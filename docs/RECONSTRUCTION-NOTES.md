@@ -258,3 +258,21 @@ Recovered bodies:
 
 `tcp_cc_rbbr` is declared and initialized in `tcp_cc.h` / `tcp_rbbr.c`.
 Remaining explicit stubs: 302.
+
+## 2026-11-25: RBBR utilization and RTT median
+
+- `rbbr_sender_utilizing_rwnd`: computes expected bytes as
+  `win * (now - cycle_measure_ts) / median_rtt`, compares the actual
+  `cycle_bytes_rcvd` percentage against `rbbr_low_utilization_thresh`,
+  and logs low utilization through `tcp_log_bbr` (line 825) when
+  enabled.
+- `rbbr_insertion_sort`, `rbbr_sorted_median`,
+  `rbbr_sort_rtt_samples` and `rbbr_get_rtt_median`: recover the full
+  RTT sample path; the median computation inlines to the reference's
+  300-byte body, including the odd/even cases and the `rtt_sorted`
+  cache flag.
+- All 11 compiler-internal `__bounds_safety` type names in the new
+  files were replaced with real C types and
+  `__counted_by`/`__sized_by` annotations.
+
+Remaining explicit stubs: 297.
