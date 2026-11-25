@@ -1,0 +1,108 @@
+From 26457681dabe8ea67ed5d898bd0efed6537b1486 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 20:00:10 +0000
+Subject: [PATCH] Recover the measurement-layout context conversion
+
+Reconstruct the static hv_convert_context_from_measurements() helper
+from the development and kasan kernels:
+
+  - assert that both buffers match their measurement's context size
+    (context_size_from_measurement), that the two measurements describe
+    the same state version, and, per copied entry, that both entry
+    sizes are nonzero;
+  - walk the 25 entries, skipping any whose source or destination size
+    is 0xffffffff;
+  - copy read-write entries always and read-only entries only when
+    copy_ro is set, moving the smaller of the two entry sizes from
+    src + src_entry->offset to dst + dst_entry->offset.
+
+Fix context_size_from_measurement's return to the recovered
+ro_context_measurement->offset + ro_context_measurement->size form
+(the assert ties it to the read-write root's size), matching the
+inlined code in both reference kernels.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ osfmk/arm64/hv/hv_compat_paranested.c | 50 ++++++++++++++++++++++++---
+ osfmk/arm64/hv/hv_compat_paranested.h |  2 +-
+ 2 files changed, 47 insertions(+), 5 deletions(-)
+
+diff --git a/osfmk/arm64/hv/hv_compat_paranested.c b/osfmk/arm64/hv/hv_compat_paranested.c
+index eb32be476..46fa1bc00 100644
+--- a/osfmk/arm64/hv/hv_compat_paranested.c
++++ b/osfmk/arm64/hv/hv_compat_paranested.c
+@@ -230,12 +230,54 @@ hv_guest_has_context_measurement_mismatch(void)
+ 	return hv_context_measurement_mismatch;
+ }
+ 
++/*
++ * Copy the live context ranges from one measurement layout to another.
++ * The two measurements must describe the same state version and the
++ * buffers must match their measurement's context size; entries flagged
++ * 0xffffffff are skipped, read-write entries are always copied and
++ * read-only entries only when copy_ro is set, and each copied range
++ * moves the smaller of the two entry sizes.
++ */
+ /* osfmk/arm64/hv/hv_compat_paranested.c:223 */
+-void
+-hv_convert_context_from_measurements(void *src __sized_by(src_size), size_t src_size, const hv_paranested_measurement_t * src_measurement, void *dst __sized_by(dst_size), size_t dst_size, const hv_paranested_measurement_t * dst_measurement, _Bool copy_ro)
++static void
++hv_convert_context_from_measurements(
++	void * src __sized_by(src_size),
++	size_t src_size,
++	const hv_paranested_measurement_t * src_measurement,
++	void * dst __sized_by(dst_size),
++	size_t dst_size,
++	const hv_paranested_measurement_t * dst_measurement,
++	_Bool copy_ro)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: hv_convert_context_from_measurements");
++	assert(src_size == context_size_from_measurement(src_measurement));
++	assert(dst_size == context_size_from_measurement(dst_measurement));
++	assert(hv_get_state_version_major(src_measurement) ==
++	    hv_get_state_version_major(dst_measurement));
++
++	for (unsigned int i = 0; i < 25; i++) {
++		const hv_measurement_entry_t * src_entry =
++		    &src_measurement->measurement_array[i];
++		const hv_measurement_entry_t * dst_entry =
++		    &dst_measurement->measurement_array[i];
++
++		if (src_entry->size == 0xffffffff ||
++		    dst_entry->size == 0xffffffff) {
++			continue;
++		}
++
++		const hv_measurement_type_t measurement_type =
++		    hv_measurement_type[i];
++
++		if (measurement_type == MEASUREMENT_TYPE_RW_CONTEXT ||
++		    (copy_ro &&
++		    measurement_type == MEASUREMENT_TYPE_RO_CONTEXT)) {
++			assert(src_entry->size != 0 && dst_entry->size != 0);
++
++			memmove((char *)dst + dst_entry->offset,
++			    (const char *)src + src_entry->offset,
++			    MIN(src_entry->size, dst_entry->size));
++		}
++	}
+ }
+ 
+ /* osfmk/arm64/hv/hv_compat_paranested.c:261 */
+diff --git a/osfmk/arm64/hv/hv_compat_paranested.h b/osfmk/arm64/hv/hv_compat_paranested.h
+index 325fbdc6b..1ab4d0d04 100644
+--- a/osfmk/arm64/hv/hv_compat_paranested.h
++++ b/osfmk/arm64/hv/hv_compat_paranested.h
+@@ -78,7 +78,7 @@ context_size_from_measurement(const hv_paranested_measurement_t * measurement)
+ 
+ 	assert(rw_context_measurement->size == ro_context_measurement->offset);
+ 
+-	return rw_context_measurement->size + ro_context_measurement->size;
++	return ro_context_measurement->offset + ro_context_measurement->size;
+ }
+ 
+ #endif /* XNU13432_OSFMK_ARM64_HV_HV_COMPAT_PARANESTED_H */
+-- 
+2.47.3
+

@@ -1434,3 +1434,38 @@ directly: `this_size` 228, `measurement_array_size` 200,
   inlined instances appear at 76:57, 78:2 and 79:33/40/66).
 
 The patch series now has 53 entries; 92 explicit stubs remain.
+
+## 2026-11-25: the measurement-layout context conversion
+
+`hv_convert_context_from_measurements` (decl line 223) is the static
+copier shared by both directions of the guest conversion.  Its
+parameters occupy lines 224-230 (src, src_size, src_measurement, dst,
+dst_size, dst_measurement, copy_ro) and the body brace is 231:0.
+
+- The three leading assertions are at 233:2, 234:2 and 237:2:
+  `src_size == context_size_from_measurement(src_measurement)`,
+  `dst_size == context_size_from_measurement(dst_measurement)` and the
+  two state version majors.  The inlined context size is compiled as
+  `ro_context_measurement->offset + ro_context_measurement->size`
+  (`ldp w9,w8,[x,#0x20]` for the root check, then the 0x24/0x28 loads
+  and `add w8,w9,w8`), which also pins the header inline's return text;
+  both reference kernels inline it the same way.
+- The loop at 238:2 walks the 25 entries (the byte index advances by 8
+  to 0xc8); `src_entry` and `dst_entry` are the loop-local entries
+  (lines 239/240).  A source or destination size of 0xffffffff skips
+  the entry (243:18/243:54 and 244:18), and the type dispatch at
+  250/251 copies read-write entries always and read-only entries only
+  when `copy_ro`; the compiled select is `csel w11, wzr, w6, ne` after
+  `cmp type, #2`, so the condition is exactly `type == RW ||
+  (copy_ro && type == RO)`.
+- The copied entries assert `(src_entry->size != 0) &&
+  (dst_entry->size != 0)` (descriptor line 253) and then
+  `memmove(dst + dst_entry->offset, src + src_entry->offset,
+  MIN(src_entry->size, dst_entry->size))` (254:4, offsets at 254:39 and
+  254:81, the minimum at 255:8).  The development kernel calls
+  `_memmove`; the kasan build lowers the non-overlapping call to
+  `__asan_memcpy`.  The closing brace is 258:1.
+- The bounds-safety wide pointers produce the surrounding pointer+size
+  pairs and the `ccmp` range checks seen in both kernels.
+
+The patch series now has 54 entries; 91 explicit stubs remain.

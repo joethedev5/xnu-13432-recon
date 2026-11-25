@@ -9,7 +9,7 @@ Apply in numeric order from a clean checkout:
 
 ```
 git checkout xnu-12377.121.6
-git am 0001-*.patch ... 0053-*.patch
+git am 0001-*.patch ... 0054-*.patch
 ```
 
 Contents:
@@ -147,6 +147,12 @@ Contents:
     signature, the static handshake flags and shared measurement, the
     accessors and `hv_paranested_virtualization_init`, plus the header's
     inline `context_size_from_measurement`.
+54. The measurement-layout context conversion: the static
+    `hv_convert_context_from_measurements` copier with its size/version
+    assertions, the 0xffffffff entry skip, read-write (and optional
+    read-only) entry copies using the smaller of the two entry sizes,
+    and the corrected `context_size_from_measurement` return expression
+    (`ro_context_measurement->offset + ro_context_measurement->size`).
 
 The patches contain only public xnu text plus original reconstruction;
 no Apple binary, dSYM, SDK payload or extracted proprietary header is
