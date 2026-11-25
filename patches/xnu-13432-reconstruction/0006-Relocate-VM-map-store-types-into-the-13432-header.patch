@@ -1,7 +1,7 @@
 From 820acab9b5cc1b697d05ec91c3105cd9336347e6 Mon Sep 17 00:00:00 2001
 From: joethedev5 <deepsbx1@proton.me>
 Date: Wed, 25 Nov 2026 02:24:22 +0000
-Subject: [PATCH 06/40] Relocate VM map store types into the 13432 header
+Subject: [PATCH 06/41] Relocate VM map store types into the 13432 header
 
 Move the packed pointer, tree node/root, reservation and guard-object
 type definitions and their packing macros out of

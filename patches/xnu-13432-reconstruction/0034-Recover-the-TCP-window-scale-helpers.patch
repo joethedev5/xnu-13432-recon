@@ -1,7 +1,7 @@
 From 908fbaae8739b2a6c5f334c6e9f9a94287c33726 Mon Sep 17 00:00:00 2001
 From: joethedev5 <deepsbx1@proton.me>
 Date: Wed, 25 Nov 2026 03:50:13 +0000
-Subject: [PATCH 34/40] Recover the TCP window scale helpers
+Subject: [PATCH 34/41] Recover the TCP window scale helpers
 
 tcp_set_window_scale and tcp_window_scale are the reference's
 extraction of the two SYN-ACK and SYN_RECEIVED scaling blocks:

@@ -1,0 +1,47 @@
+From 5c9ef532e9af4220de54425f08bee103fdf838da Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 04:27:39 +0000
+Subject: [PATCH 41/41] Complete the PRR integration in the duplicate-ACK and
+ output paths
+
+The reference calls tcp_prr_update from the already-in-fast-recovery
+duplicate-ACK branch before the legacy SACK/awnd or plain cwnd update,
+and accounts every transmitted segment in tp->prr.out at the end of
+tcp_output.  The partial-ACK call was already in place.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ bsd/netinet/tcp_input.c  | 4 +++-
+ bsd/netinet/tcp_output.c | 4 ++++
+ 2 files changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/bsd/netinet/tcp_input.c b/bsd/netinet/tcp_input.c
+index af007e959..0c297fc8f 100644
+--- a/bsd/netinet/tcp_input.c
++++ b/bsd/netinet/tcp_input.c
+@@ -3862,7 +3862,9 @@ process_dupack:
+ 					 * to keep a constant cwnd packets in the
+ 					 * network.
+ 					 */
+-					if (SACK_ENABLED(tp) && IN_FASTRECOVERY(tp)) {
++					if (tcp_prr && IN_FASTRECOVERY(tp)) {
++						tcp_prr_update(tp, th);
++					} else if (SACK_ENABLED(tp) && IN_FASTRECOVERY(tp)) {
+ 						int awnd;
+ 
+ 						/*
+diff --git a/bsd/netinet/tcp_output.c b/bsd/netinet/tcp_output.c
+index c9d21fcf2..ad6bf3f9c 100644
+--- a/bsd/netinet/tcp_output.c
++++ b/bsd/netinet/tcp_output.c
+@@ -3139,6 +3139,10 @@ out:
+ 
+ 	tcpstat.tcps_sndtotal++;
+ 
++	if (tcp_prr && IN_FASTRECOVERY(tp)) {
++		tp->prr.out += len;
++	}
++
+ 	KERNEL_DEBUG(DBG_FNC_TCP_OUTPUT | DBG_FUNC_END, 0, 0, 0, 0, 0);
+ 	if (sendalot) {
+ 		goto again;

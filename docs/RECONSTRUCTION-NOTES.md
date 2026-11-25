@@ -657,3 +657,20 @@ entitlement macros moved to kern_exec_internal.h so the new translation
 unit can use them.
 
 The patch series now has 40 entries; 166 explicit stubs remain.
+
+## 2026-11-25: Remaining PRR hooks
+
+The reference has exactly two calls to `tcp_prr_update`: the partial-ACK
+call already present in `tcp_input.c` (reference line 3287) and one in
+the already-in-fast-recovery duplicate-ACK branch (reference lines
+3083-3084).  The latter sits in an if/else-if chain ahead of the legacy
+SACK `awnd` calculation: `if (tcp_prr && IN_FASTRECOVERY(tp))
+tcp_prr_update(tp, th); else if (SACK_ENABLED(tp) && IN_FASTRECOVERY(tp))
+{ ... awnd ... } else tp->snd_cwnd += tp->t_maxseg;`.
+
+At the end of `tcp_output`, after `tcpstat.tcps_sndtotal++`, the
+reference accounts the transmitted segment when PRR is active and the
+connection is in fast recovery (`tp->prr.out += len`, reference lines
+2769-2770) before the `sendalot` loop check.
+
+The patch series now has 41 entries; 166 explicit stubs remain.

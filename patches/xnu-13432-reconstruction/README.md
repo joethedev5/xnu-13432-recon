@@ -9,7 +9,7 @@ Apply in numeric order from a clean checkout:
 
 ```
 git checkout xnu-12377.121.6
-git am 0001-*.patch ... 0040-*.patch
+git am 0001-*.patch ... 0041-*.patch
 ```
 
 Contents:
@@ -73,6 +73,9 @@ Contents:
     policy hook, and the VFS resolve-flags entitlement, together with
     the new load-result state byte, task security bits and proc VFS
     resolve flag fields.
+41. The remainder of the PRR integration: the duplicate-ACK
+    `tcp_prr_update` call and the `tp->prr.out` transmit accounting in
+    `tcp_output`.
 
 The patches contain only public xnu text plus original reconstruction;
 no Apple binary, dSYM, SDK payload or extracted proprietary header is
