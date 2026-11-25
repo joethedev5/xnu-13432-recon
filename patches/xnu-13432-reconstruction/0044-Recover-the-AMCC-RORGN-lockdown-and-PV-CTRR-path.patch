@@ -1,0 +1,488 @@
+From 5da9e04f7812d6a28d4e77adfff0f0c4bc6ff60e Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 05:24:19 +0000
+Subject: [PATCH 44/44] Recover the AMCC RORGN lockdown and PV CTRR path
+
+Fill in rorgn_contains, rorgn_stash_range, rorgn_lockdown,
+rorgn_validate_core, lock_mmu, pv_ctrr_map_reg_base and pv_ctrr_init
+from the reference image, and add the AMCC PV CTRR header with the
+recovered register offsets and control bits.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ osfmk/arm64/amcc_rorgn_common.c   |  46 ++++++++++---
+ osfmk/arm64/amcc_rorgn_ppl.c      | 109 ++++++++++++++++++++++++++----
+ osfmk/arm64/amcc_rorgn_ppl_amcc.c |  54 ++++++++++++---
+ osfmk/arm64/amcc_rorgn_pv_ctrr.c  |  89 ++++++++++++++++++++----
+ osfmk/arm64/amcc_rorgn_pv_ctrr.h  |  72 ++++++++++++++++++++
+ 5 files changed, 326 insertions(+), 44 deletions(-)
+ create mode 100644 osfmk/arm64/amcc_rorgn_pv_ctrr.h
+
+diff --git a/osfmk/arm64/amcc_rorgn_common.c b/osfmk/arm64/amcc_rorgn_common.c
+index 24d614f21..10eb77e01 100644
+--- a/osfmk/arm64/amcc_rorgn_common.c
++++ b/osfmk/arm64/amcc_rorgn_common.c
+@@ -1,23 +1,51 @@
+ /*
+- * Reconstruction of osfmk/arm64/amcc_rorgn_common.c from the xnu-13432 reference kernel.
++ * Reconstruction of osfmk/arm64/amcc_rorgn_common.c from the xnu-13432
++ * reference kernel.
+  *
+  * Function signatures and ordering are derived from the KDK 27.0.1
+- * DWARF.  Functions marked RECON were moved from the public xnu source
+- * when the reference kernel placed them in this file; bodies marked
+- * "body not recovered" are still stubs.
++ * DWARF; the body is recovered from the reference kernel image and its
++ * kasan companion, whose full DWARF supplies the local names, types and
++ * assert expression strings.
+  */
+-#include <kern/kern_types.h>
++#include <sys/systm.h>
+ #include <kern/assert.h>
+ #include <kern/debug.h>
+-#include <kern/zalloc.h>
+-#include <sys/systm.h>
++#include <kern/startup.h>
++#include <mach/vm_types.h>
++#include <machine/machine_routines.h>
++#include <os/overflow.h>
++#include <arm/pmap.h>
++#include <arm64/amcc_rorgn.h>
+ 
+ #define RECON_OSFMK_ARM64_AMCC_RORGN_COMMON_C 1
+ 
++/* osfmk/arm64/amcc_rorgn_common.c:43 */
++vm_offset_t rorgn_begin;
++/* osfmk/arm64/amcc_rorgn_common.c:44 */
++vm_offset_t rorgn_end;
++
+ /* osfmk/arm64/amcc_rorgn_common.c:61 */
+ _Bool
+ rorgn_contains(const vm_offset_t addr, vm_size_t size, _Bool defval)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: rorgn_contains");
++	if (ml_unsafe_kernel_text()) {
++		return defval;
++	}
++
++	if (startup_phase < 20) {
++		return defval;
++	}
++
++	if (rorgn_begin == 0 && rorgn_end == 0) {
++		return defval;
++	}
++
++	const vm_map_address_t pa = kvtophys(addr);
++	vm_map_address_t pa_end;
++
++	if (os_add_overflow(pa, size, &pa_end)) {
++		panic("overflow in rorgn_contains: %p + %zu", pa, size);
++	}
++
++	return (pa >= rorgn_begin) && (pa_end <= rorgn_end + 1);
+ }
+diff --git a/osfmk/arm64/amcc_rorgn_ppl.c b/osfmk/arm64/amcc_rorgn_ppl.c
+index b0a0e5bf9..1b3fea319 100644
+--- a/osfmk/arm64/amcc_rorgn_ppl.c
++++ b/osfmk/arm64/amcc_rorgn_ppl.c
+@@ -1,39 +1,120 @@
+ /*
+- * Reconstruction of osfmk/arm64/amcc_rorgn_ppl.c from the xnu-13432 reference kernel.
++ * Reconstruction of osfmk/arm64/amcc_rorgn_ppl.c from the xnu-13432
++ * reference kernel.
+  *
+  * Function signatures and ordering are derived from the KDK 27.0.1
+- * DWARF.  Functions marked RECON were moved from the public xnu source
+- * when the reference kernel placed them in this file; bodies marked
+- * "body not recovered" are still stubs.
++ * DWARF; the bodies are recovered from the reference kernel image and
++ * its kasan companion, whose full DWARF supplies the local names, types
++ * and assert expression strings.
+  */
+-#include <kern/kern_types.h>
++#include <sys/systm.h>
+ #include <kern/assert.h>
+ #include <kern/debug.h>
+-#include <kern/zalloc.h>
+-#include <sys/systm.h>
++#include <mach/vm_types.h>
++#include <machine/machine_routines.h>
++#include <arm64/amcc_rorgn.h>
++#include <arm64/amcc_rorgn_pv_ctrr.h>
+ 
+ #define RECON_OSFMK_ARM64_AMCC_RORGN_PPL_C 1
+ 
+ /* osfmk/arm64/amcc_rorgn_ppl.c:46 */
+-void
++static void
+ lock_mmu(uint64_t begin, uint64_t end)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: lock_mmu");
++	if (!pv_ctrr_available) {
++		printf("PV CTRR unavailable, skipping lockdown\n");
++		return;
++	}
++
++	const uint64_t ctrr_block_size = 1ULL << PV_CTRR_REG(PV_CTRR_BLOCK_SIZE_OFFSET);
++
++	uint64_t ctrr_ctl = PV_CTRR_CTL_LOCK | PV_CTRR_CTL_ENABLE | PV_CTRR_CTL_WRPROTECT;
++	uint64_t ctxr_ctl = PV_CTXR_CTL_ENABLE;
++
++	assert(PV_CTRR_REG64(PV_CTRR_A_LWR_OFFSET) != 0);
++	assert(PV_CTRR_REG64(PV_CTRR_A_LWR_OFFSET) <= PV_CTRR_REG64(PV_CTRR_A_UPR_OFFSET));
++	if ((PV_CTRR_REG64(PV_CTRR_A_CTL_OFFSET) & PV_CTRR_CTL_LOCK) == 0) {
++		PV_CTRR_REG64(PV_CTRR_A_CTL_OFFSET) = ctrr_ctl;
++	}
++	assert(PV_CTRR_REG64(PV_CTRR_B_LWR_OFFSET) != 0);
++	assert(PV_CTRR_REG64(PV_CTRR_B_LWR_OFFSET) <= PV_CTRR_REG64(PV_CTRR_B_UPR_OFFSET));
++	if ((PV_CTRR_REG64(PV_CTRR_B_CTL_OFFSET) & PV_CTRR_CTL_LOCK) == 0) {
++		PV_CTRR_REG64(PV_CTRR_B_CTL_OFFSET) = ctrr_ctl;
++	}
++
++	assert(PV_CTRR_REG64(PV_CTRR_C_LWR_OFFSET) != 0);
++	assert(PV_CTRR_REG64(PV_CTRR_C_LWR_OFFSET) <= PV_CTRR_REG64(PV_CTRR_C_UPR_OFFSET));
++	assert(PV_CTRR_REG64(PV_CTRR_C_CTL_OFFSET) == 0);
++	PV_CTRR_REG64(PV_CTRR_C_CTL_OFFSET) = ctrr_ctl;
++
++	assert(PV_CTRR_REG64(PV_CTRR_D_LWR_OFFSET) == (begin & ~(ctrr_block_size - 1)));
++	assert(PV_CTRR_REG64(PV_CTRR_D_UPR_OFFSET) == (end & ~(ctrr_block_size - 1)));
++	assert(PV_CTRR_REG64(PV_CTRR_D_CTL_OFFSET) == 0);
++	PV_CTRR_REG64(PV_CTRR_D_CTL_OFFSET) = ctrr_ctl;
++
++	assert(PV_CTRR_REG64(PV_CTXR_A_LWR_OFFSET) != 0);
++	assert(PV_CTRR_REG64(PV_CTXR_A_LWR_OFFSET) <= PV_CTRR_REG64(PV_CTXR_A_UPR_OFFSET));
++	assert(PV_CTRR_REG64(PV_CTXR_A_CTL_OFFSET) == 0);
++	PV_CTRR_REG64(PV_CTXR_A_CTL_OFFSET) = ctxr_ctl;
++
++	assert(PV_CTRR_REG64(PV_CTXR_B_LWR_OFFSET) != 0);
++	assert(PV_CTRR_REG64(PV_CTXR_B_LWR_OFFSET) <= PV_CTRR_REG64(PV_CTXR_B_UPR_OFFSET));
++	assert(PV_CTRR_REG64(PV_CTXR_B_CTL_OFFSET) == 0);
++	PV_CTRR_REG64(PV_CTXR_B_CTL_OFFSET) = ctxr_ctl;
++
++	assert(PV_CTRR_REG64(PV_CTXR_C_LWR_OFFSET) != 0);
++	assert(PV_CTRR_REG64(PV_CTXR_C_LWR_OFFSET) <= PV_CTRR_REG64(PV_CTXR_C_UPR_OFFSET));
++	assert(PV_CTRR_REG64(PV_CTXR_C_CTL_OFFSET) == 0);
++	PV_CTRR_REG64(PV_CTXR_C_CTL_OFFSET) = ctxr_ctl;
++
++	assert(PV_CTRR_REG64(PV_CTXR_D_LWR_OFFSET) == (begin & ~(ctrr_block_size - 1)));
++	assert(PV_CTRR_REG64(PV_CTXR_D_UPR_OFFSET) == (end & ~(ctrr_block_size - 1)));
++	assert(PV_CTRR_REG64(PV_CTXR_D_CTL_OFFSET) == 0);
++	PV_CTRR_REG64(PV_CTXR_D_CTL_OFFSET) = ctxr_ctl;
++
++	rorgn_validate_core();
+ }
+ 
+ /* osfmk/arm64/amcc_rorgn_ppl.c:176 */
+ void
+ rorgn_lockdown(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: rorgn_lockdown");
++	if (!ml_unsafe_kernel_text()) {
++		printf("CTRR (MMU) Begin: %p End: %p, setting lockdown\n", (void *)ctrr_begin, (void *)ctrr_end);
++		lock_mmu(ctrr_begin, ctrr_end);
++	}
+ }
+ 
+ /* osfmk/arm64/amcc_rorgn_ppl.c:231 */
+ void
+ rorgn_validate_core(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: rorgn_validate_core");
++	if (ml_unsafe_kernel_text()) {
++		return;
++	}
++
++	if (!pv_ctrr_available) {
++		return;
++	}
++
++	const uint64_t ctrr_block_size = 1ULL << PV_CTRR_REG(PV_CTRR_BLOCK_SIZE_OFFSET);
++
++	assert(PV_CTRR_REG64(PV_CTRR_A_CTL_OFFSET) & PV_CTRR_CTL_LOCK);
++	assert(PV_CTRR_REG64(PV_CTRR_B_CTL_OFFSET) & PV_CTRR_CTL_LOCK);
++	assert(PV_CTRR_REG64(PV_CTRR_C_CTL_OFFSET) & PV_CTRR_CTL_LOCK);
++	assert(PV_CTRR_REG64(PV_CTRR_D_LWR_OFFSET) == (ctrr_begin & ~(ctrr_block_size - 1)));
++	assert(PV_CTRR_REG64(PV_CTRR_D_UPR_OFFSET) == (ctrr_end & ~(ctrr_block_size - 1)));
++
++	uint64_t ctrr_d_ctl = PV_CTRR_REG64(PV_CTRR_D_CTL_OFFSET);
++	assert(ctrr_d_ctl & PV_CTRR_CTL_LOCK);
++	assert(ctrr_d_ctl & PV_CTRR_CTL_ENABLE);
++	assert(ctrr_d_ctl & PV_CTRR_CTL_WRPROTECT);
++
++	assert(PV_CTRR_REG64(PV_CTXR_A_CTL_OFFSET) & PV_CTRR_CTL_LOCK);
++	assert(PV_CTRR_REG64(PV_CTXR_B_CTL_OFFSET) & PV_CTRR_CTL_LOCK);
++	assert(PV_CTRR_REG64(PV_CTXR_C_CTL_OFFSET) & PV_CTRR_CTL_LOCK);
++	assert(PV_CTRR_REG64(PV_CTXR_D_LWR_OFFSET) == (ctrr_begin & ~(ctrr_block_size - 1)));
++	assert(PV_CTRR_REG64(PV_CTXR_D_UPR_OFFSET) == (ctrr_end & ~(ctrr_block_size - 1)));
++
++	assert(PV_CTRR_REG64(PV_CTXR_D_CTL_OFFSET) & PV_CTRR_CTL_LOCK);
+ }
+diff --git a/osfmk/arm64/amcc_rorgn_ppl_amcc.c b/osfmk/arm64/amcc_rorgn_ppl_amcc.c
+index 421eb960c..02586c8fb 100644
+--- a/osfmk/arm64/amcc_rorgn_ppl_amcc.c
++++ b/osfmk/arm64/amcc_rorgn_ppl_amcc.c
+@@ -1,23 +1,59 @@
+ /*
+- * Reconstruction of osfmk/arm64/amcc_rorgn_ppl_amcc.c from the xnu-13432 reference kernel.
++ * Reconstruction of osfmk/arm64/amcc_rorgn_ppl_amcc.c from the xnu-13432
++ * reference kernel.
+  *
+  * Function signatures and ordering are derived from the KDK 27.0.1
+- * DWARF.  Functions marked RECON were moved from the public xnu source
+- * when the reference kernel placed them in this file; bodies marked
+- * "body not recovered" are still stubs.
++ * DWARF; the body is recovered from the reference kernel image and its
++ * kasan companion, whose full DWARF supplies the local names, types and
++ * assert expression strings.
+  */
+-#include <kern/kern_types.h>
++#include <sys/systm.h>
+ #include <kern/assert.h>
+ #include <kern/debug.h>
+-#include <kern/zalloc.h>
+-#include <sys/systm.h>
++#include <mach/vm_types.h>
++#include <mach/vm_param.h>
++#include <machine/machine_routines.h>
++#include <arm/pmap.h>
++#include <arm64/amcc_rorgn.h>
++#include <arm64/amcc_rorgn_pv_ctrr.h>
+ 
+ #define RECON_OSFMK_ARM64_AMCC_RORGN_PPL_AMCC_C 1
+ 
++/* Defined by osfmk/arm64/arm_vm_init.c; no public header exports them. */
++extern vm_offset_t segLOWESTRO, segHIGHESTRO;
++extern vm_offset_t segLASTB;
++extern unsigned long segSizeLAST;
++
++/* osfmk/arm64/amcc_rorgn_ppl_amcc.c:73 */
++_Bool lock_regs_set;
++/* osfmk/arm64/amcc_rorgn_ppl_amcc.c:75 */
++vm_offset_t ctrr_begin;
++/* osfmk/arm64/amcc_rorgn_ppl_amcc.c:76 */
++vm_offset_t ctrr_end;
++
+ /* osfmk/arm64/amcc_rorgn_ppl_amcc.c:343 */
+ void
+ rorgn_stash_range(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: rorgn_stash_range");
++	if (ml_unsafe_kernel_text()) {
++		return;
++	}
++
++	assert(segLOWESTRO && gVirtBase && gPhysBase);
++
++	ctrr_begin = kvtophys(segLOWESTRO);
++	if (segHIGHESTRO != 0) {
++		assert(segLASTB + segSizeLAST <= segHIGHESTRO);
++		ctrr_end = kvtophys(segHIGHESTRO) - 1;
++	} else {
++		ctrr_end = kvtophys(segLASTB) + segSizeLAST - 1;
++	}
++
++	pv_ctrr_init();
++
++	if (pv_ctrr_available) {
++		rorgn_begin = ctrr_begin;
++		rorgn_end = ctrr_end;
++		printf("rorgn range is %p-%p\n", ctrr_begin, ctrr_end);
++	}
+ }
+diff --git a/osfmk/arm64/amcc_rorgn_pv_ctrr.c b/osfmk/arm64/amcc_rorgn_pv_ctrr.c
+index cd8d390e9..d9fb7c3e9 100644
+--- a/osfmk/arm64/amcc_rorgn_pv_ctrr.c
++++ b/osfmk/arm64/amcc_rorgn_pv_ctrr.c
+@@ -1,31 +1,96 @@
+ /*
+- * Reconstruction of osfmk/arm64/amcc_rorgn_pv_ctrr.c from the xnu-13432 reference kernel.
++ * Reconstruction of osfmk/arm64/amcc_rorgn_pv_ctrr.c from the xnu-13432
++ * reference kernel.
+  *
+  * Function signatures and ordering are derived from the KDK 27.0.1
+- * DWARF.  Functions marked RECON were moved from the public xnu source
+- * when the reference kernel placed them in this file; bodies marked
+- * "body not recovered" are still stubs.
++ * DWARF; the bodies are recovered from the reference kernel image and
++ * its kasan companion, whose full DWARF supplies the local names, types
++ * and assert expression strings.
+  */
+-#include <kern/kern_types.h>
++#include <sys/systm.h>
+ #include <kern/assert.h>
+ #include <kern/debug.h>
+-#include <kern/zalloc.h>
+-#include <sys/systm.h>
++#include <mach/vm_types.h>
++#include <machine/machine_routines.h>
++#include <arm/machine_routines.h>
++#include <pexpert/device_tree.h>
++#include <pexpert/arm/protos.h>
++#include <arm64/amcc_rorgn_pv_ctrr.h>
+ 
+ #define RECON_OSFMK_ARM64_AMCC_RORGN_PV_CTRR_C 1
+ 
++/* osfmk/arm64/amcc_rorgn_pv_ctrr.c:40 */
++_Bool pv_ctrr_available;
++/* osfmk/arm64/amcc_rorgn_pv_ctrr.c:41 */
++vm_offset_t pv_ctrr_reg_base;
++/* osfmk/arm64/amcc_rorgn_pv_ctrr.c:42 */
++vm_size_t pv_ctrr_reg_size;
++
+ /* osfmk/arm64/amcc_rorgn_pv_ctrr.c:45 */
+-void
++static void
+ pv_ctrr_map_reg_base(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: pv_ctrr_map_reg_base");
++	struct {
++		uint64_t block_offset;
++		uint64_t block_size;
++	} const *reg = NULL;
++	unsigned int reg_size;
++
++	DTEntry avp_ctrr_node = NULL;
++	if (SecureDTLookupEntry(NULL, "/arm-io/avp-ctrr", &avp_ctrr_node) != kSuccess) {
++		/*
++		 * The AVP CTRR node is absent on platforms without the
++		 * protected virtualisation CTRR.
++		 */
++		printf("No devicetree entry found for AVP CTRR\n");
++		return;
++	}
++
++	const char *compatible = NULL;
++	unsigned int compatible_size;
++	if (SecureDTGetProperty(avp_ctrr_node, "compatible", (const void **)&compatible, &compatible_size) != kSuccess || strcmp(compatible, "avp,ctrr") != 0) {
++		printf("No devicetree entry found for AVP CTRR\n");
++		return;
++	}
++
++	if (SecureDTGetProperty(avp_ctrr_node, "reg", (const void **)&reg, &reg_size) != kSuccess) {
++		panic("Unable to find the '%s' property on the AVP CTRR devicetree node", "reg");
++	}
++	assert(reg_size == sizeof(*reg));
++
++	const vm_offset_t soc_base_phys = pe_arm_get_soc_base_phys();
++	pv_ctrr_reg_base = ml_io_map(soc_base_phys + reg->block_offset, reg->block_size);
++	pv_ctrr_reg_size = reg->block_size;
+ }
+ 
+ /* osfmk/arm64/amcc_rorgn_pv_ctrr.c:82 */
+ void
+ pv_ctrr_init(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: pv_ctrr_init");
++	pv_ctrr_map_reg_base();
++
++	if (pv_ctrr_reg_base == 0) {
++		return;
++	}
++
++	if (*(volatile uint32_t *)(pv_ctrr_reg_base) != 'ctrr' || *(volatile uint32_t *)(pv_ctrr_reg_base + 4) != 1) {
++		/*
++		 * The register block does not carry the CTRR signature or
++		 * the expected version, so it is not the device we expect.
++		 */
++		printf("No AVP CTRR device found\n");
++		return;
++	}
++	assert(PV_CTRR_REG(PV_CTRR_NUM_REGIONS_OFFSET) >= 8);
++
++	if (PV_CTRR_REG64(PV_CTRR_D_LWR_OFFSET) == 0) {
++		/*
++		 * The firmware did not program the first protected region,
++		 * so the CTRR is not usable for lockdown.
++		 */
++		printf("No firmware support for AVP CTRR\n");
++		return;
++	}
++
++	pv_ctrr_available = true;
+ }
+diff --git a/osfmk/arm64/amcc_rorgn_pv_ctrr.h b/osfmk/arm64/amcc_rorgn_pv_ctrr.h
+new file mode 100644
+index 000000000..7d0a873bb
+--- /dev/null
++++ b/osfmk/arm64/amcc_rorgn_pv_ctrr.h
+@@ -0,0 +1,72 @@
++/*
++ * Reconstruction of osfmk/arm64/amcc_rorgn_pv_ctrr.h from the xnu-13432
++ * reference kernel.
++ *
++ * The register offsets, control bits and accessor macros are recovered
++ * from the assert expression strings embedded in the kasan kernel and
++ * from the instruction streams of amcc_rorgn_ppl.c and
++ * amcc_rorgn_pv_ctrr.c.  The original include order and comments are not
++ * recovered.
++ */
++#ifndef _ARM64_AMCC_RORGN_PV_CTRR_H_
++#define _ARM64_AMCC_RORGN_PV_CTRR_H_
++
++#include <sys/cdefs.h>
++#include <stdbool.h>
++#include <mach/vm_types.h>
++#include <libkern/section_keywords.h>
++
++__BEGIN_DECLS
++
++/* CTRR register block offsets. */
++#define PV_CTRR_SIGNATURE_OFFSET        0x00
++#define PV_CTRR_VERSION_OFFSET          0x04
++#define PV_CTRR_NUM_REGIONS_OFFSET      0x0c
++#define PV_CTRR_BLOCK_SIZE_OFFSET       0x10
++
++#define PV_CTRR_A_LWR_OFFSET            0x40
++#define PV_CTRR_A_UPR_OFFSET            0x48
++#define PV_CTRR_A_CTL_OFFSET            0x50
++#define PV_CTRR_B_LWR_OFFSET            0x60
++#define PV_CTRR_B_UPR_OFFSET            0x68
++#define PV_CTRR_B_CTL_OFFSET            0x70
++#define PV_CTRR_C_LWR_OFFSET            0x80
++#define PV_CTRR_C_UPR_OFFSET            0x88
++#define PV_CTRR_C_CTL_OFFSET            0x90
++#define PV_CTRR_D_LWR_OFFSET            0xa0
++#define PV_CTRR_D_UPR_OFFSET            0xa8
++#define PV_CTRR_D_CTL_OFFSET            0xb0
++
++#define PV_CTXR_A_LWR_OFFSET            0xc0
++#define PV_CTXR_A_UPR_OFFSET            0xc8
++#define PV_CTXR_A_CTL_OFFSET            0xd0
++#define PV_CTXR_B_LWR_OFFSET            0xe0
++#define PV_CTXR_B_UPR_OFFSET            0xe8
++#define PV_CTXR_B_CTL_OFFSET            0xf0
++#define PV_CTXR_C_LWR_OFFSET            0x100
++#define PV_CTXR_C_UPR_OFFSET            0x108
++#define PV_CTXR_C_CTL_OFFSET            0x110
++#define PV_CTXR_D_LWR_OFFSET            0x120
++#define PV_CTXR_D_UPR_OFFSET            0x128
++#define PV_CTXR_D_CTL_OFFSET            0x130
++
++/* Control register bits. */
++#define PV_CTRR_CTL_LOCK                0x1
++#define PV_CTRR_CTL_ENABLE              0x2
++#define PV_CTRR_CTL_WRPROTECT           0x4
++#define PV_CTXR_CTL_ENABLE              0x1
++
++extern _Bool pv_ctrr_available;
++extern vm_offset_t pv_ctrr_reg_base;
++extern vm_size_t pv_ctrr_reg_size;
++
++#define PV_CTRR_REG(offset) \
++	(*(volatile uint32_t *)((uintptr_t)pv_ctrr_reg_base + (offset)))
++#define PV_CTRR_REG64(offset) \
++	(*(volatile uint64_t *)((uintptr_t)pv_ctrr_reg_base + (offset)))
++
++void pv_ctrr_init(void);
++
++__END_DECLS
++
++#endif /* _ARM64_AMCC_RORGN_PV_CTRR_H_ */

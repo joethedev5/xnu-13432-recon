@@ -9,7 +9,7 @@ Apply in numeric order from a clean checkout:
 
 ```
 git checkout xnu-12377.121.6
-git am 0001-*.patch ... 0043-*.patch
+git am 0001-*.patch ... 0044-*.patch
 ```
 
 Contents:
@@ -85,6 +85,9 @@ Contents:
     block hint, `kdp_threadpair_find_owner` and the stackshot
     dispatch, plus `TURNSTILE_THREADPAIR` in the turnstile enum and
     both policy tables.
+44. The AMCC RORGN/PV CTRR path: `rorgn_contains`,
+    `rorgn_stash_range`, the MMU lockdown/validation helpers and
+    `pv_ctrr_init`, with the recovered PV CTRR register definitions.
 
 The patches contain only public xnu text plus original reconstruction;
 no Apple binary, dSYM, SDK payload or extracted proprietary header is

@@ -1,7 +1,7 @@
 From a07ff125e49db5fa6c5d4cea4e27caea42200291 Mon Sep 17 00:00:00 2001
 From: joethedev5 <deepsbx1@proton.me>
 Date: Wed, 25 Nov 2026 03:08:53 +0000
-Subject: [PATCH 25/43] Restore the tcp_seg_sent RB tree generator
+Subject: [PATCH 25/44] Restore the tcp_seg_sent RB tree generator
 
 The eleven tcp_seg_sent_tree_head_RB_* entries that DWARF reports at
 tcp_segment.c:45 are the functions emitted by one RB_GENERATE over

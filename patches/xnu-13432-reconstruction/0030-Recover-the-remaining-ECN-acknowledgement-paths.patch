@@ -1,7 +1,7 @@
 From 51cab82f79b5f8d51786c6ae568dcc447a64cbcb Mon Sep 17 00:00:00 2001
 From: joethedev5 <deepsbx1@proton.me>
 Date: Wed, 25 Nov 2026 03:31:29 +0000
-Subject: [PATCH 30/43] Recover the remaining ECN acknowledgement paths
+Subject: [PATCH 30/44] Recover the remaining ECN acknowledgement paths
 
 Complete bsd/netinet/tcp_ecn.c: split the inlined classic, accurate and
 heuristic SYN-ACK helpers back out of tcp_ecn_process_synack, and

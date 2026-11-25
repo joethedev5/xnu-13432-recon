@@ -1,7 +1,7 @@
 From 92b271fa2aa0071d461d9071a6b8ef1b4207030d Mon Sep 17 00:00:00 2001
 From: joethedev5 <deepsbx1@proton.me>
 Date: Wed, 25 Nov 2026 04:02:19 +0000
-Subject: [PATCH 36/43] Reconstruct the TCP socket-buffer helpers
+Subject: [PATCH 36/44] Reconstruct the TCP socket-buffer helpers
 
 tcp_sb.c is split out of the public tcp_subr.c in the reference.
 Recover tcp_sbrcv_min_rwin from the public tcp_sbrcv_grow_rwin body

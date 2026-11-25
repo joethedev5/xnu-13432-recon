@@ -792,3 +792,36 @@ public-12377 counterpart, confirming the reference delta is only the
 two table entries.
 
 The patch series now has 43 entries; 142 explicit stubs remain.
+
+## 2026-11-25: AMCC RORGN and the PV CTRR path
+
+The four arm64 AMCC files are now fully recovered: `rorgn_contains`,
+`rorgn_stash_range`, `rorgn_lockdown`, `rorgn_validate_core`, the
+`lock_mmu` helper and the `pv_ctrr_map_reg_base`/`pv_ctrr_init` pair.
+The KDK's kasan dSYM (100 MB, `kernel.kasan.vmapple.dSYM`) carries full
+DWARF where the release image only keeps line tables: local variable
+names and types, inlined-subroutine trees and, most usefully, the
+`mach_assert_default` descriptors whose `expr` field holds the assert
+source text.  Decoding the chained pointers in `__DATA_CONST` yields
+strings such as `PV_CTRR_REG(PV_CTRR_NUM_REGIONS_OFFSET) >= 8`,
+`reg_size == sizeof(*reg)` and
+`PV_CTRR_REG64(PV_CTRR_D_LWR_OFFSET) == (begin & ~(ctrr_block_size - 1))`.
+
+`PV_CTRR_REG(offset)` is a 32-bit MMIO read and `PV_CTRR_REG64(offset)`
+a 64-bit one from `pv_ctrr_reg_base`; the register block has signature
+`'ctrr'`, version 1, the region count at 0x0c, a block-size shift at
+0x10, and four CTRR regions (0x40..0xb0) plus four CTXR regions
+(0xc0..0x130), each with lower/upper/control registers.  `lock_mmu`
+locks A and B only when they are not already locked, requires C and D
+to be unlocked, verifies that the D window matches the request at the
+encoded block size, enables the CTXR regions and calls
+`rorgn_validate_core`.
+
+`rorgn_stash_range` takes `segLOWESTRO` and either `segHIGHESTRO` or
+`segLASTB + segSizeLAST` as the protected range, calls `pv_ctrr_init`
+and only publishes `rorgn_begin`/`rorgn_end` when the CTRR is usable.
+`rorgn_contains` gates on `ml_unsafe_kernel_text()` and
+`startup_phase < 20`, converts the address with `kvtophys`, checks the
+addition with `os_add_overflow` and tests the inclusive physical range.
+
+The patch series now has 44 entries; 135 explicit stubs remain.
