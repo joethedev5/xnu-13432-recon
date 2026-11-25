@@ -3,7 +3,9 @@
 These headers exist in the reference source set but not in public
 `xnu-12377.121.6`.  `tools/newheader_recon.py` regenerates them from the
 KDK 27.0.1 type graph: struct/union layouts (including bitfields and
-arrays), enums with values, typedefs and function prototypes.
+arrays), enums with values, typedefs and function prototypes.  The
+hypervisor headers additionally carry declaration line numbers and
+small declaration-only APIs recovered from the reference DWARF.
 
 | Header | Lines |
 |---|---:|
@@ -22,14 +24,18 @@ arrays), enums with values, typedefs and function prototypes.
 | `iokit/Kernel/IOAnalytics.h` | 30 |
 | `libkern/os/metric_types.h` | 75 |
 | `osfmk/arm64/hv/guest_thread_state.h` | 384 |
-| `osfmk/arm64/hv/hv_compat_paranested.h` | 18 |
-| `osfmk/arm64/hv/hv_interface.h` | 86 |
-| `osfmk/arm64/hv/hv_internal.h` | 24 |
-| `osfmk/arm64/hv/hv_kern_types.h` | 12 |
-| `osfmk/arm64/hv/hv_objects.h` | 41 |
+| `osfmk/arm64/hv/hv.h` | 33 |
+| `osfmk/arm64/hv/hv_compat_paranested.h` | 60 |
+| `osfmk/arm64/hv/hv_interface.h` | 90 |
+| `osfmk/arm64/hv/hv_internal.h` | 30 |
+| `osfmk/arm64/hv/hv_kern_types.h` | 32 |
+| `osfmk/arm64/hv/hv_objects.h` | 47 |
+| `osfmk/arm64/hv/hv_vcpu.h` | 35 |
+| `osfmk/arm64/hv/hv_vm.h` | 53 |
 | `osfmk/arm64/ppl/t8020dart.h` | 119 |
 | `osfmk/arm64/ppl/uat.h` | 27 |
 | `osfmk/arm64/uexc.h` | 18 |
+| `osfmk/kern/hv_support_kern.h` | 35 |
 | `osfmk/kern/matchmaker.h` | 11 |
 | `osfmk/kern/task_sanitizer_config.h` | 18 |
 | `osfmk/kern/threadpair.h` | 25 |

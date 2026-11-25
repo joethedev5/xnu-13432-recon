@@ -892,3 +892,72 @@ structures are emitted, so the reconstruction branch was amended to
 match the reference layout.
 
 The patch series now has 45 entries; 119 explicit stubs remain.
+
+## 2026-11-25: Hypervisor support layer and trap dispatcher
+
+xnu-13432 split the hypervisor support layer by architecture.  The
+x86-only `osfmk/kern/hv_support_kext.c` keeps the kext-facing trap and
+callback APIs, while the new `osfmk/kern/hv_support_kern.c` holds the
+machine-independent globals and accessors.  The kasan DWARF gives the
+layout: `hv_support_available` at line 42 and `hv_disable` at 44, then
+`hv_support_init` (48), `hv_get_support` (55), the task/thread setters
+(62/69) and getters (76/83).  `hv_init` returns `_Bool` (the DWARF type
+is one byte, and the reference stores the raw result in the `int`
+global), and the kasan disassembly confirms the exact assignment and
+the task/thread object offsets.  `task.hv_task_target` keeps its
+`XNU_PTRAUTH_SIGNED_PTR` qualifier, while `thread.hv_thread_target` is
+a plain pointer in the reference: the kasan setter/getter only show
+KASAN shadow checks, never `pacda`/`autda`.
+
+The new `osfmk/arm64/hv/hv.c` carries the kernel-side trap path.  Its
+`hv_init` parses the `hypervisor` boot arg into an `int`, sets
+`hv_internal_isa_guest_allowed` and returns
+`hv_paranested_virtualization_init()`.  `_hv_trap_capabilities` asserts
+`hv_get_support() != 0` (the kasan descriptor string is exactly that
+expression), sizes its buffer from the shared measurement's
+capabilities entry, allocates it with `kernel_memory_allocate(...,
+PAGE_MASK, KMA_ZERO, VM_KERN_MEMORY_HV)`, fills it with
+`hv_get_host_capabilities`, copyouts `MIN(size, sizeof(hv_capabilities_t))`
+bytes and returns `HV_ERROR`/`HV_SUCCESS` (the error constants
+`0xfae94001`/`0xfae94005`/`0xfae9400f` come from the standard
+`err_local | err_sub(0xba5)` space).
+
+The 19-entry `_vm_trap` table lives at line 380.  Decoding its chained
+pointers from the kasan image recovers the complete dispatch map:
+0 `_hv_trap_capabilities`, 1-5 `hv_trap_vm_create/destroy/map/unmap/
+protect`, 6-10 `hv_trap_vcpu_create/destroy/sysregs_sync/run/
+run_cancel`, 11-17 NULL, 18
+`hv_trap_paravirtualized_nested_service`.  `hv_trap` reads the trap
+number and argument from saved-state x0/x1 (not x1/x2), emits
+`KDBG_RELEASE(MACHDBG_CODE(DBG_MACH_EXCP_SC, 5) | DBG_FUNC_START/END)`
+events with debug ids `0x10c0015`/`0x10c0016`, dispatches through the
+table when `hv_get_support()` is non-zero, and writes the result back
+to saved-state x0.  The thread/task destroy callbacks tail-call
+`hv_vcpu_destroy()` and `hv_vm_destroy()`.
+
+The DWARF line attribution also pins the reference struct layouts:
+`hv_capabilities_t` is packed (size 475, with `ipa_bits_4k` at offset
+417 and `svl_b_max` at 433) and `hv_paranested_measurement_t` is packed
+too (size 228, `arm_hv_state_version` at offset 20, measurement array
+at 28), which is why the capabilities size load is at offset 0xd8.
+`ARRAY_SIZE` is not a global macro in this source set, so the table
+bounds are expressed with `sizeof`; the reference compiler's explicit
+NULL check is folded into the initializer-known entries here.
+
+New headers: `osfmk/kern/hv_support_kern.h`, `osfmk/arm64/hv/hv.h`,
+`hv_vm.h` and `hv_vcpu.h`, with declaration line numbers recovered
+from the DWARF; `hv_kern_types.h` now carries the hypervisor error
+codes, and `hv_compat_paranested.h` the full compatibility helper set.
+`hv_internal.h` declares the two lock objects and `_hv_vm_destroy`.
+
+Both translation units compile with their recovered
+`DW_AT_APPLE_flags` and reproduce the reference instruction sequences.
+The local clang cannot emit ptrauth or bounds-safety instrumentation,
+so the task target signing and the copyout wide-pointer check cannot be
+exercised locally; the source forms are recorded from the reference.
+The task and thread struct layouts in the reconstruction still differ
+from the release DWARF (`hv_task_target` at 0x618 there, 0x5e0 here;
+`hv_thread_target` 0x4a8 vs 0x4b8), so absolute member offsets remain
+to be reconciled separately from these bodies.
+
+The patch series now has 47 entries; 111 explicit stubs remain.

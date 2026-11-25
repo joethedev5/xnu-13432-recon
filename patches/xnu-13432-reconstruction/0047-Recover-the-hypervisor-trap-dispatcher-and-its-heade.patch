@@ -1,0 +1,555 @@
+From 0a26fd22a0494fc1d5a59021243595328ab47178 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 06:05:53 +0000
+Subject: [PATCH 2/2] Recover the hypervisor trap dispatcher and its headers
+
+Reconstruct osfmk/arm64/hv/hv.c from the kasan reference kernel and
+the KDK 27.0.1 DWARF:
+
+ - hv_internal_isa_guest_allowed (line 47) and hv_init (300), which
+   parses the "hypervisor" boot arg, sets the flag and returns
+   hv_paranested_virtualization_init().
+ - _hv_trap_capabilities (338): asserts hv_get_support(), sizes the
+   buffer from the shared measurement's capabilities entry (offset
+   0xd8), allocates it page-aligned and zeroed with tag
+   VM_KERN_MEMORY_HV, fills it with hv_get_host_capabilities(), copies
+   min(size, sizeof(hv_capabilities_t)) bytes out and returns
+   HV_ERROR/HV_SUCCESS.
+ - The 19-entry _vm_trap dispatch table (380) with handlers for
+   capabilities, the VM and vCPU traps, and the paravirtualized nested
+   service; the recovered handler addresses match the reference table.
+ - hv_lck_grp and hv_mtx (405/407).
+ - hv_trap (410): reads the trap and argument from saved-state x0/x1,
+   emits the KDBG_RELEASE start/end events (MACHDBG_CODE(
+   DBG_MACH_EXCP_SC, 5)), dispatches through _vm_trap when
+   hv_get_support() is set and writes the result back to x0.
+ - The thread and task destroy callbacks (433/439) tail-call
+   hv_vcpu_destroy() and hv_vm_destroy().
+
+Complete the headers this needs: the hypervisor error codes in
+hv_kern_types.h; new hv_vm.h and hv_vcpu.h with the declarations and
+reference line numbers recovered from the DWARF; the compatibility
+helper declarations in hv_compat_paranested.h; the packed
+hv_capabilities_t and hv_paranested_measurement_t layouts in
+hv_interface.h (confirmed by DWARF member offsets and size 475/228);
+and the lock/object includes in hv_internal.h, hv_objects.h.
+
+The translation unit compiles with its recovered DW_AT_APPLE_flags and
+produces the reference instruction sequences for hv_init, hv_trap and
+_hv_trap_capabilities.  The reference's bounds-safety wide pointer in
+the copyout path is approximated with a plain vm_offset_t (local clang
+lacks bounds-safety), and the trap index names are recorded as comments
+because the 13432 TRAP_HV_* definitions are not in the KDK.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ osfmk/arm64/hv/hv.c                   | 170 +++++++++++++++++++++++---
+ osfmk/arm64/hv/hv.h                   |   3 +
+ osfmk/arm64/hv/hv_compat_paranested.h |  52 +++++++-
+ osfmk/arm64/hv/hv_interface.h         |   8 +-
+ osfmk/arm64/hv/hv_internal.h          |   6 +
+ osfmk/arm64/hv/hv_kern_types.h        |  26 +++-
+ osfmk/arm64/hv/hv_objects.h           |   6 +
+ osfmk/arm64/hv/hv_vcpu.h              |  35 ++++++
+ osfmk/arm64/hv/hv_vm.h                |  53 ++++++++
+ 9 files changed, 331 insertions(+), 28 deletions(-)
+ create mode 100644 osfmk/arm64/hv/hv_vcpu.h
+ create mode 100644 osfmk/arm64/hv/hv_vm.h
+
+diff --git a/osfmk/arm64/hv/hv.c b/osfmk/arm64/hv/hv.c
+index 1a0cfb42d..48c03aa27 100644
+--- a/osfmk/arm64/hv/hv.c
++++ b/osfmk/arm64/hv/hv.c
+@@ -1,47 +1,181 @@
+ /*
+- * Reconstruction of osfmk/arm64/hv/hv.c from the xnu-13432 reference kernel.
++ * Reconstruction of osfmk/arm64/hv/hv.c from the xnu-13432 reference
++ * kernel.
+  *
+- * Function signatures and ordering are derived from the KDK 27.0.1
+- * DWARF.  Functions marked RECON were moved from the public xnu source
+- * when the reference kernel placed them in this file; bodies marked
+- * "body not recovered" are still stubs.
++ * The kernel-side entry points of the arm64 hypervisor: the boot-arg
++ * driven initialization, the capability query, and the trap dispatcher
++ * used by the paravirtualized hypercall path.  Function order, bodies
++ * and reference line numbers are recovered from the kasan reference
++ * kernel and the KDK 27.0.1 DWARF.
+  */
+-#include <kern/kern_types.h>
++#include <arm64/hv/hv.h>
++#include <kern/locks.h>
++#include <kern/startup.h>
+ #include <kern/assert.h>
+-#include <kern/debug.h>
+-#include <kern/zalloc.h>
+-#include <sys/systm.h>
++#include <kern/hv_support_kern.h>
++#include <mach/arm/thread_status.h>
++#include <libkern/copyio.h>
++#include <pexpert/pexpert.h>
++#include <sys/kdebug_kernel.h>
++#include <sys/kdebug_private.h>
++#include <vm/vm_kern_xnu.h>
++#include <arm64/hv/hv_kern_types.h>
++#include <arm64/hv/hv_interface.h>
++#include <arm64/hv/hv_objects.h>
++#include <arm64/hv/hv_compat_paranested.h>
++#include <arm64/hv/hv_vcpu.h>
++#include <arm64/hv/hv_vm.h>
+ 
+ #define RECON_OSFMK_ARM64_HV_HV_C 1
+ 
++/* osfmk/arm64/hv/hv.c:47 */
++_Bool hv_internal_isa_guest_allowed;
++
++/* osfmk/arm64/hv/hv.c:300 */
++_Bool
++hv_init(void)
++{
++	/* hv.c:305 */
++	int supported = 0;
++
++	/* hv.c:309 */
++	PE_parse_boot_argn("hypervisor", &supported, sizeof(supported));
++
++	/* hv.c:312 */
++	if (supported) {
++		/* hv.c:316 */
++		hv_internal_isa_guest_allowed = true;
++		/* hv.c:318 */
++		return hv_paranested_virtualization_init();
++	}
++	return false;
++}
++
+ /* osfmk/arm64/hv/hv.c:338 */
+-hv_return_t
++static hv_return_t
+ _hv_trap_capabilities(uint64_t arg)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: _hv_trap_capabilities");
++	/* hv.c:343 */
++	assert(hv_get_support() != 0);
++
++	/* hv.c:345 */
++	const uint32_t caps_buffer_size =
++	    hv_get_shared_measurement()->measurement_array[23].size;
++
++	/* hv.c:347 */
++	vm_offset_t caps_buffer;
++
++	/* hv.c:349 */
++	kern_return_t allocate_retval = kernel_memory_allocate(kernel_map,
++	    &caps_buffer, caps_buffer_size, PAGE_MASK, KMA_ZERO,
++	    VM_KERN_MEMORY_HV);
++
++	/* hv.c:351 */
++	if (allocate_retval != KERN_SUCCESS) {
++		return HV_NO_RESOURCES;
++	}
++
++	/* hv.c:355 */
++	hv_return_t get_caps_retval = hv_get_host_capabilities(caps_buffer);
++	/* hv.c:356 */
++	if (get_caps_retval != HV_SUCCESS) {
++		/* hv.c:357 */
++		kmem_free(kernel_map, caps_buffer, caps_buffer_size);
++		/* hv.c:358 */
++		return get_caps_retval;
++	}
++
++	/* hv.c:365 */
++	const uint32_t capabilities_size = MIN(caps_buffer_size,
++	    (uint32_t)sizeof(hv_capabilities_t));
++
++	/* hv.c:370 */
++	vm_offset_t bounded_caps_buffer = caps_buffer;
++	/* hv.c:371 */
++	int copy_retval = copyout((const void *)bounded_caps_buffer,
++	    (user_addr_t)arg, capabilities_size);
++
++	/* hv.c:373 */
++	kmem_free(kernel_map, caps_buffer, caps_buffer_size);
++
++	/* hv.c:374 */
++	return copy_retval == 0 ? HV_SUCCESS : HV_ERROR;
+ }
+ 
++/*
++ * osfmk/arm64/hv/hv.c:380
++ *
++ * Trap dispatch table.  The reference names the indices through the
++ * TRAP_HV_* definitions in hv_interface.h; only TRAP_HV_CAPABILITIES is
++ * confirmed by the public test sources, so the recovered indices are
++ * used directly here.
++ */
++static hv_return_t (* const _vm_trap[])(uint64_t arg) = {
++	[0]  = _hv_trap_capabilities,                    /* TRAP_HV_CAPABILITIES */
++	[1]  = hv_trap_vm_create,                        /* TRAP_HV_VM_CREATE */
++	[2]  = hv_trap_vm_destroy,                       /* TRAP_HV_VM_DESTROY */
++	[3]  = hv_trap_vm_map,                           /* TRAP_HV_VM_MAP */
++	[4]  = hv_trap_vm_unmap,                         /* TRAP_HV_VM_UNMAP */
++	[5]  = hv_trap_vm_protect,                       /* TRAP_HV_VM_PROTECT */
++	[6]  = hv_trap_vcpu_create,                      /* TRAP_HV_VCPU_CREATE */
++	[7]  = hv_trap_vcpu_destroy,                     /* TRAP_HV_VCPU_DESTROY */
++	[8]  = hv_trap_vcpu_sysregs_sync,                /* TRAP_HV_VCPU_SYSREGS_SYNC */
++	[9]  = hv_trap_vcpu_run,                         /* TRAP_HV_VCPU_RUN */
++	[10] = hv_trap_vcpu_run_cancel,                  /* TRAP_HV_VCPU_RUN_CANCEL */
++	[18] = hv_trap_paravirtualized_nested_service,   /* TRAP_HV_PARAVIRTUALIZED_NESTED_SERVICE */
++};
++
++/* osfmk/arm64/hv/hv.c:405 */
++LCK_GRP_DECLARE(hv_lck_grp, "hv");
++
++/* osfmk/arm64/hv/hv.c:407 */
++LCK_MTX_DECLARE(hv_mtx, &hv_lck_grp);
++
+ /* osfmk/arm64/hv/hv.c:410 */
+ void
+ hv_trap(arm_saved_state_t * state)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: hv_trap");
++	/* hv.c:412 */
++	uint64_t trap = saved_state64(state)->x[0];
++	/* hv.c:413 */
++	uint64_t arg = saved_state64(state)->x[1];
++
++	/* hv.c:415 */
++	KDBG_RELEASE(MACHDBG_CODE(DBG_MACH_EXCP_SC, 5) | DBG_FUNC_START,
++	    trap, arg);
++
++	hv_return_t result = HV_ERROR;
++	/* hv.c:419 */
++	if (hv_get_support() != 0) {
++		/* hv.c:421 */
++		if (trap < sizeof(_vm_trap) / sizeof(_vm_trap[0]) &&
++		    _vm_trap[trap] != NULL) {
++			/* hv.c:424 */
++			result = _vm_trap[trap](arg);
++		}
++	} else {
++		result = HV_UNSUPPORTED;
++	}
++
++	saved_state64(state)->x[0] = result;
++
++	/* hv.c:427 */
++	KDBG_RELEASE(MACHDBG_CODE(DBG_MACH_EXCP_SC, 5) | DBG_FUNC_END,
++	    result);
+ }
+ 
+ /* osfmk/arm64/hv/hv.c:433 */
+ void
+ hv_callback_thread_destroy(void * thread_target)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: hv_callback_thread_destroy");
++	/* hv.c:435 */
++	hv_vcpu_destroy(thread_target);
+ }
+ 
+ /* osfmk/arm64/hv/hv.c:439 */
+ void
+ hv_callback_task_destroy(void * task_target)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: hv_callback_task_destroy");
++	/* hv.c:441 */
++	hv_vm_destroy(task_target);
+ }
+diff --git a/osfmk/arm64/hv/hv.h b/osfmk/arm64/hv/hv.h
+index 628240994..25ed0d376 100644
+--- a/osfmk/arm64/hv/hv.h
++++ b/osfmk/arm64/hv/hv.h
+@@ -15,6 +15,9 @@
+ #include <mach/arm/thread_status.h>
+ #include <arm64/hv/hv_kern_types.h>
+ 
++/* Definition at hv.c:47; declaration line in hv.h not recovered. */
++extern _Bool hv_internal_isa_guest_allowed;
++
+ /* hv.h:49 */
+ _Bool hv_init(void);
+ 
+diff --git a/osfmk/arm64/hv/hv_compat_paranested.h b/osfmk/arm64/hv/hv_compat_paranested.h
+index 7fecddc3f..13c0b03c7 100644
+--- a/osfmk/arm64/hv/hv_compat_paranested.h
++++ b/osfmk/arm64/hv/hv_compat_paranested.h
+@@ -1,18 +1,60 @@
+ /*
+- * Reconstruction of osfmk/arm64/hv/hv_compat_paranested.h from the xnu-13432 reference kernel.
++ * Reconstruction of osfmk/arm64/hv/hv_compat_paranested.h from the
++ * xnu-13432 reference kernel.
+  *
+- * Declarations are derived from the KDK 27.0.1 DWARF.  Include order and
+- * macros used by the original header are not recovered here.
++ * Paranested host/guest compatibility helpers.  Declarations and their
++ * reference line numbers are derived from the KDK 27.0.1 DWARF.
+  */
+ #ifndef XNU13432_OSFMK_ARM64_HV_HV_COMPAT_PARANESTED_H
+ #define XNU13432_OSFMK_ARM64_HV_HV_COMPAT_PARANESTED_H
+ 
++#include <stdint.h>
++#include <sys/types.h>
++#include <arm64/hv/guest_thread_state.h>
++#include <arm64/hv/hv_interface.h>
++#include <arm64/hv/hv_objects.h>
++
+ typedef enum {
+ 	NATIVE_TO_SHARED = 0,
+ 	SHARED_TO_NATIVE = 1
+ } hv_context_conversion_dir_e;
+ 
+-hv_context_version_major_t hv_get_state_version_major(const hv_paranested_measurement_t * measurement);
+-size_t context_size_from_measurement(const hv_paranested_measurement_t * measurement);
++/* hv_compat_paranested.h:48 */
++const hv_paranested_measurement_t * hv_get_supported_measurement_nofail(
++	hv_context_version_major_t major_version);
++
++/* hv_compat_paranested.h:53 */
++_Bool measurement_valid(const hv_paranested_measurement_t * measurement);
++
++/* hv_compat_paranested.h:56 */
++hv_context_version_major_t hv_get_state_version_major(
++	const hv_paranested_measurement_t * measurement);
++
++/* hv_compat_paranested.h:65 */
++_Bool hv_paranested_virtualization_init(void);
++
++/* hv_compat_paranested.h:66 */
++_Bool hv_guest_needs_context_conversion(void);
++
++/* hv_compat_paranested.h:67 */
++hv_context_version_major_t hv_get_shared_version_major(void);
++
++/* hv_compat_paranested.h:68 */
++const hv_paranested_measurement_t * hv_get_shared_measurement(void);
++
++/* hv_compat_paranested.h:69 */
++_Bool hv_guest_has_major_version_mismatch(void);
++
++/* hv_compat_paranested.h:70 */
++_Bool hv_guest_has_context_measurement_mismatch(void);
++
++/* hv_compat_paranested.h:71 */
++void convert_context_by_guest(
++	hv_vcpu_t * vcpu,
++	hv_context_conversion_dir_e direction);
++
++/* hv_compat_paranested.h:73 */
++size_t context_size_from_measurement(
++	const hv_paranested_measurement_t * measurement);
+ 
+ #endif /* XNU13432_OSFMK_ARM64_HV_HV_COMPAT_PARANESTED_H */
+diff --git a/osfmk/arm64/hv/hv_interface.h b/osfmk/arm64/hv/hv_interface.h
+index c869831ac..f8efdddf2 100644
+--- a/osfmk/arm64/hv/hv_interface.h
++++ b/osfmk/arm64/hv/hv_interface.h
+@@ -7,9 +7,13 @@
+ #ifndef XNU13432_OSFMK_ARM64_HV_HV_INTERFACE_H
+ #define XNU13432_OSFMK_ARM64_HV_HV_INTERFACE_H
+ 
++#include <stdint.h>
++#include <sys/types.h>
++#include <arm64/hv/guest_thread_state.h>
++
+ typedef uint16_t hv_paranested_version_major_t;
+ typedef uint16_t hv_paranested_version_minor_t;
+-typedef struct {
++typedef struct __attribute__((packed)) {
+ 	uint64_t feature_bitmap[8];
+ 	uint64_t control_hcr;
+ 	uint64_t control_hacr;
+@@ -74,7 +78,7 @@ typedef struct {
+ 	uint32_t flags;
+ 	hv_vm_isa_t isa;
+ } hv_vm_create_t;
+-typedef struct {
++typedef struct __attribute__((packed)) {
+ 	size_t this_size;
+ 	size_t measurement_array_size;
+ 	hv_paranested_version_major_t version_major;
+diff --git a/osfmk/arm64/hv/hv_internal.h b/osfmk/arm64/hv/hv_internal.h
+index c6a1553b0..824cbacfb 100644
+--- a/osfmk/arm64/hv/hv_internal.h
++++ b/osfmk/arm64/hv/hv_internal.h
+@@ -7,6 +7,11 @@
+ #ifndef XNU13432_OSFMK_ARM64_HV_HV_INTERNAL_H
+ #define XNU13432_OSFMK_ARM64_HV_HV_INTERNAL_H
+ 
++#include <kern/locks.h>
++#include <arm64/hv/hv_objects.h>
++
++extern lck_grp_t hv_lck_grp;
++extern lck_mtx_t hv_mtx;
+ 
+ hv_vm_t * hv_get_vm(void);
+ void hv_set_vm(hv_vm_t * vm);
+@@ -19,6 +24,7 @@ void hv_vm_unlock(hv_vm_t * vm);
+ void hv_reference_vm(hv_vm_t * vm);
+ hv_vm_t * hv_get_lock_and_reference_vm(void);
+ hv_vm_t * hv_get_and_reference_vm(void);
++void _hv_vm_destroy(hv_vm_t * vm);
+ void hv_release_vm(hv_vm_t * vm);
+ 
+ #endif /* XNU13432_OSFMK_ARM64_HV_HV_INTERNAL_H */
+diff --git a/osfmk/arm64/hv/hv_kern_types.h b/osfmk/arm64/hv/hv_kern_types.h
+index c207bf14a..a7f1cf68c 100644
+--- a/osfmk/arm64/hv/hv_kern_types.h
++++ b/osfmk/arm64/hv/hv_kern_types.h
+@@ -1,12 +1,32 @@
+ /*
+- * Reconstruction of osfmk/arm64/hv/hv_kern_types.h from the xnu-13432 reference kernel.
++ * Reconstruction of osfmk/arm64/hv/hv_kern_types.h from the xnu-13432
++ * reference kernel.
+  *
+- * Declarations are derived from the KDK 27.0.1 DWARF.  Include order and
+- * macros used by the original header are not recovered here.
++ * Hypervisor return codes and the hv_return_t type.  The values live in
++ * the standard local error space with the "hypervisor" sub-system code.
+  */
+ #ifndef XNU13432_OSFMK_ARM64_HV_HV_KERN_TYPES_H
+ #define XNU13432_OSFMK_ARM64_HV_HV_KERN_TYPES_H
+ 
++#include <mach/error.h>
++#include <mach/kern_return.h>
++
++#define err_sub_hypervisor      err_sub(0xba5)
++#define err_common_hypervisor   (err_local | err_sub_hypervisor)
++
++enum {
++	HV_SUCCESS             = 0,
++	HV_ERROR               = err_common_hypervisor | 0x01,
++	HV_BUSY                = err_common_hypervisor | 0x02,
++	HV_BAD_ARGUMENT        = err_common_hypervisor | 0x03,
++	HV_ILLEGAL_GUEST_STATE = err_common_hypervisor | 0x04,
++	HV_NO_RESOURCES        = err_common_hypervisor | 0x05,
++	HV_NO_DEVICE           = err_common_hypervisor | 0x06,
++	HV_DENIED              = err_common_hypervisor | 0x07,
++	HV_EXISTS              = err_common_hypervisor | 0x08,
++	HV_UNSUPPORTED         = err_common_hypervisor | 0x0f
++};
++
+ typedef mach_error_t hv_return_t;
+ 
+ #endif /* XNU13432_OSFMK_ARM64_HV_HV_KERN_TYPES_H */
+diff --git a/osfmk/arm64/hv/hv_objects.h b/osfmk/arm64/hv/hv_objects.h
+index d1ee8eb32..8cc0f8524 100644
+--- a/osfmk/arm64/hv/hv_objects.h
++++ b/osfmk/arm64/hv/hv_objects.h
+@@ -7,6 +7,12 @@
+ #ifndef XNU13432_OSFMK_ARM64_HV_HV_OBJECTS_H
+ #define XNU13432_OSFMK_ARM64_HV_HV_OBJECTS_H
+ 
++#include <kern/kern_types.h>
++#include <kern/locks.h>
++#include <kern/bits.h>
++#include <os/refcnt.h>
++#include <arm64/hv/guest_thread_state.h>
++
+ typedef struct {
+ 	struct hv_vm_t *vm;
+ 	arm_guest_context_t *kif;
+diff --git a/osfmk/arm64/hv/hv_vcpu.h b/osfmk/arm64/hv/hv_vcpu.h
+new file mode 100644
+index 000000000..108921bec
+--- /dev/null
++++ b/osfmk/arm64/hv/hv_vcpu.h
+@@ -0,0 +1,35 @@
++/*
++ * Reconstruction of osfmk/arm64/hv/hv_vcpu.h from the xnu-13432
++ * reference kernel.
++ *
++ * vCPU-side hypervisor API.  Declarations and reference line numbers are
++ * derived from the KDK 27.0.1 DWARF; the trap handler prototypes are
++ * used by the _vm_trap dispatch table in hv.c.
++ */
++#ifndef XNU13432_OSFMK_ARM64_HV_HV_VCPU_H
++#define XNU13432_OSFMK_ARM64_HV_HV_VCPU_H
++
++#include <mach/vm_types.h>
++#include <arm64/hv/hv_kern_types.h>
++#include <arm64/hv/hv_objects.h>
++
++/* hv_vcpu.h:26 */
++void hv_vcpu_destroy(hv_vcpu_t * vcpu);
++
++/* hv_vcpu.h:28 */
++hv_return_t hv_vcpu_obj_alloc(
++	hv_vcpu_t ** vcpu,
++	vm_map_t user_map,
++	_Bool contiguous_context);
++
++/*
++ * Trap entry points referenced by hv.c's dispatch table.  Their
++ * declaration lines in hv_vcpu.h were not recovered.
++ */
++hv_return_t hv_trap_vcpu_create(uint64_t arg);
++hv_return_t hv_trap_vcpu_destroy(uint64_t arg);
++hv_return_t hv_trap_vcpu_sysregs_sync(uint64_t arg);
++hv_return_t hv_trap_vcpu_run(uint64_t arg);
++hv_return_t hv_trap_vcpu_run_cancel(uint64_t arg);
++
++#endif /* XNU13432_OSFMK_ARM64_HV_HV_VCPU_H */
+diff --git a/osfmk/arm64/hv/hv_vm.h b/osfmk/arm64/hv/hv_vm.h
+new file mode 100644
+index 000000000..00d01605d
+--- /dev/null
++++ b/osfmk/arm64/hv/hv_vm.h
+@@ -0,0 +1,53 @@
++/*
++ * Reconstruction of osfmk/arm64/hv/hv_vm.h from the xnu-13432 reference
++ * kernel.
++ *
++ * VM-side hypervisor API.  Declarations and reference line numbers are
++ * derived from the KDK 27.0.1 DWARF; the trap handler prototypes are
++ * used by the _vm_trap dispatch table in hv.c.
++ */
++#ifndef XNU13432_OSFMK_ARM64_HV_HV_VM_H
++#define XNU13432_OSFMK_ARM64_HV_HV_VM_H
++
++#include <mach/vm_types.h>
++#include <arm64/hv/hv_kern_types.h>
++#include <arm64/hv/hv_interface.h>
++#include <arm64/hv/hv_objects.h>
++
++/* hv_vm.h:36 */
++void hv_vm_destroy(hv_vm_t * vm);
++
++/* hv_vm.h:37 */
++_Bool hv_vm_allowed(hv_vm_isa_t isa);
++
++/* hv_vm.h:38 */
++hv_vm_isa_t hv_vm_max_permitted_isa(void);
++
++/* hv_vm.h:46 */
++hv_return_t hv_get_host_capabilities(vm_offset_t caps_buffer);
++
++/* hv_vm.h:47 */
++_Bool hv_paranested_virtualization_init_handshake(
++	_Bool * initialized,
++	_Bool * supported,
++	hv_paranested_measurement_t * measurement);
++
++/* hv_vm.h:50 */
++kern_return_t hv_map_lookup_protection(
++	vm_map_t map,
++	vm_map_offset_t addr,
++	vm_prot_t * prot,
++	vm_map_offset_t * entry_end);
++
++/*
++ * Trap entry points referenced by hv.c's dispatch table.  Their
++ * declaration lines in hv_vm.h were not recovered.
++ */
++hv_return_t hv_trap_vm_create(uint64_t arg);
++hv_return_t hv_trap_vm_destroy(uint64_t arg);
++hv_return_t hv_trap_vm_map(uint64_t arg);
++hv_return_t hv_trap_vm_unmap(uint64_t arg);
++hv_return_t hv_trap_vm_protect(uint64_t arg);
++hv_return_t hv_trap_paravirtualized_nested_service(uint64_t arg);
++
++#endif /* XNU13432_OSFMK_ARM64_HV_HV_VM_H */

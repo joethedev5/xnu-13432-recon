@@ -9,7 +9,7 @@ Apply in numeric order from a clean checkout:
 
 ```
 git checkout xnu-12377.121.6
-git am 0001-*.patch ... 0045-*.patch
+git am 0001-*.patch ... 0047-*.patch
 ```
 
 Contents:
@@ -94,6 +94,15 @@ Contents:
     routines and static_if initializers in `osfmk/arm64/cpu_features.c`,
     and the new 13432 ID-register field definitions in
     `arm64/proc_reg.h`.
+46. The kernel-side hypervisor support layer: `hv_support_available`,
+    `hv_disable`, the boot-time `hv_support_init`, and the task/thread
+    target accessors in the new `osfmk/kern/hv_support_kern.c`, with
+    `hv_support_kern.h` and the first part of `osfmk/arm64/hv/hv.h`.
+47. The hypervisor trap path: `hv_init`, `_hv_trap_capabilities`, the
+    19-entry `_vm_trap` dispatch table, `hv_trap` and the vCPU/VM
+    destroy callbacks in `osfmk/arm64/hv/hv.c`, plus the hypervisor
+    return codes and the new `hv_vm.h`, `hv_vcpu.h` and
+    `hv_compat_paranested.h` declarations.
 
 The patches contain only public xnu text plus original reconstruction;
 no Apple binary, dSYM, SDK payload or extracted proprietary header is

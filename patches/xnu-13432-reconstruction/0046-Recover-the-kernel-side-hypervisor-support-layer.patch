@@ -1,0 +1,215 @@
+From 487011cfd91a6592c6eab2a6cd452ddc900caab6 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 05:54:50 +0000
+Subject: [PATCH 1/2] Recover the kernel-side hypervisor support layer
+
+xnu-13432 split the hypervisor support code by architecture: the
+x86-only osfmk/kern/hv_support_kext.c keeps the kext-facing code, and
+the new osfmk/kern/hv_support_kern.c holds the machine-independent
+globals and task/thread target accessors.  Recover it from the kasan
+reference kernel and the KDK 27.0.1 DWARF:
+
+ - hv_support_available (line 42) and hv_disable (44).
+ - hv_support_init (48) stores the _Bool result of hv_init().
+ - hv_get_support (55) returns the saved value.
+ - hv_set_task_target/hv_set_thread_target (62/69) and the getters
+   (76/83) read and write task.hv_task_target (ptrauth-signed) and
+   thread.hv_thread_target at the reference call sites.
+
+Add the reconstructed osfmk/kern/hv_support_kern.h (declaration lines
+35-76 from the DWARF) and the first part of osfmk/arm64/hv/hv.h, which
+declares hv_init (line 49), hv_trap (59) and the two hv_callback_*
+hooks (108/115) used by the arm64 task/thread teardown paths.
+
+Compiled with the translation unit's recovered DW_AT_APPLE_flags: the
+generated calls match the reference.  The ptrauth signing on
+task.hv_task_target could not be exercised because the local clang
+lacks ptrauth support; the field and its qualifier are unchanged from
+the public tree.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ osfmk/arm64/hv/hv.h          | 30 ++++++++++++++++++++++++++
+ osfmk/kern/Makefile          |  1 +
+ osfmk/kern/hv_support_kern.c | 42 ++++++++++++++++++++----------------
+ osfmk/kern/hv_support_kern.h | 35 ++++++++++++++++++++++++++++++
+ 4 files changed, 89 insertions(+), 19 deletions(-)
+ create mode 100644 osfmk/arm64/hv/hv.h
+ create mode 100644 osfmk/kern/hv_support_kern.h
+
+diff --git a/osfmk/arm64/hv/hv.h b/osfmk/arm64/hv/hv.h
+new file mode 100644
+index 000000000..628240994
+--- /dev/null
++++ b/osfmk/arm64/hv/hv.h
+@@ -0,0 +1,30 @@
++/*
++ * Reconstruction of osfmk/arm64/hv/hv.h from the xnu-13432 reference
++ * kernel.
++ *
++ * Kernel-internal hypervisor entry points used by the arm64 code and by
++ * the hypervisor support layer.  Only the declarations recovered so far
++ * are present; the reference line number of each one is recorded above
++ * it so the rest of the header can be filled in as the hv translation
++ * units are recovered.
++ */
++#ifndef XNU13432_OSFMK_ARM64_HV_HV_H
++#define XNU13432_OSFMK_ARM64_HV_HV_H
++
++#include <kern/kern_types.h>
++#include <mach/arm/thread_status.h>
++#include <arm64/hv/hv_kern_types.h>
++
++/* hv.h:49 */
++_Bool hv_init(void);
++
++/* hv.h:59 */
++void hv_trap(arm_saved_state_t * state);
++
++/* hv.h:108 */
++void hv_callback_thread_destroy(void * thread_target);
++
++/* hv.h:115 */
++void hv_callback_task_destroy(void * task_target);
++
++#endif /* XNU13432_OSFMK_ARM64_HV_HV_H */
+diff --git a/osfmk/kern/Makefile b/osfmk/kern/Makefile
+index 1c856dd06..21fe846fb 100644
+--- a/osfmk/kern/Makefile
++++ b/osfmk/kern/Makefile
+@@ -74,6 +74,7 @@ EXPORT_FILES = \
+ 	extmod_statistics.h \
+ 	hv_io_notifier.h \
+ 	hv_support.h \
++	hv_support_kern.h \
+ 	hv_support_kext.h \
+ 	ipc_mig.h \
+ 	ipc_misc.h \
+diff --git a/osfmk/kern/hv_support_kern.c b/osfmk/kern/hv_support_kern.c
+index f36ac98c9..344a90370 100644
+--- a/osfmk/kern/hv_support_kern.c
++++ b/osfmk/kern/hv_support_kern.c
+@@ -1,44 +1,50 @@
+ /*
+- * Reconstruction of osfmk/kern/hv_support_kern.c from the xnu-13432 reference kernel.
++ * Reconstruction of osfmk/kern/hv_support_kern.c from the xnu-13432
++ * reference kernel.
+  *
+- * Function signatures and ordering are derived from the KDK 27.0.1
+- * DWARF.  Functions marked RECON were moved from the public xnu source
+- * when the reference kernel placed them in this file; bodies marked
+- * "body not recovered" are still stubs.
++ * In xnu-13432 the hypervisor support globals and the accessors that
++ * associate an opaque hypervisor object with the current task or thread
++ * moved out of the x86-only osfmk/kern/hv_support_kext.c into this
++ * file.  Bodies recovered from the kasan reference kernel and the KDK
++ * 27.0.1 DWARF.
+  */
+ #include <kern/kern_types.h>
+-#include <kern/assert.h>
+-#include <kern/debug.h>
+-#include <kern/zalloc.h>
+-#include <sys/systm.h>
++#include <kern/hv_support_kern.h>
++#include <kern/task.h>
++#include <kern/thread.h>
++#include <arm64/hv/hv.h>
+ 
+ #define RECON_OSFMK_KERN_HV_SUPPORT_KERN_C 1
+ 
++/* osfmk/kern/hv_support_kern.c:42 */
++int hv_support_available = 0;
++
++/* osfmk/kern/hv_support_kern.c:44 */
++int hv_disable = 0;
++
+ /* osfmk/kern/hv_support_kern.c:48 */
+ void
+ hv_support_init(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: hv_support_init");
++	hv_support_available = hv_init();
+ }
+ 
+ /* osfmk/kern/hv_support_kern.c:55 */
+ int
+ hv_get_support(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: hv_get_support");
++	return hv_support_available;
+ }
+ 
+ /* osfmk/kern/hv_support_kern.c:62 */
+-static void
++void
+ hv_set_task_target(void *target)
+ {
+ 	current_task()->hv_task_target = target;
+ }
+ 
+ /* osfmk/kern/hv_support_kern.c:69 */
+-static void
++void
+ hv_set_thread_target(void *target)
+ {
+ 	current_thread()->hv_thread_target = target;
+@@ -48,14 +54,12 @@ hv_set_thread_target(void *target)
+ void *
+ hv_get_task_target(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: hv_get_task_target");
++	return current_task()->hv_task_target;
+ }
+ 
+ /* osfmk/kern/hv_support_kern.c:83 */
+ void *
+ hv_get_thread_target(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: hv_get_thread_target");
++	return current_thread()->hv_thread_target;
+ }
+diff --git a/osfmk/kern/hv_support_kern.h b/osfmk/kern/hv_support_kern.h
+new file mode 100644
+index 000000000..6b73d6dbc
+--- /dev/null
++++ b/osfmk/kern/hv_support_kern.h
+@@ -0,0 +1,35 @@
++/*
++ * Reconstruction of osfmk/kern/hv_support_kern.h from the xnu-13432
++ * reference kernel.
++ *
++ * Kernel-side hypervisor support API.  The declarations and their
++ * reference line numbers are derived from the KDK 27.0.1 DWARF; the
++ * implementations live in osfmk/kern/hv_support_kern.c.
++ */
++#ifndef XNU13432_OSFMK_KERN_HV_SUPPORT_KERN_H
++#define XNU13432_OSFMK_KERN_HV_SUPPORT_KERN_H
++
++#include <kern/kern_types.h>
++
++/* hv_support_kern.h:35 */
++extern int hv_support_available;
++
++/* hv_support_kern.h:41 */
++extern void hv_support_init(void);
++
++/* hv_support_kern.h:48 */
++extern int hv_get_support(void);
++
++/* hv_support_kern.h:55 */
++extern void hv_set_task_target(void *target);
++
++/* hv_support_kern.h:62 */
++extern void hv_set_thread_target(void *target);
++
++/* hv_support_kern.h:69 */
++extern void * hv_get_task_target(void);
++
++/* hv_support_kern.h:76 */
++extern void * hv_get_thread_target(void);
++
++#endif /* XNU13432_OSFMK_KERN_HV_SUPPORT_KERN_H */
