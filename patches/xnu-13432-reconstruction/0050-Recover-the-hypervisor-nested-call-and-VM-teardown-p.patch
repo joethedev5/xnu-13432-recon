@@ -1,0 +1,312 @@
+From 6937ae000e02436bb8b7d1d07ec3b6f4ade7f047 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 19:30:33 +0000
+Subject: [PATCH] Recover the hypervisor nested-call and VM teardown paths
+
+Reconstruct four functions of osfmk/arm64/hv/hv_vm_paranested.c from
+the reference disassembly and DWARF:
+
+ - hv_nested_call() (line 58) is the C99 inline nested-hypervisor call.
+   It rejects services outside the 0xc6000000 family (the low five bits
+   select the service; the check compiles to a compare of service >> 5
+   with 0x6300000), loads x0-x5 from the input half of the call record,
+   issues "hvc #0", stores the six result registers into the output
+   half and returns HV_SUCCESS.  The out-of-line copy exists in the
+   reference kernel; an extern declaration in hv_vm.h gives the inline
+   definition external linkage (the reference declaration site was not
+   recovered).
+ - hv_get_host_capabilities() (line 121): assert the buffer and its
+   phys address are page aligned, translate with kvtophys(), return
+   HV_ERROR when the translation is zero, then issue service 0xc6000000
+   with the physical address and hv_vm_max_permitted_isa() and return
+   the nested call's status.
+ - _hv_vm_destroy() (line 163): drain map_list_head with LIST_EMPTY /
+   LIST_FIRST / LIST_REMOVE (the public LIST_REMOVE validation calls are
+   visible in both images), ubc_upl_commit() each entry->upl and
+   kfree_type() the 40-byte hv_map_entry_t, issue service 0xc6000018
+   with vm->host_vm_id, then lck_mtx_free() the mutex and kfree_type()
+   the VM object.
+ - hv_trap_paravirtualized_nested_service() (line 289): copy in the
+   96-byte call record, accept only services with the low nibble set
+   (compare of service >> 4 with 0xc600000), run the call, copy the
+   record back out and return HV_BAD_ARGUMENT on either copy failure or
+   a bad service.
+
+Fix the recovered data structures these need: hv_nested_call_params_t is
+the real 96-byte record ({ service, args[5] } followed by { result[6] }),
+and hv_map_entry_s uses LIST_ENTRY/LIST_HEAD for its 16-byte entry_link
+and the single-word map list.
+
+The kasan reference build has a different hv_vm_t layout from the
+release build (56 bytes with user_map at 24 and map_list_head at 48,
+versus 48 bytes with user_map at 16 and map_list_head at 40), i.e. the
+kasan configuration adds one pointer-sized member at offset 16.  This
+tree follows the release layout, and the local compile reproduces the
+release offsets and the reference control flow for all four functions.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ osfmk/arm64/hv/hv_interface.h     |  14 ++-
+ osfmk/arm64/hv/hv_objects.h       |   7 +-
+ osfmk/arm64/hv/hv_vm.h            |   9 ++
+ osfmk/arm64/hv/hv_vm_paranested.c | 137 ++++++++++++++++++++++++++----
+ 4 files changed, 144 insertions(+), 23 deletions(-)
+
+diff --git a/osfmk/arm64/hv/hv_interface.h b/osfmk/arm64/hv/hv_interface.h
+index 5cda9f38d..b72486751 100644
+--- a/osfmk/arm64/hv/hv_interface.h
++++ b/osfmk/arm64/hv/hv_interface.h
+@@ -66,9 +66,19 @@ typedef struct {
+ 	uint64_t id;
+ 	uint64_t interface;
+ } hv_vcpu_create_t;
++/*
++ * Parameter record of a paravirtualized nested-hypervisor call: the input
++ * half holds the service selector and its five arguments (x0-x5 on entry),
++ * the output half receives the six result registers (x0-x5 on return).
++ */
+ typedef struct {
+-	void * input;
+-	void * output;
++	struct {
++		uint64_t service;
++		uint64_t args[5];
++	} input;
++	struct {
++		uint64_t result[6];
++	} output;
+ } hv_nested_call_params_t;
+ /* hv_interface.h:208 */
+ typedef uint32_t hv_vm_isa_t;
+diff --git a/osfmk/arm64/hv/hv_objects.h b/osfmk/arm64/hv/hv_objects.h
+index 8cc0f8524..1d768ae97 100644
+--- a/osfmk/arm64/hv/hv_objects.h
++++ b/osfmk/arm64/hv/hv_objects.h
+@@ -11,6 +11,7 @@
+ #include <kern/locks.h>
+ #include <kern/bits.h>
+ #include <os/refcnt.h>
++#include <sys/queue.h>
+ #include <arm64/hv/guest_thread_state.h>
+ 
+ typedef struct {
+@@ -27,12 +28,10 @@ struct hv_map_entry_s {
+ 	struct upl *upl;
+ 	uint64_t ipa;
+ 	uint64_t size;
+-	void * entry_link;
++	LIST_ENTRY(hv_map_entry_s) entry_link;
+ };
+ typedef struct hv_map_entry_s hv_map_entry_t;
+-struct hv_map_list_s {
+-	struct hv_map_entry_s *lh_first;
+-};
++LIST_HEAD(hv_map_list_s, hv_map_entry_s);
+ typedef struct hv_map_list_s hv_map_list_t;
+ struct hv_vm_t {
+ 	lck_mtx_t *mtx;
+diff --git a/osfmk/arm64/hv/hv_vm.h b/osfmk/arm64/hv/hv_vm.h
+index 00d01605d..bf68118e1 100644
+--- a/osfmk/arm64/hv/hv_vm.h
++++ b/osfmk/arm64/hv/hv_vm.h
+@@ -26,6 +26,15 @@ hv_vm_isa_t hv_vm_max_permitted_isa(void);
+ /* hv_vm.h:46 */
+ hv_return_t hv_get_host_capabilities(vm_offset_t caps_buffer);
+ 
++/*
++ * hv_nested_call() is defined inline in hv_vm_paranested.c; its
++ * declaration site in the reference headers was not recovered from the
++ * DWARF, so this declaration stands in for it.  It also gives the C99
++ * inline definition external linkage, matching the reference kernel's
++ * out-of-line _hv_nested_call symbol.
++ */
++extern hv_return_t hv_nested_call(hv_nested_call_params_t * pnv_args);
++
+ /* hv_vm.h:47 */
+ _Bool hv_paranested_virtualization_init_handshake(
+ 	_Bool * initialized,
+diff --git a/osfmk/arm64/hv/hv_vm_paranested.c b/osfmk/arm64/hv/hv_vm_paranested.c
+index b45e32caf..9449eaf53 100644
+--- a/osfmk/arm64/hv/hv_vm_paranested.c
++++ b/osfmk/arm64/hv/hv_vm_paranested.c
+@@ -1,44 +1,125 @@
+ /*
+  * Reconstruction of osfmk/arm64/hv/hv_vm_paranested.c from the xnu-13432 reference kernel.
+  *
+- * Function signatures and ordering are derived from the KDK 27.0.1
+- * DWARF.  Functions marked RECON were moved from the public xnu source
+- * when the reference kernel placed them in this file; bodies marked
+- * "body not recovered" are still stubs.
++ * Function signatures, ordering and bodies are derived from the KDK 27.0.1
++ * DWARF and the disassembly of the reference kernel.  Functions marked
++ * RECON are moved from the public xnu source when the reference kernel
++ * placed them in this file; bodies marked "body not recovered" are still
++ * stubs.
+  */
+-#include <kern/kern_types.h>
++#include <arm64/hv/hv.h>
++#include <arm64/hv/hv_vm.h>
++#include <arm64/hv/hv_internal.h>
++#include <arm64/hv/hv_objects.h>
++#include <arm/pmap.h>
+ #include <kern/assert.h>
+-#include <kern/debug.h>
+-#include <kern/zalloc.h>
+-#include <sys/systm.h>
++#include <kern/kalloc.h>
++#include <kern/locks.h>
++#include <libkern/copyio.h>
++#include <mach/vm_param.h>
++#include <sys/queue.h>
++#include <sys/ubc.h>
+ 
+ #define RECON_OSFMK_ARM64_HV_HV_VM_PARANESTED_C 1
+ 
+ /* Declared in hv_space_paranested.c; prototype omitted from the public tree. */
+ extern hv_return_t hv_space_map_op_nested(user_addr_t mip, uint64_t fn);
+ 
++/*
++ * Issue a paravirtualized nested-hypervisor call.
++ *
++ * The input half of the record is loaded into x0-x5 (the service selector
++ * followed by its five arguments), the host services the call with
++ * "hvc #0", and the six result registers are stored into the output half.
++ *
++ * Only services in the 0xc6000000 family are forwarded; the low five bits
++ * select the individual service.  A bad service returns HV_BAD_ARGUMENT
++ * without entering the host.
++ */
+ /* osfmk/arm64/hv/hv_vm_paranested.c:58 */
+-hv_return_t
++inline hv_return_t
+ hv_nested_call(hv_nested_call_params_t * pnv_args)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: hv_nested_call");
++	if ((pnv_args->input.service & ~0x1fULL) != 0xc6000000ULL) {
++		return HV_BAD_ARGUMENT;
++	}
++
++	register uint64_t x0 asm("x0") = pnv_args->input.service;
++	register uint64_t x1 asm("x1") = pnv_args->input.args[0];
++	register uint64_t x2 asm("x2") = pnv_args->input.args[1];
++	register uint64_t x3 asm("x3") = pnv_args->input.args[2];
++	register uint64_t x4 asm("x4") = pnv_args->input.args[3];
++	register uint64_t x5 asm("x5") = pnv_args->input.args[4];
++
++	asm volatile("hvc #0"
++	    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5));
++
++	pnv_args->output.result[0] = x0;
++	pnv_args->output.result[1] = x1;
++	pnv_args->output.result[2] = x2;
++	pnv_args->output.result[3] = x3;
++	pnv_args->output.result[4] = x4;
++	pnv_args->output.result[5] = x5;
++
++	return HV_SUCCESS;
+ }
+ 
++/*
++ * Ask the host hypervisor to fill the capabilities structure at the
++ * physical address backing caps_buffer.  The permitted ISA level is passed
++ * along so the host can filter the advertised capabilities.
++ */
+ /* osfmk/arm64/hv/hv_vm_paranested.c:121 */
+ hv_return_t
+ hv_get_host_capabilities(vm_offset_t caps_buffer)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: hv_get_host_capabilities");
++	assert(caps_buffer != 0);
++	assert((caps_buffer & PAGE_MASK) == 0);
++
++	pmap_paddr_t caps_buffer_paddr = kvtophys(caps_buffer);
++	if (caps_buffer_paddr == 0) {
++		return HV_ERROR;
++	}
++	assert((caps_buffer_paddr & PAGE_MASK) == 0);
++
++	hv_nested_call_params_t pnv_args = {
++		.input.service = 0xc6000000,
++		.input.args = {
++			caps_buffer_paddr,
++			hv_vm_max_permitted_isa(),
++		},
++	};
++
++	return hv_nested_call(&pnv_args);
+ }
+ 
++/*
++ * Destroy a VM object: release the upls of the remaining mappings, tell
++ * the host that the VM is going away, and free the mutex and the object
++ * itself.
++ */
+ /* osfmk/arm64/hv/hv_vm_paranested.c:163 */
+ void
+ _hv_vm_destroy(hv_vm_t * vm)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: _hv_vm_destroy");
++	while (!LIST_EMPTY(&vm->map_list_head)) {
++		hv_map_entry_t * entry = LIST_FIRST(&vm->map_list_head);
++		LIST_REMOVE(entry, entry_link);
++		ubc_upl_commit(entry->upl);
++		kfree_type(hv_map_entry_t, entry);
++	}
++
++	hv_nested_call_params_t pnv_args = {
++		.input.service = 0xc6000018,
++		.input.args = {
++			vm->host_vm_id,
++		},
++	};
++
++	hv_nested_call(&pnv_args);
++
++	lck_mtx_free(vm->mtx, &hv_lck_grp);
++	kfree_type(hv_vm_t, vm);
+ }
+ 
+ /* osfmk/arm64/hv/hv_vm_paranested.c:190 */
+@@ -70,12 +151,34 @@ hv_trap_vm_protect(uint64_t arg)
+ 	return hv_space_map_op_nested(arg, 0xc6000017);
+ }
+ 
++/*
++ * Forward a user-supplied nested-hypervisor call: copy the call record in,
++ * forward only the services the paravirtualized interface exposes (the low
++ * nibble of the service selects one of them), run it, and copy the record
++ * (with the results) back out.
++ */
+ /* osfmk/arm64/hv/hv_vm_paranested.c:289 */
+ hv_return_t
+ hv_trap_paravirtualized_nested_service(uint64_t arg)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: hv_trap_paravirtualized_nested_service");
++	user_addr_t user_arg = (user_addr_t)arg;
++	hv_nested_call_params_t pnv_args = { };
++
++	if (copyin(user_arg, &pnv_args, sizeof(pnv_args)) != 0) {
++		return HV_BAD_ARGUMENT;
++	}
++
++	if ((pnv_args.input.service & ~0xfULL) != 0xc6000000ULL) {
++		return HV_BAD_ARGUMENT;
++	}
++
++	hv_return_t ret = hv_nested_call(&pnv_args);
++
++	if (copyout(&pnv_args, user_arg, sizeof(pnv_args)) != 0) {
++		ret = HV_BAD_ARGUMENT;
++	}
++
++	return ret;
+ }
+ 
+ /* osfmk/arm64/hv/hv_vm_paranested.c:323 */
+-- 
+2.47.3
+

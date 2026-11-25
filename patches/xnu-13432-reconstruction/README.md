@@ -9,7 +9,7 @@ Apply in numeric order from a clean checkout:
 
 ```
 git checkout xnu-12377.121.6
-git am 0001-*.patch ... 0049-*.patch
+git am 0001-*.patch ... 0050-*.patch
 ```
 
 Contents:
@@ -117,6 +117,13 @@ Contents:
     overwrite into the owning task, the `HV_ERROR` deallocation path,
     and the `kif`/`uif` publication with the page-alignment
     assertions.
+50. The hypervisor nested-call and VM teardown paths in
+    `osfmk/arm64/hv/hv_vm_paranested.c`: the inline `hvc`-based
+    `hv_nested_call`, `hv_get_host_capabilities`,
+    `_hv_vm_destroy` (map-list drain, host notification, mutex and
+    object teardown) and `hv_trap_paravirtualized_nested_service`,
+    with the real 96-byte `hv_nested_call_params_t` and the LIST-based
+    `hv_map_entry_s` linkage.
 
 The patches contain only public xnu text plus original reconstruction;
 no Apple binary, dSYM, SDK payload or extracted proprietary header is

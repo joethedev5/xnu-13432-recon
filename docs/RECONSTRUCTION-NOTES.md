@@ -1119,3 +1119,86 @@ the generated instruction sequence matches the release control flow
 constants and the free order).
 
 The patch series now has 49 entries; 105 explicit stubs remain.
+
+## 2026-11-25: nested call, host capabilities and VM teardown
+
+Four functions of `hv_vm_paranested.c` were recovered.  The file starts
+with an inline `hvc` helper and ends (in this range) with the VM and
+vCPU trap handlers; the kasan image keeps an out-of-line copy of the
+helper (`_hv_nested_call` at 0xfffffe0007b9cc18, 172 bytes) even though
+the release build inlines it everywhere.
+
+- `hv_nested_call` (line 58, C99 `inline`): the body checks the service
+  selector before entering the host.  The check compiles to
+  `service >> 5 == 0x6300000`, i.e. it accepts the family
+  0xc6000000-0xc600001f and rejects anything else with HV_BAD_ARGUMENT
+  (0xfae94003); a mask-and-compare against 0xffffffe0 compiles
+  differently, so the source uses a shift or `& ~0x1f` expression.
+  The call itself loads x0-x5 from `input.service`/`input.args[0..4]`,
+  executes `hvc #0` and stores x0-x5 into `output.result[0..5]`, then
+  returns HV_SUCCESS.  The out-of-line symbol exists in the reference,
+  so the definition is `inline` (not `static inline`); an extern
+  declaration in `hv_vm.h` stands in for the unrecovered declaration
+  site and gives the definition external linkage.
+- `hv_get_host_capabilities` (line 121): asserts `caps_buffer != 0` and
+  `(caps_buffer & PAGE_MASK) == 0` (kasan descriptor text), translates
+  the buffer with `kvtophys()` (line 130:35, column pinned by
+  `pmap_paddr_t caps_buffer_paddr = kvtophys(caps_buffer);`), returns
+  HV_ERROR (0xfae94001) when the physical address is zero, asserts its
+  page alignment (descriptor `(caps_buffer_paddr & PAGE_MASK) == 0`),
+  then issues service 0xc6000000 with the physical address and
+  `hv_vm_max_permitted_isa()` (zero-extended 32-bit) and returns
+  `hv_nested_call(&pnv_args)` directly (the inline call is attributed
+  to line 150, column 9, matching `return hv_nested_call(...)`).
+- `_hv_vm_destroy` (line 163): drains `vm->map_list_head` with a
+  `LIST_EMPTY`/`LIST_FIRST`/`LIST_REMOVE` loop (the source uses the
+  bsd LIST macros: entry linkage is `le_next` at +0x18 and `le_prev` at
+  +0x20, and the public LIST_REMOVE validation expands to the two
+  `ml_fatal_trap_invalid_list_linkage` call sites visible at 168:3),
+  `ubc_upl_commit(entry->upl)` (line 169, argument column 25) and
+  `kfree_type(hv_map_entry_t, entry)` (line 170, which emits the local
+  `kalloc_type_view_170` static that appears in the kasan symbol table
+  as `__hv_vm_destroy.kalloc_type_view_170`).  It then issues service
+  0xc6000018 with `vm->host_vm_id` (initializer at line 173:26, value
+  at 174:12, host_vm_id read at 177:9, call at 181:2), frees the mutex
+  with `lck_mtx_free(vm->mtx, &hv_lck_grp)` (line 184; the release
+  build inlines lck_mtx_free into `lck_mtx_destroy` plus
+  `zfree(KT_LCK_MTX, ...)` while kasan keeps the call) and frees the VM
+  with `kfree_type(hv_vm_t, vm)` (line 186, `kalloc_type_view_186`).
+- `hv_trap_paravirtualized_nested_service` (line 289): copies the
+  96-byte call record in (the `__copyin_chk` inline from
+  `libkern/copyio.h` is visible at copyio.h:54), returns HV_BAD_ARGUMENT
+  when the copy fails (294:6), accepts only services with the low
+  nibble free (`service >> 4 == 0xc600000`, line 300:6, i.e. the
+  user-exposed range 0xc6000000-0xc600000f), runs the nested call,
+  copies the record back out (copyio.h:63) and returns HV_SUCCESS or
+  HV_BAD_ARGUMENT according to the copyout result (the final status is
+  a `cmp`/`csel` pair in both images).
+
+Structure fixes carried by this increment: `hv_nested_call_params_t`
+was a placeholder pair of pointers and is now the real 96-byte record
+(anonymous input { service; args[5] } at 0, anonymous output
+{ result[6] } at 48; sizes and member names from the kasan type graph),
+and `hv_map_entry_s` now uses `LIST_ENTRY`/`LIST_HEAD` so its 16-byte
+linkage matches the recovered `le_next`/`le_prev` members and the
+`hv_map_list_s.lh_first` head.
+
+The kasan build's `hv_vm_t` is 56 bytes (user_map at 24, map_list_head
+at 48) while the release build's is 48 bytes (user_map at 16,
+map_list_head at 40): the kasan configuration adds one pointer-sized
+member at offset 16.  The reconstruction follows the release layout.
+The release build's `hv_nested_call`/`hv_paranested_...` code paths
+were also the template for the local compile check, which reproduces
+the service checks (`lsr #5`, `lsr #4`), the hvc register marshalling,
+the LIST_REMOVE validation traps and the trap status `csel`.
+
+The reference file also defines
+`hv_paranested_virtualization_init_handshake` (line 406); the release
+dSYM drops its DIE (LTO inlined the only call into hv_init), so it is
+still a stub and must be recovered from the kasan body at
+0xfffffe0007b9dc6c.  The local compile harness needed stubs for
+Apple's `__builtin_xnu_type_summary`/`__builtin_xnu_type_signature`/
+`__builtin_xnu_types_compatible` (used by the kalloc_type macros);
+those shims are harness-only and not part of the tree.
+
+The patch series now has 50 entries; 101 explicit stubs remain.
