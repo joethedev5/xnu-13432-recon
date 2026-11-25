@@ -9,7 +9,7 @@ Apply in numeric order from a clean checkout:
 
 ```
 git checkout xnu-12377.121.6
-git am 0001-*.patch ... 0021-*.patch
+git am 0001-*.patch ... 0022-*.patch
 ```
 
 Contents:
@@ -24,11 +24,14 @@ Contents:
 5. `tcp_rbbr_rwnd_init` and the missing `tcpcb.t_rbbr_state` member.
 6. Relocation of the VM map store types into
    `vm_map_store_types_internal.h`.
-7-18. RBBR state management, tunables, utilization/RTT-median and
+7-20. RBBR state management, tunables, utilization/RTT-median and
    phase-log code, `tcp_tfo_process_last_ack`, VM page telemetry
-   init, the receive-window selector and its SYN-ACK call site, and
-   the AccECN/ECN heuristic functions, including the SYN-RST path,
-   and the TFO faulty-middlebox path.
+   init, the receive-window selector and its SYN-ACK call site, the
+   AccECN/ECN heuristic functions, and the TFO faulty-middlebox path.
+21-22. The per-CPU advanced TCP timer subsystem: the recovered
+   `tcp_timer_advanced.c`, its inline header API, the new
+   `tcpcb.t_timer_entries[]` array and the two reused `t_flags`
+   bits.
 
 The patches contain only public xnu text plus original reconstruction;
 no Apple binary, dSYM, SDK payload or extracted proprietary header is

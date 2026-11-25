@@ -1,7 +1,7 @@
 From e40bc5c9c6702df4607e9d3f02d9f54290457730 Mon Sep 17 00:00:00 2001
 From: joethedev5 <deepsbx1@proton.me>
 Date: Wed, 25 Nov 2026 02:33:44 +0000
-Subject: [PATCH 18/21] Recover tcp_ecn_check_data_rst_heur
+Subject: [PATCH 18/22] Recover tcp_ecn_check_data_rst_heur
 
 Require negotiated ECN (or accurate ECN) and a first data segment
 (snd_una == iss + 1 with data outstanding) before running the ECN

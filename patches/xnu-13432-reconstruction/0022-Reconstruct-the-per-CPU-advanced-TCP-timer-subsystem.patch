@@ -1,0 +1,1098 @@
+From 38c3cea06b2d5fcdcb8c185b036515f6fee49b26 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 02:56:10 +0000
+Subject: [PATCH 22/22] Reconstruct the per-CPU advanced TCP timer subsystem
+
+Recover all 28 functions of bsd/netinet/tcp_timer_advanced.c from the
+release-kernel disassembly, each annotated with its reference
+file:line, plus the inline API in tcp_timer_advanced.h:
+
+- the te_node/te_next/te_free/te_tp/te_inp/te_expires layout and the
+  four inline accessors (schedule, cancel, isactive, get_value)
+- RB tree management (RB_GENERATE over te_expires with a pointer
+  tiebreak) with tree_remove/calculate_softexpires/entry alloc and
+  freelist handling
+- tcp_timer_advanced_add/remove/cleanup with the inlined
+  socket_lock_assert_owned and the TF_TIMER_ENTRY_USECOUNT socket
+  usecount handoff
+- the per-CPU thread_call: invoke_handler, process_cpu_timer, the
+  interface-probe snapshot/execute pair, reschedule_cpu and init.
+
+tcp_var.h gains t_timer_entries[TCPT_NTIMERS] at tcpcb offset 0x58
+(the field that shifts t_inpcb to 0xa8) and the two reused t_flags
+bits, TF_TIMER_ADVANCED (0x02000000) and TF_TIMER_ENTRY_USECOUNT
+(0x80000000).  tcp_offset_from_latest_tx loses its static linkage so
+the header inline can call it, matching its DWARF inline location in
+tcp_timer.c.
+
+Remaining explicit stubs: 259.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ bsd/netinet/tcp_timer.c          |   2 +-
+ bsd/netinet/tcp_timer_advanced.c | 756 ++++++++++++++++++++++++++-----
+ bsd/netinet/tcp_timer_advanced.h | 125 ++++-
+ bsd/netinet/tcp_var.h            |   5 +-
+ 4 files changed, 759 insertions(+), 129 deletions(-)
+
+diff --git a/bsd/netinet/tcp_timer.c b/bsd/netinet/tcp_timer.c
+index 11673bd3a..4a0b8d1f7 100644
+--- a/bsd/netinet/tcp_timer.c
++++ b/bsd/netinet/tcp_timer.c
+@@ -2883,7 +2883,7 @@ tcp_itimer(struct inpcbinfo *ipi)
+ 	lck_rw_done(&ipi->ipi_lock);
+ }
+ 
+-static uint32_t
++uint32_t
+ tcp_offset_from_latest_tx(const struct tcpcb *tp, uint32_t offset)
+ {
+ 	if (TSTMP_GT(tp->t_latest_tx, tcp_now)) {
+diff --git a/bsd/netinet/tcp_timer_advanced.c b/bsd/netinet/tcp_timer_advanced.c
+index 8f155c4d7..a8f2bfa4d 100644
+--- a/bsd/netinet/tcp_timer_advanced.c
++++ b/bsd/netinet/tcp_timer_advanced.c
+@@ -2,237 +2,759 @@
+  * Reconstruction of bsd/netinet/tcp_timer_advanced.c from the xnu-13432 reference kernel.
+  *
+  * Function signatures and ordering are derived from the KDK 27.0.1
+- * DWARF.  Functions marked RECON were moved from the public xnu source
+- * when the reference kernel placed them in this file; bodies marked
+- * "body not recovered" are still stubs.
++ * DWARF.  Bodies are recovered from the reference kernel disassembly.
+  */
++#include "tcp_includes.h"
++
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/kernel.h>
++#include <sys/mbuf.h>
++#include <sys/socketvar.h>
++#include <net/if.h>
++#include <net/if_var.h>
++#include <netinet/in_pcb.h>
++#include <netinet/tcp_timer.h>
++#include <netinet/tcp_var.h>
+ #include <netinet/tcp_timer_advanced.h>
++#include <arm/cpu_internal.h>
++#include <kern/clock.h>
++#include <kern/cpu_number.h>
++#include <kern/locks.h>
++#include <kern/thread_call.h>
++#include <kern/zalloc.h>
+ 
+-#define RECON_BSD_NETINET_TCP_TIMER_ADVANCED_C 1
+-
+-/* bsd/netinet/tcp_timer_advanced.c:50 */
+-struct tcp_timer_entry *
+-tcp_timer_tree_RB_GETPARENT(struct tcp_timer_entry * elm)
+-{
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_timer_tree_RB_GETPARENT");
+-}
+-
+-/* bsd/netinet/tcp_timer_advanced.c:50 */
+-int
+-tcp_timer_tree_RB_GETCOLOR(struct tcp_timer_entry * elm)
+-{
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_timer_tree_RB_GETCOLOR");
+-}
+-
+-/* bsd/netinet/tcp_timer_advanced.c:50 */
+-void
+-tcp_timer_tree_RB_SETCOLOR(struct tcp_timer_entry * elm, int color)
+-{
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_timer_tree_RB_SETCOLOR");
+-}
+-
+-/* bsd/netinet/tcp_timer_advanced.c:50 */
+-struct tcp_timer_entry *
+-tcp_timer_tree_RB_SETPARENT(struct tcp_timer_entry * elm, struct tcp_timer_entry * parent)
+-{
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_timer_tree_RB_SETPARENT");
+-}
+-
+-/* bsd/netinet/tcp_timer_advanced.c:50 */
+-void
+-tcp_timer_tree_RB_INSERT_COLOR(struct tcp_timer_tree * head, struct tcp_timer_entry * elm)
+-{
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_timer_tree_RB_INSERT_COLOR");
+-}
++#define TCP_TIMER_MAX_CPUS      32
++#define TCP_TIMER_FREELIST_MAX  512
+ 
+-/* bsd/netinet/tcp_timer_advanced.c:50 */
+-void
+-tcp_timer_tree_RB_REMOVE_COLOR(struct tcp_timer_tree * head, struct tcp_timer_entry * parent, struct tcp_timer_entry * elm)
+-{
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_timer_tree_RB_REMOVE_COLOR");
+-}
++void tcp_timer_reschedule_cpu(struct tcp_timer_cpu *per_cpu);
+ 
+-/* bsd/netinet/tcp_timer_advanced.c:50 */
+-struct tcp_timer_entry *
+-tcp_timer_tree_RB_REMOVE(struct tcp_timer_tree * head, struct tcp_timer_entry * elm)
+-{
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_timer_tree_RB_REMOVE");
+-}
++int tcp_timer_advanced_enabled;
+ 
+-/* bsd/netinet/tcp_timer_advanced.c:50 */
+-struct tcp_timer_entry *
+-tcp_timer_tree_RB_INSERT(struct tcp_timer_tree * head, struct tcp_timer_entry * elm)
+-{
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_timer_tree_RB_INSERT");
+-}
++/*
++ * Number of per-CPU timer structures actually in use.  Initialized from
++ * real_ncpus (clamped to TCP_TIMER_MAX_CPUS) by tcp_timer_advanced_init().
++ */
++unsigned int tcp_timer_ncpus;
+ 
+-/* bsd/netinet/tcp_timer_advanced.c:50 */
+-struct tcp_timer_entry *
+-tcp_timer_tree_RB_MINMAX(struct tcp_timer_tree * head, int val)
+-{
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_timer_tree_RB_MINMAX");
+-}
++struct tcp_timer_cpu tcp_timer_cpus[TCP_TIMER_MAX_CPUS];
+ 
+ /* bsd/netinet/tcp_timer_advanced.c:50 */
+-struct tcp_timer_entry *
+-tcp_timer_tree_RB_NEXT(struct tcp_timer_entry * elm)
+-{
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_timer_tree_RB_NEXT");
+-}
++RB_GENERATE(tcp_timer_tree, tcp_timer_entry, te_node, tcp_timer_entry_cmp);
+ 
+ /* bsd/netinet/tcp_timer_advanced.c:53 */
+ uint64_t
+ tcp_timer_get_time(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_timer_get_time");
++	uint64_t now;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &now);
++	return now;
+ }
+ 
+ /* bsd/netinet/tcp_timer_advanced.c:65 */
+ void
+ tcp_timer_clear_rbtree_pointers(struct tcp_timer_entry * te)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_timer_clear_rbtree_pointers");
++	te->te_node.rbe_left = NULL;
++	te->te_node.rbe_right = NULL;
++	te->te_node.rbe_parent = NULL;
+ }
+ 
+ /* bsd/netinet/tcp_timer_advanced.c:77 */
+ void
+ tcp_timer_tree_remove(struct tcp_timer_cpu * per_cpu, struct tcp_timer_entry * te)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_timer_tree_remove");
++	RB_REMOVE(tcp_timer_tree, &per_cpu->active_timers_tree, te);
++	per_cpu->active_timers_cnt--;
++	te->te_flags = 0;
++	tcp_timer_clear_rbtree_pointers(te);
+ }
+ 
++/*
++ * Compute the soft expiry for a timer.  The leeway depends on the timer:
++ * retransmit-style timers use no leeway, keepalive/2MSL use 3.75% of the
++ * timeout, and the rest use 10%.  The leeway is capped at 100ms and the
++ * returned value never underflows.
++ */
+ /* bsd/netinet/tcp_timer_advanced.c:99 */
+ uint64_t
+ tcp_timer_calculate_softexpires(uint8_t timer_type, uint64_t hard_expires, uint64_t timeout_ns)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_timer_calculate_softexpires");
++	uint64_t leeway;
++
++	if (timer_type <= 7) {
++		if ((1u << timer_type) & 0x1d) {
++			leeway = 0;
++		} else if ((1u << timer_type) & 0xc0) {
++			leeway = timeout_ns * 15 / 4 / 100;
++		} else {
++			leeway = timeout_ns / 10;
++		}
++	} else {
++		leeway = timeout_ns / 10;
++	}
++
++	leeway = MIN(leeway, 100 * NSEC_PER_MSEC);
++
++	if (hard_expires > leeway) {
++		return hard_expires - leeway;
++	}
++	return hard_expires;
+ }
+ 
++/*
++ * Pick the per-CPU timer queue for a connection.  Connections with a
++ * flow hash are spread by it; otherwise the current CPU number is used.
++ */
+ /* bsd/netinet/tcp_timer_advanced.c:144 */
+-int
++static int
+ tcp_timer_select_cpu(struct tcpcb * tp)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_timer_select_cpu");
++	struct inpcb *inp = tp->t_inpcb;
++	uint32_t ncpus = tcp_timer_ncpus ? tcp_timer_ncpus : 1;
++	uint32_t hash;
++
++	if (inp != NULL && inp->inp_flowhash != 0) {
++		hash = inp->inp_flowhash;
++	} else {
++		hash = cpu_number();
++	}
++	return (int)(hash % ncpus);
+ }
+ 
+ /* bsd/netinet/tcp_timer_advanced.c:179 */
+-struct tcp_timer_entry *
++static struct tcp_timer_entry *
+ tcp_timer_entry_alloc(struct tcpcb * tp, uint8_t timer_type, uint64_t new_expires, uint64_t timeout_ns)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_timer_entry_alloc");
++	struct tcp_timer_cpu *per_cpu;
++	struct tcp_timer_entry *te;
++	int cpu;
++
++	cpu = tcp_timer_select_cpu(tp);
++	per_cpu = &tcp_timer_cpus[cpu];
++
++	lck_mtx_lock(&per_cpu->cpu_lock);
++	te = per_cpu->free_list;
++	if (te != NULL) {
++		per_cpu->free_list = te->te_free;
++		per_cpu->free_list_cnt--;
++	}
++	lck_mtx_unlock(&per_cpu->cpu_lock);
++
++	if (te == NULL) {
++		te = kalloc_type(struct tcp_timer_entry, Z_WAITOK | Z_ZERO);
++		if (te == NULL) {
++			return NULL;
++		}
++	}
++
++	te->te_tp = tp;
++	te->te_type = timer_type;
++	te->te_expires = new_expires;
++	te->te_softexpires = tcp_timer_calculate_softexpires(timer_type,
++	    new_expires, timeout_ns);
++	te->te_flags = TE_FLAG_IN_TREE;
++	te->te_next = NULL;
++	te->te_free = NULL;
++
++	return te;
+ }
+ 
++/*
++ * Put an entry back on the per-CPU free list.  Returns false when the free
++ * list is full and the caller must free the entry back to the allocator.
++ */
+ /* bsd/netinet/tcp_timer_advanced.c:229 */
+-_Bool
++static _Bool
+ tcp_timer_entry_add_to_freelist(struct tcp_timer_entry * te, struct tcp_timer_cpu * per_cpu)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_timer_entry_add_to_freelist");
++	if (per_cpu->free_list_cnt >= TCP_TIMER_FREELIST_MAX) {
++		return false;
++	}
++
++	te->te_tp = NULL;
++	te->te_inp = NULL;
++	te->te_type = 0;
++	te->te_expires = 0;
++	te->te_softexpires = 0;
++	te->te_flags = 0;
++	tcp_timer_clear_rbtree_pointers(te);
++
++	te->te_free = per_cpu->free_list;
++	per_cpu->free_list = te;
++	per_cpu->free_list_cnt++;
++
++	return true;
+ }
+ 
+ /* bsd/netinet/tcp_timer_advanced.c:253 */
+ void
+ tcp_timer_entry_free(struct tcp_timer_entry * te)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_timer_entry_free");
++	struct tcp_timer_cpu *per_cpu;
++	int cpu;
++
++	cpu = te->te_cpu;
++	per_cpu = &tcp_timer_cpus[cpu];
++
++	lck_mtx_lock(&per_cpu->cpu_lock);
++	if (!tcp_timer_entry_add_to_freelist(te, per_cpu)) {
++		lck_mtx_unlock(&per_cpu->cpu_lock);
++		kfree_type(struct tcp_timer_entry, te);
++		return;
++	}
++	lck_mtx_unlock(&per_cpu->cpu_lock);
+ }
+ 
+ /* bsd/netinet/tcp_timer_advanced.c:281 */
+ int
+ tcp_timer_advanced_add(struct tcpcb * tp, uint8_t timer_type, uint64_t timeout_ns)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_timer_advanced_add");
++	struct tcp_timer_cpu *per_cpu;
++	struct tcp_timer_entry *te;
++	struct tcp_timer_entry *new_te;
++	uint64_t soft_expires;
++	uint64_t now;
++	int cpu;
++
++	if (timer_type >= TCPT_NTIMERS) {
++		return EINVAL;
++	}
++
++	socket_lock_assert_owned(tp->t_inpcb->inp_socket);
++
++	now = tcp_timer_get_time();
++
++	/*
++	 * PTO and retransmit timers may need to be anchored to the last
++	 * transmit time instead of the current time, so that timers armed
++	 * by data transmission do not slide forward.
++	 */
++	if (timer_type == TCPT_PTO || timer_type == TCPT_REXMT) {
++		if ((int32_t)(tp->t_latest_tx - tcp_now) >= 1) {
++			uint64_t latest = tp->t_latest_tx_ns;
++
++			if (latest != 0 &&
++			    latest >= now - NSEC_PER_SEC &&
++			    latest <= now + 60 * NSEC_PER_SEC) {
++				now = latest;
++			}
++		}
++	}
++
++	soft_expires = now + timeout_ns;
++
++	te = tp->t_timer_entries[timer_type];
++	if (te != NULL) {
++		cpu = te->te_cpu;
++		per_cpu = &tcp_timer_cpus[cpu];
++
++		lck_mtx_lock(&per_cpu->cpu_lock);
++		if (te->te_flags & TE_FLAG_EXECUTING) {
++			/*
++			 * The timer is being run by the timer thread; detach
++			 * it and allocate a fresh entry instead.
++			 */
++			te->te_tp = NULL;
++			tp->t_timer_entries[timer_type] = NULL;
++			lck_mtx_unlock(&per_cpu->cpu_lock);
++			goto new_entry;
++		}
++		if (te->te_flags & TE_FLAG_IN_TREE) {
++			tcp_timer_tree_remove(per_cpu, te);
++		}
++		te->te_type = timer_type;
++		te->te_expires = soft_expires;
++		te->te_softexpires = tcp_timer_calculate_softexpires(timer_type,
++		    soft_expires, timeout_ns);
++		te->te_flags = TE_FLAG_IN_TREE;
++		RB_INSERT(tcp_timer_tree, &per_cpu->active_timers_tree, te);
++		per_cpu->active_timers_cnt++;
++		if (per_cpu->active_timers_tree.rbh_root != NULL) {
++			struct tcp_timer_entry *min;
++
++			min = RB_MIN(tcp_timer_tree, &per_cpu->active_timers_tree);
++			if (min->te_expires != per_cpu->next_timer) {
++				per_cpu->next_timer = min->te_expires;
++				tcp_timer_reschedule_cpu(per_cpu);
++			}
++		}
++		lck_mtx_unlock(&per_cpu->cpu_lock);
++		return 0;
++	}
++
++new_entry:
++	new_te = tcp_timer_entry_alloc(tp, timer_type, soft_expires, timeout_ns);
++	if (new_te == NULL) {
++		return ENOMEM;
++	}
++	cpu = tcp_timer_select_cpu(tp);
++	new_te->te_cpu = cpu;
++	per_cpu = &tcp_timer_cpus[new_te->te_cpu];
++
++	lck_mtx_lock(&per_cpu->cpu_lock);
++	tp->t_timer_entries[timer_type] = new_te;
++	RB_INSERT(tcp_timer_tree, &per_cpu->active_timers_tree, new_te);
++	per_cpu->active_timers_cnt++;
++	if (!(tp->t_flags & TF_TIMER_ENTRY_USECOUNT)) {
++		tp->t_flags |= TF_TIMER_ENTRY_USECOUNT;
++		tp->t_inpcb->inp_socket->so_usecount++;
++	}
++	if (new_te->te_expires < per_cpu->next_timer) {
++		per_cpu->next_timer = new_te->te_expires;
++		tcp_timer_reschedule_cpu(per_cpu);
++	}
++	lck_mtx_unlock(&per_cpu->cpu_lock);
++
++	return 0;
+ }
+ 
+ /* bsd/netinet/tcp_timer_advanced.c:401 */
+ int
+ tcp_timer_advanced_remove(struct tcpcb * tp, uint8_t timer_type)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_timer_advanced_remove");
++	struct tcp_timer_cpu *per_cpu;
++	struct tcp_timer_entry *te;
++	int cpu;
++
++	if (timer_type >= TCPT_NTIMERS) {
++		return EINVAL;
++	}
++
++	socket_lock_assert_owned(tp->t_inpcb->inp_socket);
++
++	te = tp->t_timer_entries[timer_type];
++	if (te == NULL) {
++		return ENOENT;
++	}
++
++	cpu = te->te_cpu;
++	per_cpu = &tcp_timer_cpus[cpu];
++
++	lck_mtx_lock(&per_cpu->cpu_lock);
++	if (te->te_flags & TE_FLAG_EXECUTING) {
++		te->te_tp = NULL;
++		tp->t_timer_entries[timer_type] = NULL;
++	} else if (te->te_flags & TE_FLAG_IN_TREE) {
++		tcp_timer_tree_remove(per_cpu, te);
++	}
++	lck_mtx_unlock(&per_cpu->cpu_lock);
++
++	return 0;
+ }
+ 
+ /* bsd/netinet/tcp_timer_advanced.c:453 */
+ void
+ tcp_timer_advanced_cleanup(struct tcpcb * tp)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_timer_advanced_cleanup");
++	struct tcp_timer_cpu *per_cpu;
++	struct tcp_timer_entry *te;
++	struct tcp_timer_entry *entries_to_free[TCPT_NTIMERS];
++	int free_count = 0;
++	int timer_type;
++	int cpu;
++	int i;
++	struct inpcb *inp;
++	struct socket *so;
++
++	bzero(entries_to_free, sizeof(entries_to_free));
++
++	if (tp == NULL) {
++		return;
++	}
++
++	socket_lock_assert_owned(tp->t_inpcb->inp_socket);
++
++	for (timer_type = 0; timer_type < TCPT_NTIMERS; timer_type++) {
++		te = tp->t_timer_entries[timer_type];
++		if (te == NULL) {
++			continue;
++		}
++
++		cpu = te->te_cpu;
++		per_cpu = &tcp_timer_cpus[cpu];
++
++		lck_mtx_lock(&per_cpu->cpu_lock);
++		if (te->te_flags & TE_FLAG_EXECUTING) {
++			tp->t_timer_entries[timer_type] = NULL;
++			te->te_tp = NULL;
++			lck_mtx_unlock(&per_cpu->cpu_lock);
++			continue;
++		}
++		if (te->te_flags & TE_FLAG_IN_TREE) {
++			uint64_t expires = te->te_expires;
++			boolean_t was_earliest = (per_cpu->next_timer == expires);
++
++			RB_REMOVE(tcp_timer_tree, &per_cpu->active_timers_tree, te);
++			per_cpu->active_timers_cnt--;
++			if (was_earliest) {
++				struct tcp_timer_entry *min;
++
++				min = RB_MIN(tcp_timer_tree,
++				    &per_cpu->active_timers_tree);
++				per_cpu->next_timer = (min != NULL) ?
++				    min->te_expires : UINT64_MAX;
++			}
++		}
++		tp->t_timer_entries[timer_type] = NULL;
++		if (!tcp_timer_entry_add_to_freelist(te, per_cpu)) {
++			entries_to_free[free_count++] = te;
++		}
++		lck_mtx_unlock(&per_cpu->cpu_lock);
++	}
++
++	if (tp->t_flags & TF_TIMER_ENTRY_USECOUNT) {
++		tp->t_flags &= ~TF_TIMER_ENTRY_USECOUNT;
++		inp = tp->t_inpcb;
++		so = inp->inp_socket;
++		if (so->so_usecount == 0) {
++			TCP_LOG(tp, "%s: inpcb socket so_usecount underflow "
++			    "when removing advanced timer entry\n", __func__);
++		} else {
++			so->so_usecount--;
++		}
++	}
++
++	for (i = 0; i < free_count; i++) {
++		kfree_type(struct tcp_timer_entry, entries_to_free[i]);
++	}
+ }
+ 
++/*
++ * Run the handler for one expired advanced timer entry.  The entry carries
++ * a reference on the inpcb, and the state of the socket is revalidated
++ * after taking the socket lock.  The entry is always freed here.
++ */
+ /* bsd/netinet/tcp_timer_advanced.c:545 */
+ void
+ tcp_timer_invoke_handler(struct tcp_timer_entry * te)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_timer_invoke_handler");
++	struct inpcb *inp;
++	struct socket *so;
++	struct tcpcb *tp;
++	uint8_t timer_type;
++	int state;
++
++	inp = te->te_inp;
++	so = inp->inp_socket;
++	if (so == NULL) {
++		(void) in_pcb_checkstate(inp, WNT_RELEASE, 0);
++		goto free;
++	}
++
++	socket_lock(so, 1);
++	state = in_pcb_checkstate(inp, WNT_RELEASE, 1);
++	tp = inp->inp_ppcb;
++	timer_type = te->te_type;
++	if (tp == NULL) {
++		goto unlock_free;
++	}
++	if (state == WNT_STOPUSING) {
++		if (tp->t_timer_entries[timer_type] == te) {
++			tp->t_timer_entries[timer_type] = NULL;
++		}
++		goto unlock_free;
++	}
++	if (so->so_flags & SOF_DEFUNCT) {
++		if (tp->t_timer_entries[timer_type] == te) {
++			tp->t_timer_entries[timer_type] = NULL;
++		}
++		goto unlock_free;
++	}
++	if (tp->t_timer_entries[timer_type] == te) {
++		tp = tcp_timers(tp, timer_type);
++		if (tp != NULL && tp->t_timer_entries[timer_type] == te) {
++			te->te_flags = 0;
++			tcp_timer_clear_rbtree_pointers(te);
++		}
++	}
++
++unlock_free:
++	socket_unlock(so, 1);
++free:
++	tcp_timer_entry_free(te);
+ }
+ 
++/*
++ * Walk the per-CPU timer tree and take references on the inpcbs whose
++ * last output interface matches probe_if_index.  Returns the number of
++ * inpcbs stored in probe_inps.  Called with per_cpu->cpu_lock held.
++ */
+ /* bsd/netinet/tcp_timer_advanced.c:634 */
+ int
+ tcp_timer_snapshot_if_probes(struct tcp_timer_cpu * per_cpu, u_int16_t probe_if_index, struct inpcb **probe_inps __counted_by(128))
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_timer_snapshot_if_probes");
++	struct tcp_timer_entry *te;
++	struct tcp_timer_entry *next_te;
++	struct tcpcb *tp;
++	struct inpcb *inp;
++	struct ifnet *ifp;
++	int probe_count = 0;
++	int i;
++
++	if (probe_if_index == 0) {
++		return 0;
++	}
++
++	for (te = RB_MIN(tcp_timer_tree, &per_cpu->active_timers_tree);
++	    te != NULL; te = next_te) {
++		next_te = RB_NEXT(tcp_timer_tree, &per_cpu->active_timers_tree, te);
++		if (te->te_flags & TE_FLAG_EXECUTING) {
++			continue;
++		}
++		tp = te->te_tp;
++		if (tp == NULL) {
++			continue;
++		}
++		inp = tp->t_inpcb;
++		if (inp == NULL) {
++			continue;
++		}
++		ifp = inp->inp_last_outifp;
++		if (ifp == NULL) {
++			continue;
++		}
++		if (ifp->if_index != probe_if_index) {
++			continue;
++		}
++		for (i = 0; i < probe_count; i++) {
++			if (probe_inps[i] == inp) {
++				break;
++			}
++		}
++		if (i != probe_count) {
++			continue;
++		}
++		if (in_pcb_checkstate(inp, WNT_ACQUIRE, 0) == WNT_STOPUSING) {
++			continue;
++		}
++		probe_inps[probe_count++] = inp;
++		if (probe_count >= 128) {
++			break;
++		}
++	}
++
++	return probe_count;
+ }
+ 
++/*
++ * Send an interface probe (a PTO) on every connection captured by
++ * tcp_timer_snapshot_if_probes and drop the temporary inpcb references.
++ */
+ /* bsd/netinet/tcp_timer_advanced.c:687 */
+ void
+ tcp_timer_execute_if_probes(struct inpcb **probe_inps __counted_by(128), int probe_count)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_timer_execute_if_probes");
++	int i;
++
++	for (i = 0; i < probe_count; i++) {
++		struct inpcb *inp = probe_inps[i];
++		struct socket *so = inp->inp_socket;
++		struct tcpcb *tp;
++
++		if (so == NULL) {
++			(void) in_pcb_checkstate(inp, WNT_RELEASE, 0);
++			continue;
++		}
++		socket_lock(so, 1);
++		if (in_pcb_checkstate(inp, WNT_RELEASE, 1) == WNT_STOPUSING) {
++			socket_unlock(so, 1);
++			continue;
++		}
++		tp = inp->inp_ppcb;
++		if (tp == NULL ||
++		    (so->so_flags & SOF_DEFUNCT) ||
++		    (so->so_state & SS_ISDISCONNECTED)) {
++			socket_unlock(so, 1);
++			continue;
++		}
++
++		tp->t_flagsext |= TF_IF_PROBING;
++		tp = tcp_timers(tp, TCPT_PTO);
++		if (tp != NULL) {
++			tcp_timer_advanced_cancel(tp, TCPT_PTO);
++			tp->t_flagsext &= ~TF_IF_PROBING;
++		}
++		socket_unlock(so, 1);
++	}
+ }
+ 
++/*
++ * Process expired timers on one CPU.  Called with per_cpu->cpu_lock held;
++ * the lock is dropped before the timer handlers are invoked and the
++ * caller reacquires it afterwards.
++ */
+ /* bsd/netinet/tcp_timer_advanced.c:731 */
+ void
+ tcp_timer_process_cpu_timer(struct tcp_timer_cpu * per_cpu, uint64_t now)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_timer_process_cpu_timer");
++	struct tcp_timer_entry *te;
++	struct tcp_timer_entry *next_te;
++	struct tcp_timer_entry *expired = NULL;
++	struct tcp_timer_entry *to_free = NULL;
++	struct tcpcb *tp;
++	struct inpcb *inp;
++	uint64_t lookahead = now + 60 * NSEC_PER_SEC;
++
++	te = RB_MIN(tcp_timer_tree, &per_cpu->active_timers_tree);
++	while (te != NULL) {
++		next_te = RB_NEXT(tcp_timer_tree, &per_cpu->active_timers_tree, te);
++		if (te->te_expires > lookahead) {
++			break;
++		}
++		if (te->te_softexpires > now) {
++			te = next_te;
++			continue;
++		}
++		if (te->te_flags & TE_FLAG_EXECUTING) {
++			te = next_te;
++			continue;
++		}
++		tp = te->te_tp;
++		if (tp == NULL) {
++			tcp_timer_tree_remove(per_cpu, te);
++			if (!tcp_timer_entry_add_to_freelist(te, per_cpu)) {
++				te->te_next = to_free;
++				to_free = te;
++			}
++			te = next_te;
++			continue;
++		}
++		inp = tp->t_inpcb;
++		if (inp == NULL ||
++		    in_pcb_checkstate(inp, WNT_ACQUIRE, 0) == WNT_STOPUSING) {
++			tcp_timer_tree_remove(per_cpu, te);
++			te = next_te;
++			continue;
++		}
++		te->te_inp = inp;
++		te->te_flags = (te->te_flags & ~(TE_FLAG_IN_TREE |
++		    TE_FLAG_EXECUTING)) | TE_FLAG_EXECUTING;
++		tcp_timer_tree_remove(per_cpu, te);
++		te->te_next = expired;
++		expired = te;
++		te = next_te;
++	}
++
++	if (per_cpu->active_timers_tree.rbh_root != NULL) {
++		struct tcp_timer_entry *min;
++
++		min = RB_MIN(tcp_timer_tree, &per_cpu->active_timers_tree);
++		per_cpu->next_timer = min->te_expires;
++	} else {
++		per_cpu->next_timer = UINT64_MAX;
++	}
++
++	lck_mtx_unlock(&per_cpu->cpu_lock);
++
++	while (to_free != NULL) {
++		struct tcp_timer_entry *next = to_free->te_next;
++
++		kfree_type(struct tcp_timer_entry, to_free);
++		to_free = next;
++	}
++
++	while (expired != NULL) {
++		struct tcp_timer_entry *next = expired->te_next;
++
++		tcp_timer_invoke_handler(expired);
++		expired = next;
++	}
+ }
+ 
+ /* bsd/netinet/tcp_timer_advanced.c:827 */
+ void
+ tcp_timer_reschedule_cpu(struct tcp_timer_cpu * per_cpu)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_timer_reschedule_cpu");
++	uint64_t now;
++	uint64_t deadline;
++	uint64_t interval_ns;
++
++	thread_call_cancel(per_cpu->timer_call);
++
++	if (per_cpu->next_timer == UINT64_MAX) {
++		return;
++	}
++
++	now = tcp_timer_get_time();
++	if (per_cpu->next_timer <= now) {
++		thread_call_enter(per_cpu->timer_call);
++		return;
++	}
++
++	interval_ns = per_cpu->next_timer - now;
++	nanoseconds_to_deadline(interval_ns, &deadline);
++	thread_call_enter_delayed(per_cpu->timer_call, deadline);
+ }
+ 
+ /* bsd/netinet/tcp_timer_advanced.c:854 */
+ void
+ tcp_timer_thread_call(void * param0, void * param1)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_timer_thread_call");
++	struct tcp_timer_cpu *per_cpu = (struct tcp_timer_cpu *)param0;
++	struct inpcb *probe_inps[128];
++	u_int16_t probe_if_index;
++	int probe_count;
++	uint64_t now;
++
++	(void)param1;
++
++	bzero(probe_inps, sizeof(probe_inps));
++
++	calculate_tcp_clock();
++	now = tcp_timer_get_time();
++
++	if (per_cpu->probe_if_index != 0) {
++		lck_mtx_lock(&per_cpu->cpu_lock);
++		probe_if_index = per_cpu->probe_if_index;
++		per_cpu->probe_if_index = 0;
++		probe_count = tcp_timer_snapshot_if_probes(per_cpu,
++		    probe_if_index, probe_inps);
++		lck_mtx_unlock(&per_cpu->cpu_lock);
++		if (probe_count > 0) {
++			tcp_timer_execute_if_probes(probe_inps, probe_count);
++			now = tcp_timer_get_time();
++		}
++	}
++
++	lck_mtx_lock(&per_cpu->cpu_lock);
++	tcp_timer_process_cpu_timer(per_cpu, now);
++	lck_mtx_lock(&per_cpu->cpu_lock);
++	tcp_timer_reschedule_cpu(per_cpu);
++	lck_mtx_unlock(&per_cpu->cpu_lock);
+ }
+ 
+ /* bsd/netinet/tcp_timer_advanced.c:895 */
+ void
+ tcp_timer_advanced_init(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_timer_advanced_init");
++	struct tcp_timer_cpu *per_cpu;
++	unsigned int ncpus;
++	int cpu;
++
++	ncpus = real_ncpus;
++	if (ncpus <= 1) {
++		ncpus = 1;
++	}
++	if (ncpus > TCP_TIMER_MAX_CPUS) {
++		ncpus = TCP_TIMER_MAX_CPUS;
++	}
++	tcp_timer_ncpus = ncpus;
++
++	for (cpu = 0; cpu < (int)ncpus; cpu++) {
++		per_cpu = &tcp_timer_cpus[cpu];
++		per_cpu->cpu = cpu;
++		per_cpu->next_timer = UINT64_MAX;
++		per_cpu->cpu_lock_grp = lck_grp_alloc_init("tcptimercpu",
++		    LCK_GRP_ATTR_NULL);
++		lck_mtx_init(&per_cpu->cpu_lock, per_cpu->cpu_lock_grp,
++		    LCK_ATTR_NULL);
++		RB_INIT(&per_cpu->active_timers_tree);
++		per_cpu->active_timers_cnt = 0;
++		per_cpu->free_list = NULL;
++		per_cpu->free_list_cnt = 0;
++		per_cpu->timer_call = thread_call_allocate(tcp_timer_thread_call,
++		    per_cpu);
++	}
+ }
+diff --git a/bsd/netinet/tcp_timer_advanced.h b/bsd/netinet/tcp_timer_advanced.h
+index 2a71a2408..fea47fc54 100644
+--- a/bsd/netinet/tcp_timer_advanced.h
++++ b/bsd/netinet/tcp_timer_advanced.h
+@@ -7,8 +7,24 @@
+ #ifndef XNU13432_BSD_NETINET_TCP_TIMER_ADVANCED_H
+ #define XNU13432_BSD_NETINET_TCP_TIMER_ADVANCED_H
+ 
++#include <sys/tree.h>
++#include <kern/locks.h>
++#include <kern/thread_call.h>
++#include <netinet/in_pcb.h>
++#include <netinet/tcp_timer.h>
++#include <netinet/tcp_var.h>
++
++/*
++ * te_flags bits.  The reference names are not present in the DWARF; these
++ * spellings follow from the disassembly.
++ */
++#define TE_FLAG_IN_TREE         0x0001  /* linked into active_timers_tree */
++#define TE_FLAG_EXECUTING       0x0002  /* handed to tcp_timers(), not freeable */
++
++RB_HEAD(tcp_timer_tree, tcp_timer_entry);
++
+ struct tcp_timer_entry {
+-	void * te_node;
++	RB_ENTRY(tcp_timer_entry) te_node;
+ 	struct tcp_timer_entry *te_next;
+ 	struct tcp_timer_entry *te_free;
+ 	struct tcpcb *te_tp;
+@@ -31,15 +47,104 @@ struct tcp_timer_cpu {
+ 	uint32_t cpu;
+ 	u_int16_t probe_if_index;
+ };
+-struct tcp_timer_tree {
+-	struct tcp_timer_entry *rbh_root;
+-};
+ 
+-int tcp_timer_entry_cmp(struct tcp_timer_entry * a, struct tcp_timer_entry * b);
+-void tcp_timer_advanced_schedule(struct tcpcb * tp, uint8_t timer_type, uint32_t timeout_ticks);
+-void tcp_timer_advanced_cancel(struct tcpcb * tp, uint8_t timer_type);
+-int tcp_timer_advanced_isactive(struct tcpcb * tp, uint8_t timer_type);
+-uint32_t tcp_timer_advanced_get_value(struct tcpcb * tp, uint8_t timer_type);
+-int tcp_timer_advanced_has_expired(struct tcpcb * tp, uint8_t timer_type, uint32_t now_ticks);
++extern int tcp_timer_advanced_enabled;
++extern unsigned int tcp_timer_ncpus;
++extern struct tcp_timer_cpu tcp_timer_cpus[];
++
++uint64_t tcp_timer_get_time(void);
++int tcp_timer_advanced_add(struct tcpcb * tp, uint8_t timer_type, uint64_t timeout_ns);
++int tcp_timer_advanced_remove(struct tcpcb * tp, uint8_t timer_type);
++uint32_t tcp_offset_from_latest_tx(const struct tcpcb * tp, uint32_t offset);
++
++static inline int
++tcp_timer_entry_cmp(struct tcp_timer_entry * a, struct tcp_timer_entry * b)
++{
++	if (a->te_expires < b->te_expires) {
++		return -1;
++	}
++	if (a->te_expires > b->te_expires) {
++		return 1;
++	}
++	if (a == b) {
++		return 0;
++	}
++	return a < b ? -1 : 1;
++}
++
++RB_PROTOTYPE(tcp_timer_tree, tcp_timer_entry, te_node, tcp_timer_entry_cmp);
++
++/*
++ * Arm a TCP timer.  When advanced timers are active for this connection the
++ * per-CPU timer tree is used, otherwise the legacy t_timer[] offsets are
++ * updated in place.
++ */
++static inline void
++tcp_timer_advanced_schedule(struct tcpcb * tp, uint8_t timer_type, uint32_t timeout_ticks)
++{
++	if (tp->t_flags & TF_TIMER_ADVANCED) {
++		uint64_t timeout_ns = (uint64_t)timeout_ticks * NSEC_PER_MSEC;
++
++		tcp_timer_advanced_add(tp, timer_type, timeout_ns);
++	} else if (timer_type == TCPT_REXMT) {
++		tp->t_timer[timer_type] = tcp_offset_from_latest_tx(tp, timeout_ticks);
++	} else {
++		tp->t_timer[timer_type] = tcp_offset_from_start(tp, timeout_ticks);
++	}
++}
++
++static inline void
++tcp_timer_advanced_cancel(struct tcpcb * tp, uint8_t timer_type)
++{
++	if (tp->t_flags & TF_TIMER_ADVANCED) {
++		tcp_timer_advanced_remove(tp, timer_type);
++	} else {
++		tp->t_timer[timer_type] = 0;
++	}
++}
++
++static inline int
++tcp_timer_advanced_isactive(struct tcpcb * tp, uint8_t timer_type)
++{
++	if (tp->t_flags & TF_TIMER_ADVANCED) {
++		struct tcp_timer_entry *te = tp->t_timer_entries[timer_type];
++
++		if (te == NULL) {
++			return 0;
++		}
++		return (te->te_flags & TE_FLAG_IN_TREE) != 0;
++	}
++	return tp->t_timer[timer_type] != 0;
++}
++
++static inline uint32_t
++tcp_timer_advanced_get_value(struct tcpcb * tp, uint8_t timer_type)
++{
++	if (tp->t_flags & TF_TIMER_ADVANCED) {
++		struct tcp_timer_entry *te = tp->t_timer_entries[timer_type];
++		uint64_t now;
++
++		if (te == NULL || (te->te_flags & TE_FLAG_IN_TREE) == 0) {
++			return 0;
++		}
++		now = tcp_timer_get_time();
++		if (te->te_expires > now) {
++			return tcp_now + (uint32_t)((te->te_expires - now) / NSEC_PER_MSEC);
++		}
++		return 1;
++	}
++	if (tp->t_timer[timer_type] == 0) {
++		return 0;
++	}
++	return tp->tentry.te_timer_start + tp->t_timer[timer_type];
++}
++
++static inline int
++tcp_timer_advanced_has_expired(struct tcpcb * tp, uint8_t timer_type, uint32_t now_ticks)
++{
++	uint32_t timer_value = tcp_timer_advanced_get_value(tp, timer_type);
++
++	return timer_value != 0 && (int32_t)(timer_value - now_ticks) <= 0;
++}
+ 
+ #endif /* XNU13432_BSD_NETINET_TCP_TIMER_ADVANCED_H */
+diff --git a/bsd/netinet/tcp_var.h b/bsd/netinet/tcp_var.h
+index 1ed776db5..013573097 100644
+--- a/bsd/netinet/tcp_var.h
++++ b/bsd/netinet/tcp_var.h
+@@ -405,6 +405,7 @@ struct tcpcb {
+ 	int      t_state;               /* state of this connection */
+ 	uint32_t t_timer[TCPT_NTIMERS]; /* tcp timers */
+ 	struct tcptimerentry tentry;    /* entry in timer list */
++	struct tcp_timer_entry *t_timer_entries[TCPT_NTIMERS]; /* advanced timer entries */
+ 
+ 	struct  inpcb *t_inpcb;         /* back pointer to internet pcb */
+ 	uint32_t        t_flags;
+@@ -439,7 +440,9 @@ struct tcpcb {
+ #define TF_TSO          0x10000000      /* TCP Segment Offloading is enable on this connection */
+ #define TF_BLACKHOLE    0x20000000      /* Path MTU Discovery Black Hole detection */
+ #define TF_TIMER_ONLIST 0x40000000      /* pcb is on tcp_timer_list */
+-/* Unused 0x80000000 */
++#define TF_TIMER_ENTRY_USECOUNT 0x80000000 /* socket usecount held for advanced timers */
++
++#define TF_TIMER_ADVANCED 0x02000000    /* per-CPU advanced timers in use */
+ 
+ 	tcp_seq snd_una;                /* send unacknowledged */
+ 	tcp_seq snd_max;                /* highest sequence number sent;

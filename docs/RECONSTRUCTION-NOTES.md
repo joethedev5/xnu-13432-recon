@@ -335,3 +335,36 @@ only one TFO byte, runs `tcp_heuristic_tfo_middlebox`, sets
 SO_FILT_HINT_MP_SUB_ERROR`, and marks `TFO_S_ONE_BYTE_PROXY`; a
 13432-only `t_flagsext` bit 24 suppresses it. Patch series: 21
 entries, 287 explicit stubs remain.
+
+## 2026-11-25: Per-CPU advanced TCP timers
+
+The reference replaces the legacy per-connection `t_timer[]` offsets
+with a per-CPU red-black tree of `tcp_timer_entry` objects.  All 28
+functions of `bsd/netinet/tcp_timer_advanced.c` and the inline API in
+`tcp_timer_advanced.h` are recovered:
+
+- entry layout (`te_node`, `te_next`, `te_free`, `te_tp`, `te_inp`,
+  `te_expires`, `te_softexpires`, `te_type`, `te_cpu`, `te_flags`)
+  with `TE_FLAG_IN_TREE`/`TE_FLAG_EXECUTING`, plus the four inline
+  accessors schedule/cancel/isactive/get_value.
+- the RB tree ordered by hard expiry with a pointer tiebreak;
+  `RB_GENERATE` over `te_expires` is visible in the image, and
+  `tcp_timer_tree_remove` maintains the per-CPU active count.
+- `tcp_timer_advanced_add`/`remove`/`cleanup`, including the inlined
+  `socket_lock_assert_owned` and the socket usecount handoff
+  (`TF_TIMER_ENTRY_USECOUNT`, `so_usecount`), plus the
+  `te_softexpires` leeway calculation (1/10 of the timeout, capped at
+  100 ms, with the 15/4/100 variants for PERSIST-related timers).
+- the `thread_call` path: `tcp_timer_invoke_handler`,
+  `tcp_timer_process_cpu_timer` with its 60 s lookahead,
+  `tcp_timer_snapshot_if_probes`/`tcp_timer_execute_if_probes` for
+  the interface-probe PTO, `tcp_timer_reschedule_cpu`, and
+  `tcp_timer_advanced_init` with the `tcptimercpu` lock group.
+
+`struct tcpcb` gains `t_timer_entries[TCPT_NTIMERS]` at offset 0x58
+(which pushes `t_inpcb` to 0xa8, matching the DWARF), and the two
+reused `t_flags` bits are named `TF_TIMER_ADVANCED` (0x02000000) and
+`TF_TIMER_ENTRY_USECOUNT` (0x80000000).  `tcp_offset_from_latest_tx`
+loses its static linkage so the header inline can call it.
+
+The patch series now has 22 entries; 259 explicit stubs remain.
