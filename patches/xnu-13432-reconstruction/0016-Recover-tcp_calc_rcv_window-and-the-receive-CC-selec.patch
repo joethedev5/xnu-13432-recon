@@ -1,7 +1,7 @@
 From 05261f645826104e377dae585044aa1fc1e41df8 Mon Sep 17 00:00:00 2001
 From: joethedev5 <deepsbx1@proton.me>
 Date: Wed, 25 Nov 2026 02:31:01 +0000
-Subject: [PATCH 16/32] Recover tcp_calc_rcv_window and the receive-CC selector
+Subject: [PATCH 16/33] Recover tcp_calc_rcv_window and the receive-CC selector
 
 Add tcpcb.t_recv_cc_algo between t_adaptive_wtimo and
 t_early_rexmt_count, then reconstruct the window calculation: cap

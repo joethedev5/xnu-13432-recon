@@ -494,3 +494,29 @@ heuristic are only in `tcp_ecn.c`; the classic feedback path calls
 as well as `TE_SENDIPECT` and the heuristic bit.
 
 The patch series now has 32 entries; 185 explicit stubs remain.
+
+## 2026-11-25: Proportional rate reduction
+
+The reference tcpcb carries `struct tcp_prr prr` at offset 1384
+(delivered, out, recover_fs, sack_bytes_prev, dupacks), completing the
+1408-byte layout.  `tcp_prr_delivered` distinguishes the SACK path
+(`th_ack + sack_bytes_acked - snd_una - sack_bytes_prev`) from the
+duplicate-ACK path (one MSS per duplicate, otherwise the newly ACKed
+bytes divided into MSS-sized packet credits) and clamps the result to
+one MSS.  `tcp_prr_update` accumulates delivered bytes, then applies
+either the proportional branch `ceil(delivered * ssthresh /
+recover_fs) - out` when the pipe exceeds ssthresh, or the slow-start
+reduction bound `min(ssthresh - pipe, max(delivered - out,
+delivered_new) + mss)` when `tcp_prr_ssrb` is set.  The cwnd update is
+rounded down to an MSS multiple after adding the pipe.
+
+`tcp_prr` and `tcp_prr_ssrb` default to 1 and use the reference sysctl
+descriptions "TCP PRR" and "Enable Slow Start Reduction Bound for TCP
+PRR".  `tcp_enter_fast_recovery` resets delivered/out/dupacks and
+records `snd_max - snd_una` as recover_fs and the current SACK byte
+count, and the partial-ACK path calls `tcp_prr_update`.  The reference
+also calls it from the duplicate-ACK cwnd path and adds the sent length
+to `prr.out` in tcp_output; those two existing-file edits still need
+their exact source positions pinned down.
+
+The patch series now has 33 entries; 183 explicit stubs remain.

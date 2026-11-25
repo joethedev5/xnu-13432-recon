@@ -1,7 +1,7 @@
 From bd119675c9c051be7c74dd6d55a6dc0fbe1d7a03 Mon Sep 17 00:00:00 2001
 From: joethedev5 <deepsbx1@proton.me>
 Date: Wed, 25 Nov 2026 03:13:03 +0000
-Subject: [PATCH 27/32] Reconstruct the TCP RTT translation unit
+Subject: [PATCH 27/33] Reconstruct the TCP RTT translation unit
 
 Recover the four tcp_rtt.c stubs from the public RTT helpers, verified
 against the reference decompilation:

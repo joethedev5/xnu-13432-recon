@@ -1,0 +1,208 @@
+From 41c0afc957274a0c9db8f193dc6ec9172fdb9aaa Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 03:48:04 +0000
+Subject: [PATCH 33/33] Reconstruct the TCP PRR translation unit
+
+Add the missing struct tcp_prr to tcpcb at offset 1384 (delivered,
+out, recover_fs, sack_bytes_prev, dupacks), restoring the reference's
+1408-byte layout.
+
+tcp_prr_delivered and tcp_prr_update are recovered from the reference
+disassembly: duplicate-ACK and SACK delivery accounting, the
+slow-start reduction bound, the proportional reduction branch, and the
+mss-rounded cwnd update.  tcp_prr and tcp_prr_ssrb default to 1 with
+their reference sysctl descriptions, tcp_enter_fast_recovery
+initializes the state, and the partial-ACK path calls tcp_prr_update.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ bsd/netinet/tcp_input.c    |  3 ++
+ bsd/netinet/tcp_prr.c      | 86 ++++++++++++++++++++++++++++++++++----
+ bsd/netinet/tcp_recovery.c |  7 ++++
+ bsd/netinet/tcp_var.h      | 15 +++++++
+ 4 files changed, 104 insertions(+), 7 deletions(-)
+
+diff --git a/bsd/netinet/tcp_input.c b/bsd/netinet/tcp_input.c
+index 81a68784c..48a031ba2 100644
+--- a/bsd/netinet/tcp_input.c
++++ b/bsd/netinet/tcp_input.c
+@@ -4073,6 +4073,9 @@ process_dupack:
+ 						tcp_newreno_partial_ack(tp, th);
+ 					}
+ 					tcp_ccdbg_trace(tp, th, TCP_CC_PARTIAL_ACK);
++					if (tcp_prr && IN_FASTRECOVERY(tp)) {
++						tcp_prr_update(tp, th);
++					}
+ 				}
+ 			} else {
+ 				exiting_fr = 1;
+diff --git a/bsd/netinet/tcp_prr.c b/bsd/netinet/tcp_prr.c
+index a211debc2..b4af823c9 100644
+--- a/bsd/netinet/tcp_prr.c
++++ b/bsd/netinet/tcp_prr.c
+@@ -2,28 +2,100 @@
+  * Reconstruction of bsd/netinet/tcp_prr.c from the xnu-13432 reference kernel.
+  *
+  * Function signatures and ordering are derived from the KDK 27.0.1
+- * DWARF.  Functions marked RECON were moved from the public xnu source
+- * when the reference kernel placed them in this file; bodies marked
+- * "body not recovered" are still stubs.
++ * DWARF.  Bodies are recovered from the reference disassembly.
+  */
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/kernel.h>
++#include <sys/sysctl.h>
++#include <netinet/in.h>
++#include <netinet/in_systm.h>
++#include <netinet/ip.h>
++#include <netinet/tcp.h>
++#include <netinet/tcp_var.h>
+ 
+ #define RECON_BSD_NETINET_TCP_PRR_C 1
+ 
++int tcp_prr = 1;
++SYSCTL_INT(_net_inet_tcp, OID_AUTO, prr, CTLFLAG_RW | CTLFLAG_LOCKED,
++    &tcp_prr, 0, "TCP PRR");
++
++int tcp_prr_ssrb = 1;
++SYSCTL_INT(_net_inet_tcp, OID_AUTO, prr_ssrb, CTLFLAG_RW | CTLFLAG_LOCKED,
++    &tcp_prr_ssrb, 0, "Enable Slow Start Reduction Bound for TCP PRR");
++
+ /* bsd/netinet/tcp_prr.c:45 */
+ uint32_t
+ tcp_prr_delivered(struct tcpcb * tp, struct tcphdr * th)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_prr_delivered");
++	uint32_t delivered_data;
++
++	if (!SACK_ENABLED(tp)) {
++		if (th->th_ack == tp->snd_una) {
++			/* A duplicate ACK delivers one segment */
++			delivered_data = tp->t_maxseg;
++			tp->prr.dupacks++;
++		} else {
++			/*
++			 * Compute how many segments this ACK delivers beyond
++			 * what was already accounted for by duplicate ACKs.
++			 */
++			uint32_t acked = th->th_ack -
++			    (tp->snd_una + tp->t_maxseg * tp->prr.dupacks);
++			uint32_t packets;
++
++			if (acked < tp->t_maxseg) {
++				acked = tp->t_maxseg;
++			}
++			packets = acked / tp->t_maxseg;
++
++			if (packets > tp->prr.dupacks) {
++				tp->prr.dupacks = 0;
++			} else {
++				tp->prr.dupacks -= packets - 1;
++			}
++			delivered_data = acked;
++		}
++	} else {
++		/* SACK: delivered data includes the newly SACKed bytes */
++		delivered_data = th->th_ack + tp->sackhint.sack_bytes_acked -
++		    (tp->snd_una + tp->prr.sack_bytes_prev);
++		tp->prr.sack_bytes_prev = tp->sackhint.sack_bytes_acked;
++	}
++
++	if (delivered_data < tp->t_maxseg) {
++		delivered_data = tp->t_maxseg;
++	}
++
++	return delivered_data;
+ }
+ 
+ /* bsd/netinet/tcp_prr.c:92 */
+ void
+ tcp_prr_update(struct tcpcb * tp, struct tcphdr * th)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_prr_update");
++	uint32_t sndcnt;
++	uint32_t pipe;
++	uint32_t delivered_new;
++	uint32_t limit;
++
++	delivered_new = tcp_prr_delivered(tp, th);
++	tp->prr.delivered += delivered_new;
++
++	pipe = tcp_flight_size(tp);
++	if (tp->snd_ssthresh < pipe) {
++		/* Proportional rate reduction */
++		sndcnt = howmany(tp->prr.delivered * tp->snd_ssthresh,
++		    tp->prr.recover_fs);
++		sndcnt -= tp->prr.out;
++	} else {
++		/* Slow start reduction bound */
++		limit = tp->prr.delivered - tp->prr.out;
++		if (tcp_prr_ssrb) {
++			limit = MAX(limit, delivered_new) + tp->t_maxseg;
++		}
++		sndcnt = MIN(tp->snd_ssthresh - pipe, limit);
++	}
++
++	tp->snd_cwnd = pipe + (sndcnt / tp->t_maxseg) * tp->t_maxseg;
+ }
+diff --git a/bsd/netinet/tcp_recovery.c b/bsd/netinet/tcp_recovery.c
+index 68d1e8da3..8b54f24b4 100644
+--- a/bsd/netinet/tcp_recovery.c
++++ b/bsd/netinet/tcp_recovery.c
+@@ -486,6 +486,13 @@ tcp_enter_fast_recovery(struct tcpcb *tp)
+ 	if (CC_ALGO(tp)->pre_fr != NULL) {
+ 		CC_ALGO(tp)->pre_fr(tp);
+ 	}
++	if (tcp_prr) {
++		tp->prr.delivered = 0;
++		tp->prr.out = 0;
++		tp->prr.recover_fs = tp->snd_max - tp->snd_una;
++		tp->prr.sack_bytes_prev = tp->sackhint.sack_bytes_acked;
++		tp->prr.dupacks = 0;
++	}
+ 	ENTER_FASTRECOVERY(tp);
+ 	if (tp->t_flags & TF_SENTFIN) {
+ 		tp->snd_recover = tp->snd_max - 1;
+diff --git a/bsd/netinet/tcp_var.h b/bsd/netinet/tcp_var.h
+index dca35402b..de27d9c11 100644
+--- a/bsd/netinet/tcp_var.h
++++ b/bsd/netinet/tcp_var.h
+@@ -395,6 +395,15 @@ struct pacer {
+ 	uint64_t packet_tx_time;
+ };
+ 
++/* Proportional rate reduction state (RFC 6937) */
++struct tcp_prr {
++	uint32_t delivered;             /* Data delivered to the receiver */
++	uint32_t out;                   /* Data outstanding in the network */
++	uint32_t recover_fs;            /* Flight size at the start of recovery */
++	uint32_t sack_bytes_prev;       /* Previous SACK bytes acked */
++	uint32_t dupacks;               /* Duplicate ACK count */
++};
++
+ /*
+  * Tcp control block, one per tcp; fields:
+  * Organized for 16 byte cacheline efficiency.
+@@ -890,6 +899,8 @@ struct tcpcb {
+ 
+ 	uuid_t          t_fsw_uuid;
+ 	uuid_t          t_flow_uuid;
++
++	struct tcp_prr  prr;            /* Proportional rate reduction state */
+ };
+ 
+ __CCT_DECLARE_CONSTRAINED_PTR_TYPES(struct tcpcb, tcpcb);
+@@ -1802,6 +1813,10 @@ extern struct tseg_qent *tcp_reass_qent_alloc(struct protosw *proto);
+ extern void tcp_reass_qent_free(struct protosw *proto, struct tseg_qent *te);
+ 
+ extern int tcp_rack;
++extern int tcp_prr;
++extern int tcp_prr_ssrb;
++
++void tcp_prr_update(struct tcpcb *tp, struct tcphdr *th);
+ 
+ extern int tcp_reass_total_qlen;
+ 

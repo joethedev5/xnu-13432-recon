@@ -9,7 +9,7 @@ Apply in numeric order from a clean checkout:
 
 ```
 git checkout xnu-12377.121.6
-git am 0001-*.patch ... 0032-*.patch
+git am 0001-*.patch ... 0033-*.patch
 ```
 
 Contents:
@@ -51,6 +51,8 @@ Contents:
 32. The process virtual-environment integration: `proc.p_virtual_env`,
     fork/exit/exec lifetime, the posix_spawn subsystem-root creation
     path and the `PSPA_VIRTUAL_ENV` port action.
+33. The TCP proportional-rate-reduction unit and the missing
+    `tcpcb.prr` state at offset 1384.
 
 The patches contain only public xnu text plus original reconstruction;
 no Apple binary, dSYM, SDK payload or extracted proprietary header is
