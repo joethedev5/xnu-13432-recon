@@ -1,7 +1,7 @@
 From c4a029d225614aa0ba2e6f2707d3c14f87e9266f Mon Sep 17 00:00:00 2001
 From: joethedev5 <deepsbx1@proton.me>
 Date: Wed, 25 Nov 2026 03:05:31 +0000
-Subject: [PATCH 23/35] Reconstruct the ECN handshake and feedback paths
+Subject: [PATCH 23/39] Reconstruct the ECN handshake and feedback paths
 
 Recover 16 of the 26 tcp_ecn.c stubs from the reference disassembly:
 

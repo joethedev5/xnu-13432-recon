@@ -556,3 +556,42 @@ entry points.  `tcp_tfo_check`/`tcp_tfo_write_cookie*` and
 subsystem.
 
 The patch series now has 35 entries; 175 explicit stubs remain.
+
+## 2026-11-25: Socket buffers, RACK failure path, TCP context, delayed ACK
+
+The socket-buffer helpers split out of tcp_subr.c are external in the
+reference.  `tcp_sbrcv_min_rwin` (tcp_sb.c:265) is the reference's
+rename of the public `tcp_sbrcv_grow_rwin`: it grows the receive
+buffer by sixteen segments when auto-resizing is enabled, the socket
+is not background-throttled, less than one increment is free, and the
+current high-water mark is within one increment of the ideal size.
+`tcp_sbspace` calls it at its two mptcp/BDP sites, and the stale
+public copy and prototypes were removed.
+
+`tcp_seg_free_and_disable_rack` (tcp_segment.c:83) is static inline in
+the reference.  Both inlined instances (in `tcp_seg_rto_insert_end`
+and `tcp_seg_sent_insert_before`) show the same sequence: a TLEF_LOG
+message "not enough memory to allocate segment, disabling RACK",
+`tcp_segs_sent_clean(tp, true)` and clearing `TF_RACK_ENABLED`.
+
+`struct tcp_context` is declared at tcp_var.h:293 and is 128 bytes
+with 64-byte alignment: mbuf, inpcb/tcpcb reference pointers, socket,
+tcphdr, an anonymous union of ip/ip6, tcpopt, the counted option
+pointer and length, thflags, tlen, off0, iss/irs/tiwin, ts_offset,
+ifscope, and the isipv6/is_th_swapped bits at byte 118.
+`tcp_socket_exists_for_tuple` unlocks the socket, runs the IPv4 or
+IPv6 `*_pcblookup_hash_exists` with the mbuf's source/destination
+interface scopes (relaxed=false for IPv6), re-locks the socket and
+reports a connected match.
+
+The delayed-ACK decision moved from tcp_cc.c into tcp_ack.c as
+`tcp_delay_ack`; every tcp_cc_algo `delay_ack` slot is NULL in the
+reference module tables.  Modes 1/2 check `TF_RXWIN0SENT`, TH_PUSH
+and `t_unacksegs == 1`; mode 3 uses the clamped `tcp_sbspace` window,
+`TF_QUICKACK`, `t_forced_acks`, `sb_lowat`, `t_last_recwin`, the
+1.5 * `tcp_recvspace` threshold, a quarter-window BDP bound and a
+256-MSS ACK burst bound, counting delays in `t_stat.acks_delayed`.
+`tcp_cc_delay_ack` and the four per-algorithm wrappers were removed,
+and the tcp_input `DELAY_ACK` macro calls `tcp_delay_ack`.
+
+The patch series now has 39 entries; 171 explicit stubs remain.

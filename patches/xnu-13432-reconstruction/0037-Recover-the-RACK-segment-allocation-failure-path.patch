@@ -1,0 +1,57 @@
+From 9443434b7161ec69b3451d099af42084d9aca020 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 04:08:34 +0000
+Subject: [PATCH 37/39] Recover the RACK segment-allocation failure path
+
+tcp_seg_free_and_disable_rack is a static inline in the reference,
+inlined into the segment insertion paths when tcp_seg_alloc_init fails.
+It emits the tcp_log message "not enough memory to allocate segment,
+disabling RACK" under TLEF_LOG, cleans the sent-segment bookkeeping with
+tcp_segs_sent_clean(tp, true), and clears TF_RACK_ENABLED.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ bsd/netinet/tcp_segment.c | 21 ++++++++++++++++++---
+ 1 file changed, 18 insertions(+), 3 deletions(-)
+
+diff --git a/bsd/netinet/tcp_segment.c b/bsd/netinet/tcp_segment.c
+index 4b52915e1..dc1ef6bcd 100644
+--- a/bsd/netinet/tcp_segment.c
++++ b/bsd/netinet/tcp_segment.c
+@@ -9,6 +9,20 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/kernel.h>
++#include <sys/mbuf.h>
++#include <sys/protosw.h>
++#include <sys/socket.h>
++#include <sys/socketvar.h>
++#include <net/if.h>
++#include <netinet/in.h>
++#include <netinet/in_pcb.h>
++#include <netinet/ip.h>
++#include <netinet/tcp.h>
++#include <netinet/tcp_log.h>
++#include <netinet/tcp_seq.h>
++#include <netinet/tcp_timer.h>
++#include <netinet/tcp_utils.h>
++#include <netinet/tcp_var.h>
+ #include <netinet/tcp_segment.h>
+ 
+ #define RECON_BSD_NETINET_TCP_SEGMENT_C 1
+@@ -61,11 +75,12 @@ tcp_seg_alloc_init(struct tcpcb *tp)
+ }
+ 
+ /* bsd/netinet/tcp_segment.c:83 */
+-void
++static void
+ tcp_seg_free_and_disable_rack(struct tcpcb * tp)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_seg_free_and_disable_rack");
++	TCP_LOG(tp, "not enough memory to allocate segment, disabling RACK");
++	tcp_segs_sent_clean(tp, true);
++	tp->t_flagsext &= ~TF_RACK_ENABLED;
+ }
+ 
+ /* bsd/netinet/tcp_segment.c:91 */

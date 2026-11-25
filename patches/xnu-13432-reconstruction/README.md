@@ -9,7 +9,7 @@ Apply in numeric order from a clean checkout:
 
 ```
 git checkout xnu-12377.121.6
-git am 0001-*.patch ... 0035-*.patch
+git am 0001-*.patch ... 0039-*.patch
 ```
 
 Contents:
@@ -60,6 +60,13 @@ Contents:
     `tcp_reass_destroy_qent`, `tcp_reassq_free`), the external
     linkage of the moved reassembly, option-parsing and TFO
     functions, and the removal of the public duplicate bodies.
+36. The TCP socket-buffer helpers and the recovery of
+    `tcp_sbrcv_min_rwin`.
+37. The RACK segment-allocation failure path
+    (`tcp_seg_free_and_disable_rack`).
+38. `struct tcp_context` and `tcp_socket_exists_for_tuple`.
+39. The reference delayed-ACK policy in `tcp_ack.c` and the removal
+    of the per-algorithm delay-ack hooks.
 
 The patches contain only public xnu text plus original reconstruction;
 no Apple binary, dSYM, SDK payload or extracted proprietary header is

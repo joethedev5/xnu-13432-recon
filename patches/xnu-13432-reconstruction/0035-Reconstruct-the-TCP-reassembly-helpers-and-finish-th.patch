@@ -1,7 +1,7 @@
 From b3cd14afd42aa95f19874e3ae63c5ee95f5a3e01 Mon Sep 17 00:00:00 2001
 From: joethedev5 <deepsbx1@proton.me>
 Date: Wed, 25 Nov 2026 04:00:15 +0000
-Subject: [PATCH 35/35] Reconstruct the TCP reassembly helpers and finish the
+Subject: [PATCH 35/39] Reconstruct the TCP reassembly helpers and finish the
  options relocation
 
 Recover tcp_reass_create_qent, tcp_reass_destroy_qent, and

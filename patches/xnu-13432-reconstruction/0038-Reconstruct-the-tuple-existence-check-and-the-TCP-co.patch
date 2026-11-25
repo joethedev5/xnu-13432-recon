@@ -1,0 +1,135 @@
+From 17d74b32d2af2f63e226c9060fc0da3053165efa Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 04:08:38 +0000
+Subject: [PATCH 38/39] Reconstruct the tuple-existence check and the TCP
+ context
+
+Add the reference's 128-byte struct tcp_context to tcp_var.h (mbuf,
+inpcb/tcpcb references, socket, tcphdr, ip/ip6 union, options, option
+pointer/length, thflags, tlen, off0, iss/irs/tiwin, ts_offset, ifscope
+and the isipv6/is_th_swapped bits, aligned to 64 bytes).
+
+tcp_socket_exists_for_tuple unlocks the socket, looks the 4-tuple up
+in the IPv4 or IPv6 PCB hash with the in/out interface scopes taken
+from the mbuf, re-locks the socket and reports whether a connected
+socket exists.  The reference resolves both the source and destination
+interface scopes and passes relaxed=false to the IPv6 lookup.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ bsd/netinet/tcp_handshake.c | 42 ++++++++++++++++++++++++++++++++++---
+ bsd/netinet/tcp_var.h       | 33 +++++++++++++++++++++++++++++
+ 2 files changed, 72 insertions(+), 3 deletions(-)
+
+diff --git a/bsd/netinet/tcp_handshake.c b/bsd/netinet/tcp_handshake.c
+index f881b9121..d56ac243e 100644
+--- a/bsd/netinet/tcp_handshake.c
++++ b/bsd/netinet/tcp_handshake.c
+@@ -9,8 +9,23 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/kernel.h>
+-#include <netinet/tcp_fastopen.h>
++#include <sys/mbuf.h>
++#include <sys/protosw.h>
++#include <sys/socket.h>
++#include <sys/socketvar.h>
++#include <net/if.h>
++#include <netinet/in.h>
++#include <netinet/in_pcb.h>
++#include <netinet/ip.h>
++#include <netinet/ip6.h>
++#include <netinet/tcp.h>
++#include <netinet/tcp_log.h>
++#include <netinet/tcp_seq.h>
++#include <netinet/tcp_timer.h>
+ #include <netinet/tcp_var.h>
++#include <netinet/tcp_fastopen.h>
++#include <netinet6/in6_pcb.h>
++#include <netinet6/ip6_var.h>
+ 
+ #define RECON_BSD_NETINET_TCP_HANDSHAKE_C 1
+ 
+@@ -18,8 +33,29 @@
+ _Bool
+ tcp_socket_exists_for_tuple(struct socket * so, struct tcp_context * ctx)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_socket_exists_for_tuple");
++	struct tcphdr *th = ctx->th;
++	struct ifnet *ifp = ctx->m->m_pkthdr.rcvif;
++	uid_t uid;
++	gid_t gid;
++	int exists;
++
++	socket_unlock(so, 0);
++
++	if (ctx->isipv6) {
++		exists = in6_pcblookup_hash_exists(&tcbinfo,
++		    &ctx->ip6->ip6_src, th->th_sport,
++		    ip6_input_getsrcifscope(ctx->m), &ctx->ip6->ip6_dst,
++		    th->th_dport, ip6_input_getdstifscope(ctx->m), 0,
++		    &uid, &gid, ifp, false);
++	} else {
++		exists = in_pcblookup_hash_exists(&tcbinfo, ctx->ip->ip_src,
++		    th->th_sport, ctx->ip->ip_dst,
++		    th->th_dport, 0, &uid, &gid, ifp);
++	}
++
++	socket_lock(so, 0);
++
++	return exists != 0 && (so->so_state & SS_ISCONNECTED) != 0;
+ }
+ 
+ /* bsd/netinet/tcp_handshake.c:150 */
+diff --git a/bsd/netinet/tcp_var.h b/bsd/netinet/tcp_var.h
+index c0a1610f0..1fa2aab7d 100644
+--- a/bsd/netinet/tcp_var.h
++++ b/bsd/netinet/tcp_var.h
+@@ -1097,6 +1097,38 @@ struct tcpopt {
+ #define TFO_COOKIE_LEN_DEFAULT  8
+ #define TFO_COOKIE_LEN_MAX      16
+ 
++struct ip;
++struct ip6_hdr;
++
++/*
++ * Per-segment processing context used by the reference's split TCP
++ * input/handshake code (bsd/netinet/tcp_var.h:293).
++ */
++struct tcp_context {
++	struct mbuf *m;
++	struct inpcb **inp_ref;
++	struct tcpcb **tp_ref;
++	struct socket *so;
++	struct tcphdr *th;
++	union {
++		struct ip *ip;
++		struct ip6_hdr *ip6;
++	};
++	struct tcpopt *options;
++	u_char *optp __counted_by(optlen);
++	int optlen;
++	uint8_t *thflags;
++	int *tlen;
++	int off0;
++	tcp_seq iss;
++	tcp_seq irs;
++	uint32_t *tiwin;
++	uint32_t ts_offset;
++	u_short ifscope;
++	uint8_t isipv6:1,
++	    is_th_swapped:1;
++} __attribute__((aligned(64)));
++
+ /*
+  * Jaguar compatible TCP control block, for xtcpcb
+  * Does not have the old fields
+@@ -1839,6 +1871,7 @@ struct tcp_respond_args {
+ };
+ 
+ void     tcp_canceltimers(struct tcpcb *);
++_Bool    tcp_delay_ack(struct tcpcb *, struct tcphdr *);
+ void     tcp_process_options(struct tcpcb *, u_char *cp0 __counted_by(cnt0), int cnt0,
+     struct tcphdr *, struct tcpopt *);
+ void     tcp_finalize_options(struct tcpcb *, struct tcpopt *, unsigned int);

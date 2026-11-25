@@ -1,7 +1,7 @@
 From 8999319c52144cacd5da0a2d0694c41b67e95493 Mon Sep 17 00:00:00 2001
 From: joethedev5 <deepsbx1@proton.me>
 Date: Wed, 25 Nov 2026 03:43:03 +0000
-Subject: [PATCH 31/35] Match the reference TCP receive accounting and ECN
+Subject: [PATCH 31/39] Match the reference TCP receive accounting and ECN
  feedback flow
 
 The 13432 tcpcb replaces total_ect_packets_marked/acked with a single

@@ -1,0 +1,219 @@
+From 92b271fa2aa0071d461d9071a6b8ef1b4207030d Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 04:02:19 +0000
+Subject: [PATCH 36/39] Reconstruct the TCP socket-buffer helpers
+
+tcp_sb.c is split out of the public tcp_subr.c in the reference.
+Recover tcp_sbrcv_min_rwin from the public tcp_sbrcv_grow_rwin body
+(the reference renamed it) and point tcp_sbspace at it; the function
+is static per the DWARF.
+
+Mark tcp_sbrcv_grow, tcp_sbrcv_trim, tcp_sbrcv_tstmp_check and
+tcp_sbsnd_trim external, move their prototypes to tcp_var.h, and drop
+the stale tcp_input.c prototypes and the now-unused
+tcp_sbrcv_grow_rwin definition from tcp_subr.c.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ bsd/netinet/tcp_input.c |  7 ------
+ bsd/netinet/tcp_sb.c    | 52 ++++++++++++++++++++++++++++++++---------
+ bsd/netinet/tcp_subr.c  | 31 ------------------------
+ bsd/netinet/tcp_var.h   |  5 ++++
+ 4 files changed, 46 insertions(+), 49 deletions(-)
+
+diff --git a/bsd/netinet/tcp_input.c b/bsd/netinet/tcp_input.c
+index 25f699b16..939dd3a3c 100644
+--- a/bsd/netinet/tcp_input.c
++++ b/bsd/netinet/tcp_input.c
+@@ -268,13 +268,6 @@ static inline void compute_iaj_meat(struct tcpcb *tp, uint32_t cur_iaj);
+ static inline unsigned int tcp_maxmtu6(struct rtentry *);
+ unsigned int get_maxmtu(struct rtentry *);
+ 
+-static void tcp_sbrcv_grow(struct tcpcb *tp, struct sockbuf *sb,
+-    struct tcpopt *to, uint32_t tlen);
+-void tcp_sbrcv_trim(struct tcpcb *tp, struct sockbuf *sb);
+-static void tcp_sbsnd_trim(struct sockbuf *sbsnd);
+-static inline void tcp_sbrcv_tstmp_check(struct tcpcb *tp);
+-static inline void tcp_sbrcv_reserve(struct tcpcb *tp, struct sockbuf *sb,
+-    u_int32_t newsize, u_int32_t idealsize, u_int32_t rcvbuf_max);
+ static void tcp_bad_rexmt_restore_state(struct tcpcb *tp, struct tcphdr *th);
+ static void tcp_compute_rtt(struct tcpcb *tp, struct tcpopt *to,
+     struct tcphdr *th);
+diff --git a/bsd/netinet/tcp_sb.c b/bsd/netinet/tcp_sb.c
+index 1341bd628..1fb9bddd0 100644
+--- a/bsd/netinet/tcp_sb.c
++++ b/bsd/netinet/tcp_sb.c
+@@ -9,6 +9,20 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/kernel.h>
++#include <sys/mbuf.h>
++#include <sys/socket.h>
++#include <sys/socketvar.h>
++#include <net/if.h>
++#include <net/content_filter.h>
++#include <netinet/in.h>
++#include <netinet/in_pcb.h>
++#include <netinet/ip.h>
++#include <netinet/tcp.h>
++#include <netinet/tcp_seq.h>
++#include <netinet/tcp_timer.h>
++#include <netinet/tcp_utils.h>
++#include <netinet/tcp_var.h>
++#include <netinet/mptcp_var.h>
+ 
+ #define RECON_BSD_NETINET_TCP_SB_C 1
+ 
+@@ -41,7 +55,7 @@ tcp_sbrcv_reserve(struct tcpcb *tp, struct sockbuf *sbrcv,
+ }
+ 
+ /* bsd/netinet/tcp_sb.c:128 */
+-static void
++void
+ tcp_sbrcv_grow(struct tcpcb *tp, struct sockbuf *sbrcv,
+     struct tcpopt *to, uint32_t pktlen)
+ {
+@@ -173,15 +187,31 @@ out:
+ }
+ 
+ /* bsd/netinet/tcp_sb.c:265 */
+-void
+-tcp_sbrcv_min_rwin(struct tcpcb * tp, struct sockbuf * sb)
++static void
++tcp_sbrcv_min_rwin(struct tcpcb *tp, struct sockbuf *sb)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_sbrcv_min_rwin");
++	u_int32_t rcvbufinc = tp->t_maxseg << 4;
++	u_int32_t rcvbuf = sb->sb_hiwat;
++	struct socket *so = tp->t_inpcb->inp_socket;
++
++	if (tcp_recv_bg == 1 || IS_TCP_RECV_BG(so)) {
++		return;
++	}
++
++	if (tcp_do_autorcvbuf == 1 &&
++	    (tp->t_flags & TF_SLOWLINK) == 0 &&
++	    (so->so_flags1 & SOF1_EXTEND_BK_IDLE_WANTED) == 0 &&
++	    (rcvbuf - sb->sb_cc) < rcvbufinc &&
++	    rcvbuf < tcp_autorcvbuf_max &&
++	    (sb->sb_idealsize > 0 &&
++	    sb->sb_hiwat <= (sb->sb_idealsize + rcvbufinc))) {
++		sbreserve(sb,
++		    min((sb->sb_hiwat + rcvbufinc), tcp_autorcvbuf_max));
++	}
+ }
+ 
+ /* bsd/netinet/tcp_sb.c:293 */
+-static void
++void
+ tcp_sbrcv_trim(struct tcpcb *tp, struct sockbuf *sbrcv)
+ {
+ 	if (tcp_do_autorcvbuf == 1 && sbrcv->sb_idealsize > 0 &&
+@@ -219,7 +249,7 @@ tcp_sbrcv_trim(struct tcpcb *tp, struct sockbuf *sbrcv)
+ }
+ 
+ /* bsd/netinet/tcp_sb.c:337 */
+-static inline void
++void
+ tcp_sbrcv_tstmp_check(struct tcpcb *tp)
+ {
+ 	struct socket *so = tp->t_inpcb->inp_socket;
+@@ -234,7 +264,7 @@ tcp_sbrcv_tstmp_check(struct tcpcb *tp)
+ }
+ 
+ /* bsd/netinet/tcp_sb.c:357 */
+-static void
++void
+ tcp_sbsnd_trim(struct sockbuf *sbsnd)
+ {
+ 	if (((sbsnd->sb_flags & (SB_AUTOSIZE | SB_TRIM)) ==
+@@ -266,12 +296,12 @@ tcp_sbspace(struct tcpcb *tp)
+ 
+ 	if (so->so_flags & SOF_MP_SUBFLOW) {
+ 		/* We still need to grow TCP's buffer to have a BDP-estimate */
+-		tcp_sbrcv_grow_rwin(tp, sb);
++		tcp_sbrcv_min_rwin(tp, sb);
+ 
+ 		return mptcp_sbspace(tptomptp(tp));
+ 	}
+ 
+-	tcp_sbrcv_grow_rwin(tp, sb);
++	tcp_sbrcv_min_rwin(tp, sb);
+ 
+ 	/* hiwat might have changed */
+ 	rcvbuf = sb->sb_hiwat;
+@@ -312,7 +342,7 @@ tcp_sbspace(struct tcpcb *tp)
+ }
+ 
+ /* bsd/netinet/tcp_sb.c:433 */
+-static int
++int
+ tcp_notsent_lowat_check(struct socket *so)
+ {
+ 	struct inpcb *inp = sotoinpcb(so);
+diff --git a/bsd/netinet/tcp_subr.c b/bsd/netinet/tcp_subr.c
+index bfe4b647d..795f7fe6c 100644
+--- a/bsd/netinet/tcp_subr.c
++++ b/bsd/netinet/tcp_subr.c
+@@ -280,7 +280,6 @@ KALLOC_TYPE_DEFINE(tcp_seg_sent_zone, struct tcp_seg_sent, NET_KT_DEFAULT);
+ extern int slowlink_wsize;      /* window correction for slow links */
+ extern int path_mtu_discovery;
+ 
+-static void tcp_sbrcv_grow_rwin(struct tcpcb *tp, struct sockbuf *sb);
+ 
+ #define TCP_BWMEAS_BURST_MINSIZE 6
+ #define TCP_BWMEAS_BURST_MAXSIZE 25
+@@ -3238,36 +3237,6 @@ tcp_getlock(struct socket *so, int flags)
+ 	}
+ }
+ 
+-/*
+- * Determine if we can grow the recieve socket buffer to avoid sending
+- * a zero window update to the peer. We allow even socket buffers that
+- * have fixed size (set by the application) to grow if the resource
+- * constraints are met. They will also be trimmed after the application
+- * reads data.
+- */
+-static void
+-tcp_sbrcv_grow_rwin(struct tcpcb *tp, struct sockbuf *sb)
+-{
+-	u_int32_t rcvbufinc = tp->t_maxseg << 4;
+-	u_int32_t rcvbuf = sb->sb_hiwat;
+-	struct socket *so = tp->t_inpcb->inp_socket;
+-
+-	if (tcp_recv_bg == 1 || IS_TCP_RECV_BG(so)) {
+-		return;
+-	}
+-
+-	if (tcp_do_autorcvbuf == 1 &&
+-	    (tp->t_flags & TF_SLOWLINK) == 0 &&
+-	    (so->so_flags1 & SOF1_EXTEND_BK_IDLE_WANTED) == 0 &&
+-	    (rcvbuf - sb->sb_cc) < rcvbufinc &&
+-	    rcvbuf < tcp_autorcvbuf_max &&
+-	    (sb->sb_idealsize > 0 &&
+-	    sb->sb_hiwat <= (sb->sb_idealsize + rcvbufinc))) {
+-		sbreserve(sb,
+-		    min((sb->sb_hiwat + rcvbufinc), tcp_autorcvbuf_max));
+-	}
+-}
+-
+ /*
+  * Checks TCP Segment Offloading capability for a given connection
+  * and interface pair.
+diff --git a/bsd/netinet/tcp_var.h b/bsd/netinet/tcp_var.h
+index 9d0cd2ad9..c0a1610f0 100644
+--- a/bsd/netinet/tcp_var.h
++++ b/bsd/netinet/tcp_var.h
+@@ -1898,6 +1898,11 @@ struct sackhole *tcp_sack_output(struct tcpcb *tp, int *sack_bytes_rexmt);
+ void     tcp_sack_partialack(struct tcpcb *, struct tcphdr *);
+ void     tcp_free_sackholes(struct tcpcb *tp);
+ int32_t  tcp_sbspace(struct tcpcb *tp);
++void     tcp_sbrcv_grow(struct tcpcb *tp, struct sockbuf *sb,
++    struct tcpopt *to, uint32_t tlen);
++void     tcp_sbrcv_trim(struct tcpcb *tp, struct sockbuf *sb);
++void     tcp_sbrcv_tstmp_check(struct tcpcb *tp);
++void     tcp_sbsnd_trim(struct sockbuf *sbsnd);
+ void     tcp_set_tso(struct tcpcb *tp, struct ifnet *ifp);
+ void     tcp_set_ecn(struct tcpcb *tp);
+ void     tcp_set_l4s(struct tcpcb *tp, struct ifnet *ifp);

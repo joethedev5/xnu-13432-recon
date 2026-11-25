@@ -1,7 +1,7 @@
 From 60831fdfd439a42b2dcc2847d4032f6498dfc0ed Mon Sep 17 00:00:00 2001
 From: joethedev5 <deepsbx1@proton.me>
 Date: Wed, 25 Nov 2026 03:08:04 +0000
-Subject: [PATCH 24/35] Reconstruct the TCP Fast Open translation unit
+Subject: [PATCH 24/39] Reconstruct the TCP Fast Open translation unit
 
 Recover the six remaining tcp_fastopen.c stubs, relocating the public
 bodies where the reference keeps the same logic:
