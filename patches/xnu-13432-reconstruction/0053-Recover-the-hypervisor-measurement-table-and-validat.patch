@@ -1,0 +1,313 @@
+From 09794673bbbab75f67cf7daaec8242f25d985a44 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 19:58:25 +0000
+Subject: [PATCH] Recover the hypervisor measurement table and validator
+
+Reconstruct the compat layer's native measurement and the functions that
+consume it from the reference image and the kasan DWARF:
+
+  - the static const native_measurement record (228 bytes, interface
+    version 1.1, ARM state version 0x2068797003000004, and its 25
+    offset/size entries, read out of the reference data section);
+  - hv_get_native_measurement and hv_get_supported_measurement (the
+    native record is supported exactly for state version major 0x300);
+  - hv_get_supported_measurement_nofail with its three assertions
+    (measurement != NULL, the requested major matches, and
+    measurement_valid(measurement));
+  - measurement_entry_within_range, expressed with size_t start/end
+    values as in the reference DWARF;
+  - measurement_valid: the 0x20687970 state signature, the contiguous
+    read-write/read-only context roots, the 0xffffffff skip and zero
+    rejection for each entry, range containment for real contexts, and
+    the 0x8000 size-only / 0x10000 context-root ceilings behind the
+    recovered assert;
+  - the static handshake state (major-conversion flag, context-mismatch
+    flag, shared measurement), hv_paranested_virtualization_init, and
+    the accessors, with hv_get_shared_version_major returning the
+    shared record's >> 16 state major.
+
+Turn context_size_from_measurement into the header's static inline
+(asserting that the read-write root's size equals the read-only root's
+offset and returning their sum).
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ osfmk/arm64/hv/hv_compat_paranested.c | 194 ++++++++++++++++++++++++--
+ osfmk/arm64/hv/hv_compat_paranested.h |  19 ++-
+ 2 files changed, 198 insertions(+), 15 deletions(-)
+
+diff --git a/osfmk/arm64/hv/hv_compat_paranested.c b/osfmk/arm64/hv/hv_compat_paranested.c
+index ece7fa26b..eb32be476 100644
+--- a/osfmk/arm64/hv/hv_compat_paranested.c
++++ b/osfmk/arm64/hv/hv_compat_paranested.c
+@@ -10,56 +10,224 @@
+ #include <kern/assert.h>
+ #include <kern/debug.h>
+ #include <kern/zalloc.h>
+-#include <sys/systm.h>
++#include <arm64/hv/hv_compat_paranested.h>
++#include <arm64/hv/hv_vm.h>
+ 
+ #define RECON_OSFMK_ARM64_HV_HV_COMPAT_PARANESTED_C 1
+ 
++/*
++ * The measurement this guest reports as its own.  The values were read
++ * out of the reference kernel image at the native_measurement address:
++ * 228-byte record, 1.1 interface version, ARM state version
++ * 0x2068797003000004, and the 25 context entries below.  The types of
++ * the entries are given by hv_measurement_type[].
++ */
++/* osfmk/arm64/hv/hv_compat_paranested.c:36 */
++static const hv_paranested_measurement_t native_measurement = {
++	.this_size = sizeof(hv_paranested_measurement_t),
++	.measurement_array_size = sizeof(hv_measurement_entry_t) * 25,
++	.version_major = 1,
++	.version_minor = 1,
++	.arm_hv_state_version = 0x2068797003000004ULL,
++	.measurement_array = {
++		{ .offset = 0x0000, .size = 0x4000 },
++		{ .offset = 0x4000, .size = 0x4000 },
++		{ .offset = 0x0008, .size = 0x0110 },
++		{ .offset = 0x0140, .size = 0x0210 },
++		{ .offset = 0x0350, .size = 0x0068 },
++		{ .offset = 0x03b8, .size = 0x00d0 },
++		{ .offset = 0x0488, .size = 0x0220 },
++		{ .offset = 0x06a8, .size = 0x0018 },
++		{ .offset = 0x0920, .size = 0x00e0 },
++		{ .offset = 0x0a00, .size = 0x0008 },
++		{ .offset = 0x0a08, .size = 0x0010 },
++		{ .offset = 0x0a18, .size = 0x0298 },
++		{ .offset = 0x1000, .size = 0x1000 },
++		{ .offset = 0x2000, .size = 0x1000 },
++		{ .offset = 0x4000, .size = 0x0008 },
++		{ .offset = 0x4008, .size = 0x0028 },
++		{ .offset = 0x4030, .size = 0x00e0 },
++		{ .offset = 0x4110, .size = 0x0018 },
++		{ .offset = 0x4128, .size = 0x0018 },
++		{ .offset = 0x4140, .size = 0x0010 },
++		{ .offset = 0x4150, .size = 0x0010 },
++		{ .offset = 0x0000, .size = 0x4000 },
++		{ .offset = 0x0000, .size = 0x1440 },
++		{ .offset = 0x0000, .size = 0x01db },
++		{ .offset = 0x06c0, .size = 0x0260 },
++	},
++};
++
++/* osfmk/arm64/hv/hv_compat_paranested.c:41 */
++const hv_paranested_measurement_t *
++hv_get_native_measurement(void)
++{
++	return &native_measurement;
++}
++
++/*
++ * Return the native measurement when it speaks the requested interface
++ * version.  The reference DWARF also lists a loop variable at line 53;
++ * the compiled body has no loop left, so only the version comparison is
++ * observable.
++ */
+ /* osfmk/arm64/hv/hv_compat_paranested.c:47 */
+ const hv_paranested_measurement_t *
+ hv_get_supported_measurement(hv_context_version_major_t major_version)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: hv_get_supported_measurement");
++	if (major_version == hv_get_state_version_major(&native_measurement)) {
++		return &native_measurement;
++	}
++
++	return NULL;
+ }
+ 
+ /* osfmk/arm64/hv/hv_compat_paranested.c:62 */
+ const hv_paranested_measurement_t *
+ hv_get_supported_measurement_nofail(hv_context_version_major_t major_version)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: hv_get_supported_measurement_nofail");
++	const hv_paranested_measurement_t * measurement =
++	    hv_get_supported_measurement(major_version);
++
++	assert(measurement != NULL);
++	assert(major_version == hv_get_state_version_major(measurement));
++	assert(measurement_valid(measurement));
++
++	return measurement;
++}
++
++/* osfmk/arm64/hv/hv_compat_paranested.c:72 */
++_Bool
++measurement_entry_within_range(
++	const hv_measurement_entry_t * measurement_entry,
++	const hv_measurement_entry_t * range)
++{
++	const size_t measurement_start = measurement_entry->offset;
++	size_t measurement_end;
++	const size_t range_start = range->offset;
++	size_t range_end;
++
++	measurement_end = measurement_start + measurement_entry->size;
++	range_end = range_start + range->size;
++
++	return measurement_start >= range_start && measurement_end <= range_end;
++}
++
++/*
++ * Validate a measurement record: the ARM state version signature, the
++ * two contiguous context roots, and every entry against its kind.  The
++ * two roots must tile the context window; read-write and read-only
++ * entries must lie inside their root, size-only entries are limited to
++ * 0x8000 bytes and context roots to 0x10000.
++ */
++/* osfmk/arm64/hv/hv_compat_paranested.c:92 */
++_Bool
++measurement_valid(const hv_paranested_measurement_t * measurement)
++{
++	if ((uint32_t)(measurement->arm_hv_state_version >> 32) != 0x20687970) {
++		return false;
++	}
++
++	const hv_measurement_entry_t * rw_context_measurement =
++	    &measurement->measurement_array[0];
++	const hv_measurement_entry_t * ro_context_measurement =
++	    &measurement->measurement_array[1];
++
++	if (rw_context_measurement->size != ro_context_measurement->offset) {
++		return false;
++	}
++
++	for (unsigned int i = 0; i < 25; i++) {
++		const hv_measurement_type_t measurement_type =
++		    hv_measurement_type[i];
++
++		const hv_measurement_entry_t * measurement_entry =
++		    &measurement->measurement_array[i];
++
++		if (measurement_entry->size == 0xffffffff) {
++			continue;
++		}
++
++		if (measurement_entry->size == 0) {
++			return false;
++		}
++
++		if (measurement_type == MEASUREMENT_TYPE_RW_CONTEXT ||
++		    measurement_type == MEASUREMENT_TYPE_RO_CONTEXT) {
++			const hv_measurement_entry_t * context_range =
++			    measurement_type == MEASUREMENT_TYPE_RW_CONTEXT ?
++			    rw_context_measurement : ro_context_measurement;
++
++			if (!measurement_entry_within_range(measurement_entry,
++			    context_range)) {
++				return false;
++			}
++		} else {
++			uint32_t max_size = measurement_type ==
++			    MEASUREMENT_TYPE_SIZE ? 0x8000 : 0x10000;
++
++			assert(measurement_type ==
++			    MEASUREMENT_TYPE_CONTEXT_ROOT);
++
++			if (measurement_entry->size > max_size) {
++				return false;
++			}
++		}
++	}
++
++	return true;
++}
++
++/* osfmk/arm64/hv/hv_compat_paranested.c:172 */
++static _Bool hv_major_conversion_needed;
++/* osfmk/arm64/hv/hv_compat_paranested.c:173 */
++static _Bool hv_context_measurement_mismatch;
++/* osfmk/arm64/hv/hv_compat_paranested.c:174 */
++static hv_paranested_measurement_t shared_measurement;
++
++/* osfmk/arm64/hv/hv_compat_paranested.c:177 */
++_Bool
++hv_paranested_virtualization_init(void)
++{
++	return hv_paranested_virtualization_init_handshake(
++		&hv_major_conversion_needed,
++		&hv_context_measurement_mismatch,
++		&shared_measurement);
+ }
+ 
+ /* osfmk/arm64/hv/hv_compat_paranested.c:184 */
+ _Bool
+ hv_guest_needs_context_conversion(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: hv_guest_needs_context_conversion");
++	return hv_guest_has_major_version_mismatch() || hv_guest_has_context_measurement_mismatch();
+ }
+ 
+ /* osfmk/arm64/hv/hv_compat_paranested.c:190 */
+ hv_context_version_major_t
+ hv_get_shared_version_major(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: hv_get_shared_version_major");
++	return hv_get_state_version_major(&shared_measurement);
++}
++
++/* osfmk/arm64/hv/hv_compat_paranested.c:196 */
++const hv_paranested_measurement_t *
++hv_get_shared_measurement(void)
++{
++	return &shared_measurement;
+ }
+ 
+ /* osfmk/arm64/hv/hv_compat_paranested.c:202 */
+ _Bool
+ hv_guest_has_major_version_mismatch(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: hv_guest_has_major_version_mismatch");
++	return hv_major_conversion_needed;
+ }
+ 
+ /* osfmk/arm64/hv/hv_compat_paranested.c:208 */
+ _Bool
+ hv_guest_has_context_measurement_mismatch(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: hv_guest_has_context_measurement_mismatch");
++	return hv_context_measurement_mismatch;
+ }
+ 
+ /* osfmk/arm64/hv/hv_compat_paranested.c:223 */
+diff --git a/osfmk/arm64/hv/hv_compat_paranested.h b/osfmk/arm64/hv/hv_compat_paranested.h
+index 762b60f00..325fbdc6b 100644
+--- a/osfmk/arm64/hv/hv_compat_paranested.h
++++ b/osfmk/arm64/hv/hv_compat_paranested.h
+@@ -62,8 +62,23 @@ void convert_context_by_guest(
+ 	hv_vcpu_t * vcpu,
+ 	hv_context_conversion_dir_e direction);
+ 
++/*
++ * Total size of the guest context described by a measurement: the two
++ * context roots are contiguous, so the size is the read-write root's
++ * size plus the read-only root's size.
++ */
+ /* hv_compat_paranested.h:73 */
+-size_t context_size_from_measurement(
+-	const hv_paranested_measurement_t * measurement);
++static inline size_t
++context_size_from_measurement(const hv_paranested_measurement_t * measurement)
++{
++	const hv_measurement_entry_t * rw_context_measurement =
++	    &measurement->measurement_array[0];
++	const hv_measurement_entry_t * ro_context_measurement =
++	    &measurement->measurement_array[1];
++
++	assert(rw_context_measurement->size == ro_context_measurement->offset);
++
++	return rw_context_measurement->size + ro_context_measurement->size;
++}
+ 
+ #endif /* XNU13432_OSFMK_ARM64_HV_HV_COMPAT_PARANESTED_H */
+-- 
+2.47.3
+

@@ -9,7 +9,7 @@ Apply in numeric order from a clean checkout:
 
 ```
 git checkout xnu-12377.121.6
-git am 0001-*.patch ... 0052-*.patch
+git am 0001-*.patch ... 0053-*.patch
 ```
 
 Contents:
@@ -138,6 +138,15 @@ Contents:
     `hv_get_state_version_major` and the 25-entry
     `hv_measurement_type[]` array recovered from the kasan reference
     kernel, which keeps the full DWARF the release dSYM omits.
+53. The hypervisor measurement table and validator: the static
+    `native_measurement` record (228 bytes, interface 1.1 and the 25
+    context entries read from the reference data section),
+    `hv_get_native_measurement`, `hv_get_supported_measurement` and its
+    asserting `_nofail` wrapper, `measurement_entry_within_range`, the
+    `measurement_valid` entry/range checks with the 0x20687970 state
+    signature, the static handshake flags and shared measurement, the
+    accessors and `hv_paranested_virtualization_init`, plus the header's
+    inline `context_size_from_measurement`.
 
 The patches contain only public xnu text plus original reconstruction;
 no Apple binary, dSYM, SDK payload or extracted proprietary header is

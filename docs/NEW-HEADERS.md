@@ -25,7 +25,7 @@ small declaration-only APIs recovered from the reference DWARF.
 | `libkern/os/metric_types.h` | 75 |
 | `osfmk/arm64/hv/guest_thread_state.h` | 420 |
 | `osfmk/arm64/hv/hv.h` | 33 |
-| `osfmk/arm64/hv/hv_compat_paranested.h` | 69 |
+| `osfmk/arm64/hv/hv_compat_paranested.h` | 84 |
 | `osfmk/arm64/hv/hv_interface.h` | 123 |
 | `osfmk/arm64/hv/hv_internal.h` | 123 |
 | `osfmk/arm64/hv/hv_kern_types.h` | 32 |

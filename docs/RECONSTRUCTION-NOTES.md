@@ -1350,3 +1350,87 @@ handshake.__desc` spells out the recovered text exactly:
   copies in the reference image are identical.
 
 The patch series now has 52 entries; 98 explicit stubs remain.
+
+## 2026-11-25: the measurement table and validator
+
+`hv_compat_paranested.c` keeps its native measurement as a static const
+record (DWARF decl line 36; `const hv_paranested_measurement_t` through
+the release type table).  It lives at `0xfffffe000700b6f0` in the
+release image (`0xfffffe000700a3f8` in kasan) and was read out
+directly: `this_size` 228, `measurement_array_size` 200,
+`version_major` 1, `version_minor` 1, `arm_hv_state_version`
+0x2068797003000004, and 25 entries (offset, size):
+
+    0x0000,0x4000  0x4000,0x4000  0x0008,0x0110  0x0140,0x0210
+    0x0350,0x0068  0x03b8,0x00d0  0x0488,0x0220  0x06a8,0x0018
+    0x0920,0x00e0  0x0a00,0x0008  0x0a08,0x0010  0x0a18,0x0298
+    0x1000,0x1000  0x2000,0x1000  0x4000,0x0008  0x4008,0x0028
+    0x4030,0x00e0  0x4110,0x0018  0x4128,0x0018  0x4140,0x0010
+    0x4150,0x0010  0x0000,0x4000  0x0000,0x1440  0x0000,0x01db
+    0x06c0,0x0260
+
+- `hv_get_native_measurement` (line 41) returns the record's address
+  (body 43:2).  `hv_get_supported_measurement` (line 47) compares the
+  requested major with `hv_get_state_version_major(&native_measurement)`
+  at 49 (the `==` operator at column 20, the inlined state-major call at
+  49:23 and its `>> 16` at hv_compat_paranested.h:59) and returns the
+  record or NULL; the closing brace is 59:1.  The DWARF also records an
+  `unsigned int i` at line 53 with no location: the source had a loop
+  that the optimizer eliminated completely, so only the comparison is
+  observable.
+- `hv_get_supported_measurement_nofail` (line 62): the measurement is
+  declared at 64:51 (`... = hv_get_supported_measurement(major_version)`);
+  the three assert descriptors are `measurement != NULL` (65),
+  `major_version == hv_get_state_version_major(measurement)` (66; the
+  inline call is at 66:2 and loads the state halfword at +0x16) and
+  `measurement_valid(measurement)` (67; out-of-line call), and the
+  record is returned at 68.
+- `measurement_entry_within_range` (line 72) uses `const size_t
+  measurement_start` (75), `size_t measurement_end` (76), `const
+  size_t range_start` (77) and `size_t range_end` (78), loads the two
+  entry sizes at 81:6 and 84:6, and compares at 88:27/88:42.  Both
+  kernels compute 64-bit ends (`add x9,x9,x8`) and return
+  `measurement_start >= range_start && measurement_end <= range_end`
+  via `ccmp ...,#2,hs` + `cset ls`; the closing brace is 89:1.
+- `measurement_valid` (line 92, body 93:0) starts with the ARM state
+  signature: the high 32 bits of `arm_hv_state_version` (offset 0x18)
+  must equal 0x20687970 (94:6/94:68).  It names the two roots
+  `rw_context_measurement` (98) and `ro_context_measurement` (99) and
+  requires `rw_context_measurement->size ==
+  ro_context_measurement->offset` (the if at 102:30/102:62, compare at
+  102:35).  The loop at 106:2 walks the 25 entries with `unsigned int
+  i`; `measurement_type` (107) and `measurement_entry` (108) are
+  loop-local.  A size of 0xffffffff is skipped (112:31) and a size of
+  zero is invalid (the same line's compare); the type dispatch at 122:7
+  sends read-write and read-only entries through `context_range` (125)
+  and `measurement_entry_within_range` (127:59), and the remaining
+  kinds compute a `uint32_t max_size` (132): 0x8000 for
+  `MEASUREMENT_TYPE_SIZE`, otherwise the recovered assert
+  `measurement_type == MEASUREMENT_TYPE_CONTEXT_ROOT` (descriptor at
+  136) precedes 0x10000.  Entries larger than the ceiling fail at
+  139:27; the success return and closing brace are at 147:1.  The
+  local clang build (bounds-safety flags dropped) folds the const type
+  table into bit tests; the reference loads `hv_measurement_type[i]`
+  each iteration.
+- The handshake state is three statics at lines 172-174, laid out
+  consecutively in both kernels (`hv_major_conversion_needed`,
+  `hv_context_measurement_mismatch`, `shared_measurement`; the dev
+  symbols are local `b` entries at 0x81322f8-fa, release
+  0x7da0110-112).  `hv_paranested_virtualization_init` (177) tail-calls
+  the handshake with those three addresses (179:9).
+- `hv_guest_needs_context_conversion` (184) returns the OR of
+  `hv_guest_has_major_version_mismatch()` and
+  `hv_guest_has_context_measurement_mismatch()` on one line (calls at
+  186:9 and 186:50).  `hv_get_shared_version_major` (190) is the
+  inlined `hv_get_state_version_major(&shared_measurement)` (192:9,
+  halfword at shared+0x16); `hv_get_shared_measurement` (196) returns
+  its address at 198:2; the two predicates return the flags at 204:9
+  and 210:9.
+- `context_size_from_measurement` is the header's static inline at
+  line 73: `rw_context_measurement` (75) and `ro_context_measurement`
+  (76) point at the two roots, the descriptor at line 78 is
+  `rw_context_measurement->size == ro_context_measurement->offset`,
+  and the return at 79 adds the two sizes (columns 33 and 66; the
+  inlined instances appear at 76:57, 78:2 and 79:33/40/66).
+
+The patch series now has 53 entries; 92 explicit stubs remain.
