@@ -1,0 +1,20 @@
+name: runner-probe
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: xcode-27
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe reference host
+        run: |
+          mkdir -p out
+          { sw_vers; uname -a; sysctl -n kern.version; xcodebuild -version;
+            xcode-select -p; } > out/host.txt 2>&1
+          cat out/host.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: host-probe
+          path: out/host.txt
+          retention-days: 1

@@ -1,0 +1,18 @@
+# Extracted Apple reference materials — never redistributed here
+kdk/
+clt/
+recon-artifacts/
+*.dmg
+*.pkg
+*.tgz
+*.tar.gz
+*.zip
+
+# Local analysis scratch
+analysis/raw/
+analysis/dwarf/
+analysis/kernels/
+build/
+.venv/
+__pycache__/
+*.pyc
