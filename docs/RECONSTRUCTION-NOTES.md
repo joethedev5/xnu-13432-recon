@@ -1799,3 +1799,99 @@ switch on 468 (protect call at 475, map call at 481), panics on an
 unexpected function (486) and releases the VM (488).  `hv_space_map_op_nested` (decl 491) tail-calls it.
 
 The patch series now has 59 entries; 73 explicit stubs remain.
+
+## 2026-11-25: the hypervisor context conversion path
+
+`convert_context_by_guest` (decl 261) was the last hypervisor stub.
+It converts the guest's saved context between the native and shared
+layouts and is reached only when `hv_guest_needs_context_conversion()`
+is true.  The kasan line table, the argument/column rows and the
+release build's inlined code together give the full structure.
+
+- 264/265: the two assertions, exactly as their `mach_assert`
+  descriptors read: `vcpu->kif_shared != NULL && vcpu->kif != NULL &&
+  vcpu->kif != vcpu->kif_shared` and
+  `direction == NATIVE_TO_SHARED || direction == SHARED_TO_NATIVE`.
+- 267/268: `src` and `dst`, `vcpu->kif`/`vcpu->kif_shared` swapped by
+  direction (rows 267:58/64/70 and 268:46/52/65/71 are the two
+  branches and their `+ 0x8000` end computations).
+- 270/271: `src_size` and `dst_size`: the kernel interface frame is
+  0x8000 bytes (the selection blocks add the immediate), the shared
+  side uses `vcpu->kif_shared_size`.
+- 273/274: `src_measurement`/`dst_measurement`, pointing at
+  `native_measurement`/`shared_measurement` according to direction.
+- 278: `copy_ro = direction == SHARED_TO_NATIVE`; the comparison
+  operator is at column 33, so the declaration is
+  `const bool copy_ro = ...` without parentheses.
+- 280-283: `major_version_mismatch`, `context_measurement_mismatch`,
+  `src_version_major`, `dst_version_major`.  The DWARF call columns
+  (280:38, 281:44, 282:55, 283:55) only line up for `const bool` and
+  `const hv_context_version_major_t` declarations, which fixed those
+  spellings (`bool` is `_Bool` in the DWARF either way).
+- 285: `if (major_version_mismatch && context_measurement_mismatch)`;
+  the `&&` is at column 29 of the source line.
+- 289: `intermediate_measurement =
+  hv_get_supported_measurement_nofail(hv_get_shared_version_major())`.
+- 290: `if (direction == NATIVE_TO_SHARED)`, operator at column 17.
+- 291: `hv_convert_context_major_version(src, src_version_major,
+  vcpu->kif_intermediate, dst_version_major, copy_ro)`.  The kasan
+  argument checks sit at 291:37 (`src`), 291:61 and 291:67 (the
+  `vcpu->kif_intermediate` wide pointer and its member), fixing the
+  argument order and columns.
+- 293: `hv_convert_context_from_measurements(vcpu->kif_intermediate,
+  vcpu->kif_intermediate_size, intermediate_measurement, dst,
+  dst_size, dst_measurement, copy_ro)`.  The release build inlines it
+  at call line 293 with src = x22 = `kif_intermediate`, src_size = x21
+  = `kif_intermediate_size`, dst = x19 = `kif_shared`, and the
+  intermediate measurement as the source measurement.
+- 296: the reverse conversion,
+  `hv_convert_context_from_measurements(src, src_size,
+  src_measurement, vcpu->kif_intermediate,
+  vcpu->kif_intermediate_size, intermediate_measurement, copy_ro)`;
+  the kasan row 296:79 is the member access of the fourth argument on
+  the call line.
+- 298: `hv_convert_context_major_version(vcpu->kif_intermediate,
+  src_version_major, dst, dst_version_major, copy_ro)`; rows
+  298:37/43 fix the first argument and its member, row 298:80 fixes
+  `dst`.
+- 300/302: major-version-only mismatch,
+  `hv_convert_context_major_version(src, src_version_major, dst,
+  dst_version_major, copy_ro)` (rows 302:36 and 302:60).
+- 304: `assert(!major_version_mismatch &&
+  context_measurement_mismatch)` for the measurement-only case; the
+  descriptor text matches.
+- 305: the direct `hv_convert_context_from_measurements(src, src_size,
+  src_measurement, dst, dst_size, dst_measurement, copy_ro)`.
+- 307: `if (major_version_mismatch && direction ==
+  SHARED_TO_NATIVE)`; the `&&` is at column 29, which fixes the
+  operand order.
+- 310: `vcpu->kif->ro.ver = ARM_HV_STATE_VER`.  The store is
+  `str 0x2068797003000004, [kif + 0x4000]`; the DWARF kernel interface
+  frame type has the `ro` union at 0x4000 and `ver` as its first
+  member, and the source columns 9/14/21 are `kif`, `ro` and the
+  assignment.
+
+The helper (decl 157) is `static inline void
+hv_convert_context_major_version(const void *src,
+hv_context_version_major_t src_version_major, void *dst,
+hv_context_version_major_t dst_version_major, bool copy_ro)`.  Its
+abstract DIE lacks `DW_AT_external`, unlike every external inline
+helper in the file, and the image has no symbol for it; at its three
+call sites the only emitted code is the trap for the line-166
+`assert(false)` descriptor.  In the release kernel `assert()` is
+empty (`osfmk/kern/assert.h` defines it as `((void)0)` without
+MACH_ASSERT), so the panic disappears and the release build executes
+the explicit `kif_intermediate` conversions instead: its inlining
+tree has exactly three `hv_convert_context_from_measurements` sites,
+at call lines 293, 296 and 305, and no helper trap.
+
+The release build of the recovered function now matches that
+behaviour, and the kasan/dev build of the helper emits the same
+`false` descriptor and three `brk #0xbffc` sites as the reference.
+The header was corrected at the same time: `hv_get_state_version_major`
+has no `assert(measurement)` (its inlined body is a single `ldrh`),
+`ARM_HV_STATE_VER` is defined from the public unit-test mock's use,
+and the read-only context root carries its recovered members
+(`ver`, `exit`, `controls`, `state`, `ich`, `sme_state`, `misc`).
+
+The patch series now has 60 entries; 72 explicit stubs remain.

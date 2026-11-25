@@ -9,7 +9,7 @@ Apply in numeric order from a clean checkout:
 
 ```
 git checkout xnu-12377.121.6
-git am 0001-*.patch ... 0059-*.patch
+git am 0001-*.patch ... 0060-*.patch
 ```
 
 Contents:
@@ -197,6 +197,18 @@ Contents:
     `hv_space_map_op_nested`; plus the reference-only
     `mach_vm_protect_kernel` helper and its declaration in
     `osfmk/vm/vm_kern.c` and `vm_kern_xnu.h`.
+60. The hypervisor context conversion path in
+    `osfmk/arm64/hv/hv_compat_paranested.c`: `convert_context_by_guest`
+    (direction-selected buffers, sizes and measurements; the
+    both-mismatch path through `kif_intermediate`, the major-only and
+    measurement-only paths, and the shared-to-native version stamp in
+    the read-only context root) and the unimplemented
+    `hv_convert_context_major_version` helper, whose body is
+    `assert(false)` and therefore panics in development and kasan
+    kernels but falls away in release kernels.  The patch also gives
+    the read-only context root its recovered members, defines
+    `ARM_HV_STATE_VER`, declares the file's external inline helpers and
+    drops a spurious assert from `hv_get_state_version_major`.
 
 The patches contain only public xnu text plus original reconstruction;
 no Apple binary, dSYM, SDK payload or extracted proprietary header is

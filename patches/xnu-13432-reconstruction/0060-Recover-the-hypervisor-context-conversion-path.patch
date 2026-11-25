@@ -1,0 +1,400 @@
+From 094e3e203c56e7753ddba505f9bfb2e67421a62a Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 20:50:15 +0000
+Subject: [PATCH] Recover the hypervisor context conversion path
+
+convert_context_by_guest selects the source and destination buffers,
+sizes and measurements from the direction, then branches on the guest's
+major-version and context-measurement mismatches.  With both mismatches
+the context goes through kif_intermediate: native to intermediate (the
+supported layout of the shared version) and then intermediate to
+shared, or the reverse for shared to native.  A major-version-only
+mismatch goes through the major-version conversion helper, a
+measurement-only mismatch converts directly, and a shared-to-native
+conversion after a major mismatch stamps the kernel interface frame's
+read-only root with the ARM hypervisor state version.
+
+hv_convert_context_major_version is the unimplemented major-version
+conversion: its body is assert(false), so development and kasan kernels
+panic at the three call sites while release kernels, where assert() is
+empty, fall through to the explicit kif_intermediate conversions.  The
+helper's descriptor, the assertion texts and the release build's three
+conversion sites all match the reference.
+
+Also give the read-only context root its recovered members (ver, exit,
+controls, state, ich, sme_state, misc), define ARM_HV_STATE_VER, declare
+the file's external inline helpers, and drop a spurious assert from
+hv_get_state_version_major, matching the reference header.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ osfmk/arm64/hv/guest_thread_state.h   |  10 +-
+ osfmk/arm64/hv/hv_compat_paranested.c | 135 +++++++++++++++++++++++---
+ osfmk/arm64/hv/hv_compat_paranested.h |  65 ++++++++-----
+ osfmk/arm64/hv/hv_interface.h         |   7 ++
+ 4 files changed, 176 insertions(+), 41 deletions(-)
+
+diff --git a/osfmk/arm64/hv/guest_thread_state.h b/osfmk/arm64/hv/guest_thread_state.h
+index f7c646539..cf3131ab4 100644
+--- a/osfmk/arm64/hv/guest_thread_state.h
++++ b/osfmk/arm64/hv/guest_thread_state.h
+@@ -362,7 +362,15 @@ typedef struct {
+ 	arm_guest_amx_context_t *amx;
+ } arm_guest_ro_context_misc_t;
+ typedef union {
+-	/* unresolved anonymous member at offset 0 */
++	struct {
++		uint64_t ver;
++		arm_guest_vmexit_t exit;
++		arm_guest_controls_t controls;
++		arm_guest_ro_state_t state;
++		arm_guest_ich_context_t ich;
++		arm_guest_sme_state_t sme_state;
++		arm_guest_ro_context_misc_t misc;
++	};
+ 	uint8_t page[16384];
+ } arm_guest_ro_context_t;
+ typedef struct {
+diff --git a/osfmk/arm64/hv/hv_compat_paranested.c b/osfmk/arm64/hv/hv_compat_paranested.c
+index 46fa1bc00..1905d2167 100644
+--- a/osfmk/arm64/hv/hv_compat_paranested.c
++++ b/osfmk/arm64/hv/hv_compat_paranested.c
+@@ -72,7 +72,7 @@ hv_get_native_measurement(void)
+  * observable.
+  */
+ /* osfmk/arm64/hv/hv_compat_paranested.c:47 */
+-const hv_paranested_measurement_t *
++inline const hv_paranested_measurement_t *
+ hv_get_supported_measurement(hv_context_version_major_t major_version)
+ {
+ 	if (major_version == hv_get_state_version_major(&native_measurement)) {
+@@ -83,7 +83,7 @@ hv_get_supported_measurement(hv_context_version_major_t major_version)
+ }
+ 
+ /* osfmk/arm64/hv/hv_compat_paranested.c:62 */
+-const hv_paranested_measurement_t *
++inline const hv_paranested_measurement_t *
+ hv_get_supported_measurement_nofail(hv_context_version_major_t major_version)
+ {
+ 	const hv_paranested_measurement_t * measurement =
+@@ -97,7 +97,7 @@ hv_get_supported_measurement_nofail(hv_context_version_major_t major_version)
+ }
+ 
+ /* osfmk/arm64/hv/hv_compat_paranested.c:72 */
+-_Bool
++inline bool
+ measurement_entry_within_range(
+ 	const hv_measurement_entry_t * measurement_entry,
+ 	const hv_measurement_entry_t * range)
+@@ -121,7 +121,7 @@ measurement_entry_within_range(
+  * 0x8000 bytes and context roots to 0x10000.
+  */
+ /* osfmk/arm64/hv/hv_compat_paranested.c:92 */
+-_Bool
++bool
+ measurement_valid(const hv_paranested_measurement_t * measurement)
+ {
+ 	if ((uint32_t)(measurement->arm_hv_state_version >> 32) != 0x20687970) {
+@@ -178,15 +178,37 @@ measurement_valid(const hv_paranested_measurement_t * measurement)
+ 	return true;
+ }
+ 
++/*
++ * Convert a context between two major versions.
++ *
++ * The reference does not implement the conversion: the body is the
++ * assertion below, so development and kasan kernels panic here.  In
++ * release kernels assert() is empty and the function falls away, which
++ * leaves the callers' explicit kif_intermediate conversions in charge.
++ */
++/* osfmk/arm64/hv/hv_compat_paranested.c:157 */
++static inline void
++hv_convert_context_major_version(const void * src, hv_context_version_major_t src_version_major,
++    void * dst, hv_context_version_major_t dst_version_major, bool copy_ro)
++{
++	(void)src;
++	(void)src_version_major;
++	(void)dst;
++	(void)dst_version_major;
++	(void)copy_ro;
++
++	assert(false);
++}
++
+ /* osfmk/arm64/hv/hv_compat_paranested.c:172 */
+-static _Bool hv_major_conversion_needed;
++static bool hv_major_conversion_needed;
+ /* osfmk/arm64/hv/hv_compat_paranested.c:173 */
+-static _Bool hv_context_measurement_mismatch;
++static bool hv_context_measurement_mismatch;
+ /* osfmk/arm64/hv/hv_compat_paranested.c:174 */
+ static hv_paranested_measurement_t shared_measurement;
+ 
+ /* osfmk/arm64/hv/hv_compat_paranested.c:177 */
+-_Bool
++bool
+ hv_paranested_virtualization_init(void)
+ {
+ 	return hv_paranested_virtualization_init_handshake(
+@@ -196,14 +218,14 @@ hv_paranested_virtualization_init(void)
+ }
+ 
+ /* osfmk/arm64/hv/hv_compat_paranested.c:184 */
+-_Bool
++bool
+ hv_guest_needs_context_conversion(void)
+ {
+ 	return hv_guest_has_major_version_mismatch() || hv_guest_has_context_measurement_mismatch();
+ }
+ 
+ /* osfmk/arm64/hv/hv_compat_paranested.c:190 */
+-hv_context_version_major_t
++inline hv_context_version_major_t
+ hv_get_shared_version_major(void)
+ {
+ 	return hv_get_state_version_major(&shared_measurement);
+@@ -217,14 +239,14 @@ hv_get_shared_measurement(void)
+ }
+ 
+ /* osfmk/arm64/hv/hv_compat_paranested.c:202 */
+-_Bool
++inline bool
+ hv_guest_has_major_version_mismatch(void)
+ {
+ 	return hv_major_conversion_needed;
+ }
+ 
+ /* osfmk/arm64/hv/hv_compat_paranested.c:208 */
+-_Bool
++inline bool
+ hv_guest_has_context_measurement_mismatch(void)
+ {
+ 	return hv_context_measurement_mismatch;
+@@ -247,7 +269,7 @@ hv_convert_context_from_measurements(
+ 	void * dst __sized_by(dst_size),
+ 	size_t dst_size,
+ 	const hv_paranested_measurement_t * dst_measurement,
+-	_Bool copy_ro)
++	bool copy_ro)
+ {
+ 	assert(src_size == context_size_from_measurement(src_measurement));
+ 	assert(dst_size == context_size_from_measurement(dst_measurement));
+@@ -271,7 +293,7 @@ hv_convert_context_from_measurements(
+ 		if (measurement_type == MEASUREMENT_TYPE_RW_CONTEXT ||
+ 		    (copy_ro &&
+ 		    measurement_type == MEASUREMENT_TYPE_RO_CONTEXT)) {
+-			assert(src_entry->size != 0 && dst_entry->size != 0);
++			assert((src_entry->size != 0) && (dst_entry->size != 0));
+ 
+ 			memmove((char *)dst + dst_entry->offset,
+ 			    (const char *)src + src_entry->offset,
+@@ -280,10 +302,93 @@ hv_convert_context_from_measurements(
+ 	}
+ }
+ 
++/*
++ * Convert the guest's saved context between the native and the shared
++ * layout, in the direction the caller asks for.
++ *
++ * The two layouts are compared before the conversion: a major-version
++ * mismatch means the guest speaks a different context version, and a
++ * measurement mismatch means the individual context ranges moved.  The
++ * cases are:
++ *
++ *  - both mismatches: the context is converted through kif_intermediate.
++ *    The intermediate holds the layout of the shared major version, so
++ *    the context is first converted between the native and intermediate
++ *    layouts and then between the intermediate and shared layouts (in
++ *    the order required by the direction).  The major-version conversion
++ *    itself is not implemented and only asserts.
++ *  - major mismatch only: the layouts are directly compatible, but the
++ *    version conversion is not implemented; the call only asserts.
++ *  - measurement mismatch only: the layouts differ and are converted
++ *    directly.
++ *
++ * After a shared-to-native conversion caused by a major mismatch, the
++ * kernel interface frame's read-only root is stamped with the version
++ * of the ARM hypervisor state the kernel now speaks.
++ *
++ * Reference layout: 264-265 assertions, 267-274 source/destination
++ * selection, 278 copy_ro, 280-283 mismatch and version facts, 285-306
++ * the conversion cases, 307-310 the version stamp.
++ */
+ /* osfmk/arm64/hv/hv_compat_paranested.c:261 */
+ void
+ convert_context_by_guest(hv_vcpu_t * vcpu, hv_context_conversion_dir_e direction)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: convert_context_by_guest");
++	assert(vcpu->kif_shared != NULL && vcpu->kif != NULL && vcpu->kif != vcpu->kif_shared);
++	assert(direction == NATIVE_TO_SHARED || direction == SHARED_TO_NATIVE);
++
++	arm_guest_context_t * src = direction == NATIVE_TO_SHARED ? vcpu->kif : vcpu->kif_shared;
++	arm_guest_context_t * dst = direction == NATIVE_TO_SHARED ? vcpu->kif_shared : vcpu->kif;
++
++	const size_t src_size = direction == NATIVE_TO_SHARED ?
++	    sizeof(arm_guest_context_t) : vcpu->kif_shared_size;
++	const size_t dst_size = direction == NATIVE_TO_SHARED ?
++	    vcpu->kif_shared_size : sizeof(arm_guest_context_t);
++
++	const hv_paranested_measurement_t * src_measurement = direction == NATIVE_TO_SHARED ?
++	    &native_measurement : &shared_measurement;
++	const hv_paranested_measurement_t * dst_measurement = direction == NATIVE_TO_SHARED ?
++	    &shared_measurement : &native_measurement;
++
++	const bool copy_ro = direction == SHARED_TO_NATIVE;
++
++	const bool major_version_mismatch = hv_guest_has_major_version_mismatch();
++	const bool context_measurement_mismatch = hv_guest_has_context_measurement_mismatch();
++	const hv_context_version_major_t src_version_major = hv_get_state_version_major(src_measurement);
++	const hv_context_version_major_t dst_version_major = hv_get_state_version_major(dst_measurement);
++
++	if (major_version_mismatch && context_measurement_mismatch) {
++		const hv_paranested_measurement_t * intermediate_measurement =
++		    hv_get_supported_measurement_nofail(hv_get_shared_version_major());
++
++		if (direction == NATIVE_TO_SHARED) {
++			hv_convert_context_major_version(src, src_version_major, vcpu->kif_intermediate,
++			    dst_version_major, copy_ro);
++
++			hv_convert_context_from_measurements(vcpu->kif_intermediate,
++			    vcpu->kif_intermediate_size, intermediate_measurement, dst,
++			    dst_size, dst_measurement, copy_ro);
++		} else {
++			hv_convert_context_from_measurements(src, src_size, src_measurement, vcpu->kif_intermediate,
++			    vcpu->kif_intermediate_size, intermediate_measurement, copy_ro);
++
++			hv_convert_context_major_version(vcpu->kif_intermediate, src_version_major, dst,
++			    dst_version_major, copy_ro);
++		}
++	} else if (major_version_mismatch) {
++		hv_convert_context_major_version(src, src_version_major, dst,
++		    dst_version_major, copy_ro);
++	} else {
++		assert(!major_version_mismatch && context_measurement_mismatch);
++
++		hv_convert_context_from_measurements(src, src_size, src_measurement,
++		    dst, dst_size, dst_measurement, copy_ro);
++	}
++	if (major_version_mismatch && direction == SHARED_TO_NATIVE) {
++		/*
++		 * The kernel interface frame now carries a context in the
++		 * guest's shared version.
++		 */
++		vcpu->kif->ro.ver = ARM_HV_STATE_VER;
++	}
+ }
+diff --git a/osfmk/arm64/hv/hv_compat_paranested.h b/osfmk/arm64/hv/hv_compat_paranested.h
+index 1ab4d0d04..42b73491d 100644
+--- a/osfmk/arm64/hv/hv_compat_paranested.h
++++ b/osfmk/arm64/hv/hv_compat_paranested.h
+@@ -20,48 +20,63 @@ typedef enum {
+ 	SHARED_TO_NATIVE = 1
+ } hv_context_conversion_dir_e;
+ 
+-/* hv_compat_paranested.h:48 */
++/*
++ * The functions below are defined in hv_compat_paranested.c; the
++ * reference line of each definition is given for cross-checking.
++ */
++/* hv_compat_paranested.c:41 */
++const hv_paranested_measurement_t * hv_get_native_measurement(void);
++
++/* hv_compat_paranested.c:47 */
++const hv_paranested_measurement_t * hv_get_supported_measurement(
++	hv_context_version_major_t major_version);
++
++/* hv_compat_paranested.c:62 */
+ const hv_paranested_measurement_t * hv_get_supported_measurement_nofail(
+ 	hv_context_version_major_t major_version);
+ 
+-/* hv_compat_paranested.h:53 */
+-_Bool measurement_valid(const hv_paranested_measurement_t * measurement);
++/* hv_compat_paranested.c:72 */
++bool measurement_entry_within_range(
++	const hv_measurement_entry_t * measurement_entry,
++	const hv_measurement_entry_t * range);
+ 
+-/*
+- * Return the context version major encoded in the measurement's ARM
+- * hypervisor state version (bits 16-31).
+- */
+-/* hv_compat_paranested.h:56 */
+-static inline hv_context_version_major_t
+-hv_get_state_version_major(const hv_paranested_measurement_t * measurement)
+-{
+-	assert(measurement);
+-	return (hv_context_version_major_t)(measurement->arm_hv_state_version >> 16);
+-}
++/* hv_compat_paranested.c:92 */
++bool measurement_valid(const hv_paranested_measurement_t * measurement);
+ 
+-/* hv_compat_paranested.h:65 */
+-_Bool hv_paranested_virtualization_init(void);
++/* hv_compat_paranested.c:177 */
++bool hv_paranested_virtualization_init(void);
+ 
+-/* hv_compat_paranested.h:66 */
+-_Bool hv_guest_needs_context_conversion(void);
++/* hv_compat_paranested.c:184 */
++bool hv_guest_needs_context_conversion(void);
+ 
+-/* hv_compat_paranested.h:67 */
++/* hv_compat_paranested.c:190 */
+ hv_context_version_major_t hv_get_shared_version_major(void);
+ 
+-/* hv_compat_paranested.h:68 */
++/* hv_compat_paranested.c:196 */
+ const hv_paranested_measurement_t * hv_get_shared_measurement(void);
+ 
+-/* hv_compat_paranested.h:69 */
+-_Bool hv_guest_has_major_version_mismatch(void);
++/* hv_compat_paranested.c:202 */
++bool hv_guest_has_major_version_mismatch(void);
+ 
+-/* hv_compat_paranested.h:70 */
+-_Bool hv_guest_has_context_measurement_mismatch(void);
++/* hv_compat_paranested.c:208 */
++bool hv_guest_has_context_measurement_mismatch(void);
+ 
+-/* hv_compat_paranested.h:71 */
++/* hv_compat_paranested.c:261 */
+ void convert_context_by_guest(
+ 	hv_vcpu_t * vcpu,
+ 	hv_context_conversion_dir_e direction);
+ 
++/*
++ * Return the context version major encoded in the measurement's ARM
++ * hypervisor state version (bits 16-31).
++ */
++/* hv_compat_paranested.h:56 */
++static inline hv_context_version_major_t
++hv_get_state_version_major(const hv_paranested_measurement_t * measurement)
++{
++	return (hv_context_version_major_t)(measurement->arm_hv_state_version >> 16);
++}
++
+ /*
+  * Total size of the guest context described by a measurement: the two
+  * context roots are contiguous, so the size is the read-write root's
+diff --git a/osfmk/arm64/hv/hv_interface.h b/osfmk/arm64/hv/hv_interface.h
+index 9d2d0c8a3..fb480f199 100644
+--- a/osfmk/arm64/hv/hv_interface.h
++++ b/osfmk/arm64/hv/hv_interface.h
+@@ -111,6 +111,13 @@ typedef struct __attribute__((packed)) {
+ 	uint32_t flags;
+ 	hv_vm_isa_t isa;
+ } hv_vm_create_t;
++/*
++ * Version stamp of the ARM hypervisor state the kernel speaks.  The
++ * low half is the interface revision (major 0x300 in bits 16-31); the
++ * high half is the "hvsh" signature.
++ */
++#define ARM_HV_STATE_VER         0x2068797003000004ULL
++
+ typedef struct __attribute__((packed)) {
+ 	size_t this_size;
+ 	size_t measurement_array_size;
+-- 
+2.47.3
+
