@@ -88,10 +88,12 @@ Contents:
 44. The AMCC RORGN/PV CTRR path: `rorgn_contains`,
     `rorgn_stash_range`, the MMU lockdown/validation helpers and
     `pv_ctrr_init`, with the recovered PV CTRR register definitions.
-45. The ARM feature detection: the per-register init routines and
-    static_if initializers in `osfmk/arm/arm_features.inc`, the Apple
-    AIDR feature keys in `osfmk/arm64/cpu_features.c`, and the new
-    13432 ID-register field definitions in `arm64/proc_reg.h`.
+45. The ARM feature detection: the `ARM_FEAT_*`/`ARM_SME_*` static_if
+    key definitions in `osfmk/arm/arm_features.inc`, the Apple AIDR
+    keys in `osfmk/arm/apple_features.inc`, the per-register init
+    routines and static_if initializers in `osfmk/arm64/cpu_features.c`,
+    and the new 13432 ID-register field definitions in
+    `arm64/proc_reg.h`.
 
 The patches contain only public xnu text plus original reconstruction;
 no Apple binary, dSYM, SDK payload or extracted proprietary header is

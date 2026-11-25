@@ -831,27 +831,36 @@ The patch series now has 44 entries; 135 explicit stubs remain.
 xnu-13432 moved the EL0-visible ARM feature detection out of
 `osfmk/arm/commpage/commpage.c` and rewrote it around static_if keys.
 The kasan DWARF names the true source files once the CU file table is
-resolved: the 16 functions live in `osfmk/arm/arm_features.inc`
-(lines 73-739), `osfmk/arm64/cpu_features.c` only defines the Apple
-keys (lines 30-47) and includes the shared file, and all ARM_FEAT_*
-jump keys are defined in `osfmk/arm64/static_if.h` (lines 37-197).
-`osfmk/arm/apple_features.inc` is included too but contributes nothing
-on this platform.  The public 12377 commpage code is the exact
-template for the register tests, so the recovery is a matter of
-carrying the tests over, converting each `gARM_FEAT_* = 1` into a
-`static_if_key_enable()`, and adding the fields new in 13432.
+resolved with the DWARF v5 zero-based index: the 16 functions live in
+`osfmk/arm64/cpu_features.c` (lines 73-739), the ARM_FEAT_* jump keys
+are defined in `osfmk/arm/arm_features.inc` (lines 37-197), and the
+Apple AIDR keys are defined in `osfmk/arm/apple_features.inc`
+(lines 30-47), which `cpu_features.c` includes.  The public 12377
+commpage code is the exact template for the register tests, so the
+recovery is a matter of carrying the tests over, converting each
+`gARM_FEAT_* = 1` into a `static_if_key_enable()`, and adding the
+fields new in 13432.
+
+An early reading of the file table treated its index as one-based,
+which swapped the roles of `arm_features.inc` and `cpu_features.c`.
+The `hv_init`/`current_task` attributions from the same table only
+made sense zero-based, so the layout above is the corrected one.
 
 Recovered layout:
 
- - `cpu_features.c` defines `Apple_AFP`, `Apple_AMAIRCfg`, `Apple_AMX`,
-   `Apple_AMX4_1`, `Apple_APFLG`, `Apple_CTRRv2`, `Apple_CTRRv3`,
-   `Apple_GEXSCM`, `Apple_MILDDSB`, `Apple_MTE`, `Apple_MTEver_1`,
-   `Apple_PRSVScalarFP`, `Apple_TBCF` and `Apple_TSO`.
- - `arm_features.inc` holds zfr0/isar0/isar1/isar2/isar3/mmfr0/mmfr2/
-   pfr0/pfr1/pfr2/smfr0/mmfr1/fpcr/misc init routines, the
-   `arm_cpu_features_init` dispatcher (with the `enable_sme` boot arg)
-   and `apple_cpu_features_init`, each registered with
-   `STATIC_IF_INIT()`.
+ - `osfmk/arm/arm_features.inc` defines the 84 `ARM_FEAT_*` /
+   `ARM_SME_*` keys, from `ARM_FEAT_FP8` at line 37 to
+   `ARM_FEAT_MTE_NO_ADDRESS_TAGS` at line 197.
+ - `osfmk/arm/apple_features.inc` defines `Apple_AFP`,
+   `Apple_AMAIRCfg`, `Apple_AMX`, `Apple_AMX4_1`, `Apple_APFLG`,
+   `Apple_CTRRv2`, `Apple_CTRRv3`, `Apple_GEXSCM`, `Apple_MILDDSB`,
+   `Apple_MTE`, `Apple_MTEver_1`, `Apple_PRSVScalarFP`, `Apple_TBCF`
+   and `Apple_TSO` at lines 30-47.
+ - `osfmk/arm64/cpu_features.c` holds the zfr0/isar0/isar1/isar2/
+   isar3/mmfr0/mmfr1/mmfr2/pfr0/pfr1/pfr2/smfr0/fpcr/misc init
+   routines, the `arm_cpu_features_init` dispatcher (with the
+   `enable_sme` boot arg) and `apple_cpu_features_init`, each
+   registered with `STATIC_IF_INIT()`; it includes both key files.
  - New field tests beyond public 12377: ISAR1 API value 6
    (`FEAT_PAuth_LR`), ISAR2 LUT, ISAR3 FAMINMAX/CPA, MMFR0 ASIDBits,
    MMFR2 VARANGE, PFR1 CSV2_frac 1.2, PFR2 FPMR, SMFR0 LUTv2/F8F16/
@@ -864,8 +873,9 @@ Recovered layout:
    clear.  MILDDSB requires both the AIDR bit and the `mdsb` boot arg.
 
 The key enable sequence was verified against the reference image: the
-recovered file enables the same 82 ARM keys and the same Apple keys,
-with identical masks, thresholds and control flow.  Column numbers in
+recovered code enables the same 82 ARM keys and 12 of the 14 Apple
+keys (`Apple_AMX` and `Apple_AMX4_1` are defined but enabled
+elsewhere), with identical masks, thresholds and control flow.  Column numbers in
 the kasan line table pin down the exact macro spellings, which is how
 the longer `(pnum & (MIDR_EL1_PNUM_MASK & ~0x10)) == 0x300` form was
 recovered instead of a plain PNUM compare.
@@ -873,6 +883,12 @@ recovered instead of a plain PNUM compare.
 The 12377 `ARM_FEATURE_FLAG()` list that used to live in
 `osfmk/arm/arm_features.inc` moved to `osfmk/arm/arm_features.h` so
 `commpage.c` and `kern_mib.c` keep generating their feature flags; the
-`.inc` path now carries the 13432 detection implementation.
+`.inc` paths now carry only the static_if key definitions, and the
+detection implementation lives in `cpu_features.c`.
+
+Splitting the recovered code back into these three files leaves the
+generated instructions unchanged apart from where the Apple key
+structures are emitted, so the reconstruction branch was amended to
+match the reference layout.
 
 The patch series now has 45 entries; 119 explicit stubs remain.
