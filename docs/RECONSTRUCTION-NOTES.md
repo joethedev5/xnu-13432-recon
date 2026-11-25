@@ -2331,3 +2331,65 @@ The patch applies to the series with tree hash
 254718811c56b3c454b71aa0edc6c0e00638f66c.
 
 The patch series now has 65 entries; 45 explicit stubs remain.
+
+## 2026-11-25: the APT callback registration path
+
+Patch 66 recovers the last two stubs of
+`pexpert/arm/hwtrace/cputrace_apt_interface.c`, the CPU-trace callback
+registration API.  The file is new in 13432; the public tree only has the
+`apt_msg` helpers and `osfmk/arm64/apt.c`.
+
+Reference layout: `apt_register_callback` at kasan 0x9769438 (136 bytes),
+development 0x7f57f98 and release 0x7c2e5a0; `apt_unregister_callback` at
+kasan 0x97694c0 (124 bytes), development 0x7f58020 and release 0x7c2e628
+(128 bytes).  The kasan build keeps the callees out of line and names
+them: commpage_update_apt_active, suspend_cluster_powerdown and
+resume_cluster_powerdown.
+
+The state is `apt_callback_state_s`, a 16-byte union (DWARF line 23) of an
+anonymous struct { `apt_callback` at 0, `apt_driver_instance` at 8 } and
+`unsigned __int128 packed`.  `apt_callback_t` is a pointer to a function
+returning void and taking (void *, enum apt_event_type, void *).  The
+header had only the unresolved union member and a double-pointer callback
+typedef; both are corrected.  `apt_callback_state` is an external common
+symbol (kasan 0x9999660, development 0x81008f0, release 0x7d710aa0);
+`apt_suspended_cluster_powerdown` is a static bool (kasan 0x99fc860,
+development 0x814e3b0).  The union is 16-byte aligned, which the casp in
+the reference relies on.
+
+Line rows: register decl 101, brace 103, version check 104, locals 108,
+read-modify-write 111, commpage call 129, powerdown check 131 (column 6),
+assignment 132 (column 35), suspend 133, close 137; unregister decl 140,
+brace 141, locals 142, read-modify-write 145, commpage call 156, check
+158, assignment 159 (column 35), resume 160, close 164.  The Apple clang
+line tables use 1-based columns (the callee at 111/145 sits at the 17th
+character, the assignment operators at the 35th).
+
+Semantics recovered from the three images: register returns the private
+code 45 unless version == 1, builds an empty expected state and the
+callback/driver pair, and installs it with an `os_atomic_rmw_loop` on the
+packed view that gives up with 37 when either member is already set.  It
+then sets the commpage APT-active byte and, the first time, suspends
+cluster powerdown.  unregister clears the pair under the same loop,
+giving up with 22 when either member is NULL, then clears the commpage
+byte and resumes cluster powerdown when this file had suspended it.  The
+`_result` int and `_p` pointer locals at 111/145 identify the construct as
+os_atomic_rmw_loop (os_atomic_cmpxchg would show `_r` and `_b`), and the
+OR of both halves in the register path is the non-empty test.
+
+The private status codes 45/37/22 have no naming header in the image (the
+dSYM carries no .debug_macro), so they remain literals with an explanatory
+comment.  clang 19 emits an LL/SC pair for the 128-bit exchange where
+Apple clang used casp; the loop semantics are identical.
+
+The file compiles with the reference RELEASE flags and with
+DEVELOPMENT+DEBUG.  The patch applies to the series with tree hash
+c289ca6646883a7419fa961bb76ad6466381fc56.
+
+The two callbacks are the release-visible part of the unit.  The
+kasan-only static handlers (`apt_handle_buffer_fill`,
+`apt_handle_context_switch` and the inline `apt_handle_buffer_fill_internal`)
+and the development bodies of the panic-trace accessors are still to be
+recovered, so the file is stub-free but not yet line-exact.
+
+The patch series now has 66 entries; 43 explicit stubs remain.

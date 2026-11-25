@@ -1,0 +1,163 @@
+From 4e9ca267de956f914e0a8c0c1faf0b288b86919a Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 21:59:34 +0000
+Subject: [PATCH] Recover the APT callback registration path
+
+Implement apt_register_callback() and apt_unregister_callback() in
+pexpert/arm/hwtrace/cputrace_apt_interface.c from the RELEASE,
+DEVELOPMENT and kasan vmapple kernels, and fill in the callback and
+driver-instance members of the state union in the header from the CU
+DWARF.
+
+The callback state is the 16-byte union apt_callback_state_s: an
+anonymous struct of apt_callback (the three-argument callback pointer)
+and apt_driver_instance at offset 8, plus the unsigned __int128 packed
+view used by the atomic exchange.  apt_callback_state is an external
+common symbol; apt_suspended_cluster_powerdown is a static bool.
+
+apt_register_callback() rejects any version other than 1, builds the
+new callback/driver pair and installs it with a 128-bit atomic
+read-modify-write loop that refuses to overwrite a non-empty state,
+then marks APT active in the commpage and suspends cluster powerdown
+the first time.  apt_unregister_callback() clears the pair under the
+same loop and returns early when either member is already NULL, then
+clears the commpage active byte and resumes cluster powerdown when the
+file had suspended it.
+
+The reference returns private status codes from this API (45 for a
+version mismatch, 37 when a callback is already registered, 22 when
+none is registered).  The header that names them is not present in the
+kernel image, so the values are kept as literals with a comment.
+
+The file compiles with the reference RELEASE flags and with
+DEVELOPMENT+DEBUG defined.  The release, development and kasan
+disassembly agree instruction for instruction apart from clang 19
+choosing an LL/SC pair for the 128-bit exchange where Apple clang used
+casp.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ pexpert/arm/hwtrace/cputrace_apt_interface.c  | 69 +++++++++++++++++--
+ .../pexpert/arm64/cputrace_apt_interface.h    |  7 +-
+ 2 files changed, 68 insertions(+), 8 deletions(-)
+
+diff --git a/pexpert/arm/hwtrace/cputrace_apt_interface.c b/pexpert/arm/hwtrace/cputrace_apt_interface.c
+index dd0f7d5bd..0708eead3 100644
+--- a/pexpert/arm/hwtrace/cputrace_apt_interface.c
++++ b/pexpert/arm/hwtrace/cputrace_apt_interface.c
+@@ -7,11 +7,23 @@
+  * "body not recovered" are still stubs.
+  */
+ #include <pexpert/pexpert.h>
+-#include <sys/systm.h>
+ #include <pexpert/arm64/cputrace_apt_interface.h>
++#include <kern/processor.h>
++#include <machine/commpage.h>
++#include <os/atomic_private.h>
+ 
+ #define RECON_PEXPERT_ARM_HWTRACE_CPUTRACE_APT_INTERFACE_C 1
+ 
++/*
++ * The callback state is published atomically as a 128-bit pair.  The
++ * reference returns private status codes from the callback API: 45 for a
++ * version mismatch, 37 when a callback is already registered and 22 when
++ * no callback is registered.  The header that names these constants is
++ * not recoverable from the kernel image.
++ */
++apt_callback_state_s apt_callback_state;
++static bool apt_suspended_cluster_powerdown;
++
+ /* pexpert/arm/hwtrace/cputrace_apt_interface.c:89 */
+ void
+ apt_thread_on_cpu_impl(thread_t old, thread_t new)
+@@ -21,18 +33,63 @@ apt_thread_on_cpu_impl(thread_t old, thread_t new)
+ 
+ /* pexpert/arm/hwtrace/cputrace_apt_interface.c:101 */
+ kern_return_t
+-apt_register_callback(uint32_t version, apt_callback_t callback, void * apt_handle)
++apt_register_callback(uint32_t version, apt_callback_t callback,
++    void * apt_handle)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: apt_register_callback");
++	if (version != 1) {
++		return 45;
++	}
++
++	apt_callback_state_s old = {}, new = {
++		.apt_callback = callback,
++		.apt_driver_instance = apt_handle,
++	};
++	bool success = os_atomic_rmw_loop(&apt_callback_state.packed, old.packed,
++	    new.packed, relaxed, {
++		if (old.apt_callback != NULL || old.apt_driver_instance != NULL) {
++			os_atomic_rmw_loop_give_up(break);
++		}
++	});
++
++	if (!success) {
++		return 37;
++	}
++
++	commpage_update_apt_active(true);
++
++	if (!apt_suspended_cluster_powerdown) {
++		apt_suspended_cluster_powerdown = true;
++		suspend_cluster_powerdown();
++	}
++
++	return KERN_SUCCESS;
+ }
+ 
+ /* pexpert/arm/hwtrace/cputrace_apt_interface.c:140 */
+ kern_return_t
+ apt_unregister_callback(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: apt_unregister_callback");
++	apt_callback_state_s old = {}, new = {};
++
++	bool success = os_atomic_rmw_loop(&apt_callback_state.packed, old.packed,
++	    new.packed, relaxed, {
++		if (old.apt_callback == NULL || old.apt_driver_instance == NULL) {
++			os_atomic_rmw_loop_give_up(break);
++		}
++	});
++
++	if (!success) {
++		return 22;
++	}
++
++	commpage_update_apt_active(false);
++
++	if (apt_suspended_cluster_powerdown) {
++		apt_suspended_cluster_powerdown = false;
++		resume_cluster_powerdown();
++	}
++
++	return KERN_SUCCESS;
+ }
+ 
+ /* pexpert/arm/hwtrace/cputrace_apt_interface.c:167 */
+diff --git a/pexpert/pexpert/arm64/cputrace_apt_interface.h b/pexpert/pexpert/arm64/cputrace_apt_interface.h
+index a980679b3..d4cd9ba52 100644
+--- a/pexpert/pexpert/arm64/cputrace_apt_interface.h
++++ b/pexpert/pexpert/arm64/cputrace_apt_interface.h
+@@ -11,9 +11,12 @@ enum apt_event_type {
+ 	APT_EVENT_BUFFER_FILL = 0,
+ 	APT_EVENT_CONTEXT_SWITCH = 1
+ };
+-typedef void (**apt_callback_t)();
++typedef void (*apt_callback_t)(void *, enum apt_event_type, void *);
+ typedef union {
+-	/* unresolved anonymous member at offset 0 */
++	struct {
++		apt_callback_t apt_callback;
++		void *apt_driver_instance;
++	};
+ 	unsigned __int128 packed;
+ } apt_callback_state_s;
+ 
+-- 
+2.47.3
+
