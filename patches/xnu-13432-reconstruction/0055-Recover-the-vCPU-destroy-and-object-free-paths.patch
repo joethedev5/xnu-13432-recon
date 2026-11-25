@@ -1,0 +1,216 @@
+From b98b341632172a9a60878768f97554dce48c0cc1 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 20:07:02 +0000
+Subject: [PATCH] Recover the vCPU destroy and object-free paths
+
+Reconstruct the hypervisor vCPU teardown in hv_vcpu_paranested.c from
+the development and kasan kernels:
+
+  - _hv_free_context derives the buffer size from the measurement with
+    context_size_from_measurement, asserts that it is nonzero, and
+    frees it with kmem_free;
+  - _hv_vcpu_obj_free frees the shared context with the host's
+    measurement and then the intermediate buffer, if any, with the
+    measurement for the shared version major; the else branch asserts
+    that no intermediate context exists without a shared one.  It then
+    deallocates the user mapping, the kernel context and the vCPU
+    object itself;
+  - _hv_vcpu_destroy issues host service 0xc6000012 with the host VM
+    id and the vCPU id, prefers the host's result when the nested call
+    succeeds, drops the vCPU from the VM's online bitmap under the VM
+    lock, and frees the object;
+  - hv_vcpu_destroy and hv_trap_vcpu_destroy wrap the destroy path:
+    the public entry tail-calls it, the trap destroys the current
+    thread's vCPU when there is one and clears the thread target;
+  - hv_trap_vcpu_sysregs_sync uses the hv_get_vcpu() accessor and
+    reports HV_NO_DEVICE when the thread has no vCPU.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ osfmk/arm64/hv/hv_vcpu_paranested.c | 122 +++++++++++++++++++++++-----
+ 1 file changed, 100 insertions(+), 22 deletions(-)
+
+diff --git a/osfmk/arm64/hv/hv_vcpu_paranested.c b/osfmk/arm64/hv/hv_vcpu_paranested.c
+index e83feedd6..187bb394b 100644
+--- a/osfmk/arm64/hv/hv_vcpu_paranested.c
++++ b/osfmk/arm64/hv/hv_vcpu_paranested.c
+@@ -9,45 +9,105 @@
+ #include <kern/kern_types.h>
+ #include <kern/assert.h>
+ #include <kern/debug.h>
+-#include <kern/zalloc.h>
+-#include <sys/systm.h>
+-#include <kern/thread.h>
++#include <vm/vm_kern.h>
++#include <vm/vm_kern_xnu.h>
++#include <arm64/hv/hv_compat_paranested.h>
++#include <arm64/hv/hv_internal.h>
++#include <arm64/hv/hv_vcpu.h>
++#include <arm64/hv/hv_vm.h>
+ 
+ #define RECON_OSFMK_ARM64_HV_HV_VCPU_PARANESTED_C 1
+ 
+-/* Hypervisor.framework hv_error.h (not present in the public tree). */
+-#define HV_NO_DEVICE 0xfae94006
+-
++/*
++ * Release one of the guest context buffers against the measurement that
++ * describes its layout: the buffer is as large as the context the
++ * measurement spans.
++ */
+ /* osfmk/arm64/hv/hv_vcpu_paranested.c:42 */
+-void
++static void
+ _hv_free_context(vm_offset_t context_addr, const hv_paranested_measurement_t * measurement)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: _hv_free_context");
++	size_t context_size = context_size_from_measurement(measurement);
++	assert(context_size > 0);
++	kmem_free(kernel_map, context_addr, context_size);
+ }
+ 
++/*
++ * Free a vCPU object and every context buffer it owns.
++ *
++ * The shared context and the intermediate buffer only ever exist
++ * together: the intermediate buffer is only allocated while a guest
++ * needs its context converted.
++ */
+ /* osfmk/arm64/hv/hv_vcpu_paranested.c:51 */
+-void
++static void
+ _hv_vcpu_obj_free(hv_vcpu_t * vcpu)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: _hv_vcpu_obj_free");
++	if (vcpu->kif_shared != NULL) {
++		_hv_free_context((vm_offset_t)vcpu->kif_shared, hv_get_shared_measurement());
++		vcpu->kif_shared_size = 0;
++		vcpu->kif_shared = NULL;
++
++		/* The intermediate context shadows the shared one. */
++		if (vcpu->kif_intermediate != NULL) {
++			const hv_paranested_measurement_t * intermediate_measurement = hv_get_supported_measurement_nofail(hv_get_shared_version_major());
++			_hv_free_context((vm_offset_t)vcpu->kif_intermediate, intermediate_measurement);
++			vcpu->kif_intermediate_size = 0;
++			vcpu->kif_intermediate = NULL;
++		}
++	} else {
++		/*
++		 * Without a shared context there cannot be an intermediate
++		 * context either.
++		 */
++		assert(vcpu->kif_intermediate == NULL);
++	}
++
++	mach_vm_deallocate_kernel(vcpu->vm->user_map,
++	    (mach_vm_address_t)vcpu->uif, sizeof(arm_guest_context_t));
++
++	kmem_free(kernel_map, (vm_offset_t)vcpu->kif, sizeof(arm_guest_context_t));
++	kmem_free(kernel_map, (vm_offset_t)vcpu, sizeof(hv_vcpu_t));
+ }
+ 
++/*
++ * Destroy a vCPU: ask the host to release it, drop it from the VM's
++ * online set, and free the object.  The host's result is returned.
++ */
+ /* osfmk/arm64/hv/hv_vcpu_paranested.c:80 */
+-hv_return_t
++static hv_return_t
+ _hv_vcpu_destroy(hv_vcpu_t * vcpu)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: _hv_vcpu_destroy");
++	hv_vm_t * vm = vcpu->vm;
++
++	hv_nested_call_params_t pnv_args = {
++		.input = {
++			.service = 0xc6000012,
++			.args = {
++				vm->host_vm_id,
++				vcpu->id,
++			},
++		},
++	};
++
++	hv_return_t ret = hv_nested_call(&pnv_args);
++	if (ret == HV_SUCCESS) {
++		ret = (hv_return_t)pnv_args.output.result[0];
++	}
++
++	hv_vm_lock(vm);
++	assert(bitmap_test(&vm->vcpu_online_mask[0], vcpu->id));
++	bitmap_clear(&vm->vcpu_online_mask[0], vcpu->id);
++	hv_vm_unlock(vm);
++	_hv_vcpu_obj_free(vcpu);
++	return ret;
+ }
+ 
+ /* osfmk/arm64/hv/hv_vcpu_paranested.c:108 */
+ void
+ hv_vcpu_destroy(hv_vcpu_t * vcpu)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: hv_vcpu_destroy");
++	_hv_vcpu_destroy(vcpu);
+ }
+ 
+ /* osfmk/arm64/hv/hv_vcpu_paranested.c:115 */
+@@ -66,22 +126,40 @@ hv_trap_vcpu_create(uint64_t arg)
+ 	panic("reconstructed stub: hv_trap_vcpu_create");
+ }
+ 
++/*
++ * Destroy the current thread's vCPU, if it has one, and clear the
++ * thread's target.
++ */
+ /* osfmk/arm64/hv/hv_vcpu_paranested.c:301 */
+ hv_return_t
+ hv_trap_vcpu_destroy(uint64_t arg)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: hv_trap_vcpu_destroy");
++	hv_vcpu_t * vcpu;
++
++	/* A thread without a vCPU has nothing to destroy. */
++	if ((vcpu = hv_get_vcpu()) == NULL) {
++		return HV_NO_DEVICE;
++	}
++
++	hv_return_t ret = _hv_vcpu_destroy(vcpu);
++
++	/*
++	 * Clear the thread's target: the vCPU object is gone.
++	 */
++	hv_set_vcpu(NULL);
++
++	return ret;
+ }
+ 
+ /* osfmk/arm64/hv/hv_vcpu_paranested.c:321 */
+ hv_return_t
+ hv_trap_vcpu_sysregs_sync(uint64_t arg)
+ {
+-	if (current_thread()->hv_thread_target == NULL) {
++	if (hv_get_vcpu() == NULL) {
+ 		return HV_NO_DEVICE;
+ 	}
+-	return 0;
++
++	return HV_SUCCESS;
+ }
+ 
+ /* osfmk/arm64/hv/hv_vcpu_paranested.c:332 */
+@@ -94,7 +172,7 @@ hv_trap_vcpu_run(uint64_t arg)
+ 
+ /* osfmk/arm64/hv/hv_vcpu_paranested.c:392 */
+ hv_return_t
+-hv_trap_vcpu_run_cancel(const uint64_t arg)
++hv_trap_vcpu_run_cancel(uint64_t arg)
+ {
+ 	/* RECON(13432): body not recovered from the reference kernel yet. */
+ 	panic("reconstructed stub: hv_trap_vcpu_run_cancel");
+-- 
+2.47.3
+

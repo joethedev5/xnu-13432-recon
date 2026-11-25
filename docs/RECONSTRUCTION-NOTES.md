@@ -1513,3 +1513,53 @@ recovered frame:
 Completing this function needs the major-version converter's body
 (decl 157, inlined only) and the intermediate-buffer layout; it remains
 a RECON stub until then.
+
+## 2026-11-25: the vCPU destroy and object-free paths
+
+The vCPU teardown in `hv_vcpu_paranested.c` is recovered from the
+development symbols and, for the source layout, from the kasan CU's
+line table and inline records (the release dSYM carries line tables
+only).
+
+- `_hv_free_context` (static, decl 42, brace 43) declares
+  `context_size` at 44, asserts `context_size > 0` at 45 (descriptor
+  `context_size > 0`) and calls
+  `kmem_free(kernel_map, context_addr, context_size)` at 46:12.  The
+  inlined size computation is again
+  `ro_context_measurement->offset + ro_context_measurement->size`.
+- `_hv_vcpu_obj_free` (static, decl 51, brace 52:0) frees the shared
+  context at 55:3 with `hv_get_shared_measurement()` (callee at
+  55:51), clears `kif_shared_size` (56:25) and `kif_shared` (57:20),
+  then, inside the same branch, frees a present intermediate context
+  at 62:4 (the `kif_intermediate != NULL` test is at 60:30) using
+  `hv_get_supported_measurement_nofail(hv_get_shared_version_major())`
+  (61:66/61:102), clearing its size (63:32) and pointer (64:27).  The
+  else branch asserts `vcpu->kif_intermediate == NULL` (69:3).  The
+  tail deallocates the user mapping with
+  `mach_vm_deallocate_kernel(vcpu->vm->user_map,
+  (mach_vm_address_t)vcpu->uif, sizeof(arm_guest_context_t))`
+  (72:34/72:38/72:2, continuation 73:31) and the kernel context and
+  vCPU object with `kmem_free` (75:12/75:43 and 76:12), using
+  `sizeof(arm_guest_context_t)` (0x8000) and `sizeof(hv_vcpu_t)`
+  (0x40).
+- `_hv_vcpu_destroy` (static, decl 80, brace 81:0) builds the nested
+  call at 84-92 (`service = 0xc6000012`, `args = { vm->host_vm_id,
+  vcpu->id }`; `vm` is read at 82:22), calls it at 93:20, prefers the
+  host result when the call succeeded (94:10/95:22), then under
+  `hv_vm_lock(vm)` (98:2) asserts
+  `bitmap_test(&vm->vcpu_online_mask[0], vcpu->id)` (descriptor line
+  99), clears the bit at 101:2 and unlocks (102:2).  The object is
+  freed at 103:2 and `ret` returned at 104:2.
+- `hv_vcpu_destroy` (decl 108) compiles to a four-byte tail branch to
+  the static destroy (110:2).  `hv_trap_vcpu_destroy` (decl 301, brace
+  302:0) declares `vcpu` at 303, tests
+  `(vcpu = hv_get_vcpu()) == NULL` at 306:29, returns `HV_NO_DEVICE`
+  when the thread has no vCPU, destroys it at 311:20 and clears the
+  thread target with `hv_set_vcpu(NULL)` at 315 before returning `ret`
+  (318:1).
+- `hv_trap_vcpu_sysregs_sync` (decl 321, brace 322:0, closing 329:1)
+  has no local variables: it calls `hv_get_vcpu()` at 323 and is
+  compiled to a `cmp`/`csel` pair returning `HV_NO_DEVICE` when the
+  thread has no vCPU and `HV_SUCCESS` otherwise.
+
+The patch series now has 55 entries; 86 explicit stubs remain.

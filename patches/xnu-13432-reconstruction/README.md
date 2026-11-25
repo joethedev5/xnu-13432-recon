@@ -9,7 +9,7 @@ Apply in numeric order from a clean checkout:
 
 ```
 git checkout xnu-12377.121.6
-git am 0001-*.patch ... 0054-*.patch
+git am 0001-*.patch ... 0055-*.patch
 ```
 
 Contents:
@@ -153,6 +153,16 @@ Contents:
     read-only) entry copies using the smaller of the two entry sizes,
     and the corrected `context_size_from_measurement` return expression
     (`ro_context_measurement->offset + ro_context_measurement->size`).
+55. The hypervisor vCPU teardown paths in
+    `osfmk/arm64/hv/hv_vcpu_paranested.c`: the static
+    `_hv_free_context` (measurement-derived size with its nonzero
+    assertion), `_hv_vcpu_obj_free` (shared and intermediate context
+    release with the intermediate-without-shared assertion, then the
+    user mapping, kernel context and vCPU object deallocation),
+    `_hv_vcpu_destroy` (host service 0xc6000012 and online-bitmap
+    removal under the VM lock), the tail-calling `hv_vcpu_destroy`
+    wrapper, `hv_trap_vcpu_destroy` (thread target clear) and the
+    accessor-based `hv_trap_vcpu_sysregs_sync`.
 
 The patches contain only public xnu text plus original reconstruction;
 no Apple binary, dSYM, SDK payload or extracted proprietary header is
