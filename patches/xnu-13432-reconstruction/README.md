@@ -9,7 +9,7 @@ Apply in numeric order from a clean checkout:
 
 ```
 git checkout xnu-12377.121.6
-git am 0001-*.patch ... 0063-*.patch
+git am 0001-*.patch ... 0064-*.patch
 ```
 
 Contents:
@@ -244,6 +244,19 @@ Contents:
     point.  Also adds the `os_metric_context_encode`, `log_payload_init`
     and `get_os_log_subsystem_id` declarations and the shared
     `os_log_mem`.
+
+64. The IOKit analytics unit `iokit/Kernel/IOAnalytics.cpp` and its
+    header: the IOAnalyticsBoot (five `CA_INT` fields) and empty
+    IOAnalyticsPeriodic CoreAnalytics events, the handler entries and
+    their SLIST heads, and the eight static methods of the IOAnalytics
+    class: `initialize` (locks, list init, the one-shot low-priority
+    periodic thread call), `registerBootInfoUpdate` (retains a handler
+    until boot completes), `registerPeriodicInfoUpdate`/
+    `deregisterPeriodicInfoUpdate` (retain, unlink, release and free a
+    periodic handler and cancel the tick when the list empties),
+    `completeBoot` (collects the boot record, fills and sends the event,
+    releases the handlers), `schedulePeriodicUpdate` (daily absolute
+    deadline), `cancelPeriodicUpdate` and `sendPeriodic`.
 
 The patches contain only public xnu text plus original reconstruction;
 no Apple binary, dSYM, SDK payload or extracted proprietary header is

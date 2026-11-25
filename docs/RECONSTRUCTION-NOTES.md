@@ -2134,3 +2134,108 @@ The patch compiles with the reference RELEASE flags and applies to
 the series with tree hash 6b4fc9810ec9baff700c0e3cbbeeb4c721cc7e4e.
 
 The patch series now has 63 entries; 54 explicit stubs remain.
+
+## 2026-11-25: the IOKit analytics unit
+
+Patch 64 recovers `iokit/Kernel/IOAnalytics.cpp` and its header.  The
+reference CU declares eight static members of the `IOAnalytics` class:
+`initialize` at cpp line 68, `registerBootInfoUpdate` at 86,
+`registerPeriodicInfoUpdate` at 119, `deregisterPeriodicInfoUpdate` at
+145, `completeBoot` at 172, `schedulePeriodicUpdate` at 217 (inline-only
+abstract instance), `cancelPeriodicUpdate` at 229 (inline-only) and
+`sendPeriodic` at 237.  The kasan image keeps out-of-line copies of all
+of them (initialize 0x95ee41c, sendPeriodic 0x95ee4d4, registerBoot
+0x95ee758, registerPeriodic 0x95ee8a8, schedule 0x95eea88, deregister
+0x95eeb48, cancel 0x95eed9c, completeBoot 0x95eedc4); the RELEASE image
+keeps `initialize`, `registerBootInfoUpdate`, `sendPeriodic` and
+`completeBoot` out of line and inlines `registerPeriodicInfoUpdate`,
+`deregisterPeriodicInfoUpdate` and the two schedulers into their
+callers.
+
+The header lays out the records: the boot record is an anonymous
+40-byte struct typedef'd to `IOAnalyticsBootEvent` at lines 43-49
+(bootTimeMS, numConfigThreads, numMatchedServices,
+totalServiceWaitTimeMS, totalModuleStallTimeMS), the periodic record is
+an empty struct typedef'd at 51-52, the block handler types are at 54
+(`void (^)(IOAnalyticsBootEvent *)`) and 55 (`void
+(^)(IOAnalyticsPeriodicEvent *)`), and the class is declared at 57 with
+its methods at 63, 73, 83, 91, 96, 97, 98 and 99.
+
+The two CoreAnalytics events are recovered from the
+`__ca_event_format_*` strings in the kasan image:
+`com.apple.xnu.IOAnalyticsBoot\01ULL\0bootTimeMS\01ULL\0...` with the
+five `CA_INT` fields, and a field-less
+`com.apple.xnu.IOAnalyticsPeriodic` whose payload struct is one byte.
+The file-scope statics are `bootHandlers`/`periodicHandlers` (the SLIST
+heads created on cpp lines 58/59, symbols `__ZL12bootHandlers.0` and
+`__ZL16periodicHandlers.0`), `bootCompleted` 61, `bootLock` 62,
+`periodicEnabled` 63, `periodicLock` 64 and `periodicThreadCall` 65.
+The entry records are `struct BootHandlerEntry` 49 (`chain` at 0,
+`handler` at 8) and `struct PeriodicHandlerEntry` 53.
+
+Behaviour recovered from the images:
+
+- `initialize` calls `IOLockAlloc` for both locks, asserts the results
+  (the three kasan `__desc` symbols sit at lines 73, 74 and 82),
+  `SLIST_INIT`s both heads at 76/77 and allocates the one-shot thread
+  call at 80 with `THREAD_CALL_PRIORITY_LOW` (3) and
+  `THREAD_CALL_OPTIONS_ONCE` (1); the release image inlines the
+  allocation and fills `func`, priority and options into the object.
+- `registerBootInfoUpdate` starts from `ret = kIOReturnNoMemory`
+  (0xe00002bd); a null handler returns `kIOReturnBadArgument`
+  (0xe00002c2, built as +5), a completed boot returns
+  `kIOReturnUnsupported` (0xe00002c7, +0xa), and the entry allocation
+  passes flags 0 (`Z_WAITOK`, not `Z_WAITOK_ZERO`).  The success path
+  block-copies the handler, inserts the entry and returns success.  The
+  one-tab indentation of the insert/copy lines and the single shared
+  unlock at 113 and return at 115 pin the early-out layout.
+- `registerPeriodicInfoUpdate` returns NULL for a null handler or a
+  failed allocation, copies the handler at 131, locks at 133, inserts
+  at 134 and calls the inlined `schedulePeriodicUpdate` (lines 219-226)
+  under the lock when `!periodicEnabled` at 135, then unlocks and
+  returns the entry.
+- `deregisterPeriodicInfoUpdate` walks the list with
+  `SLIST_FOREACH_SAFE` (the `listEntryTmp` local), compares against the
+  `void *` argument at 152, and inside the match removes the element,
+  releases the block and frees the entry at 155-157 before breaking.
+  The compound `found && SLIST_EMPTY(&periodicHandlers)` at 163 is
+  confirmed by the operator/macro columns 12 and 15; it cancels the
+  periodic tick and the function returns
+  `found ? kIOReturnSuccess : kIOReturnBadArgument` at 168.
+- `completeBoot` latches `bootCompleted` under the boot lock (the
+  early return unlocks and returns at 183/184), allocates the 40-byte
+  boot event at 189 with flags 0x8004, takes `event->data` (offset 16)
+  at 190, lets every handler fill `data` at 193/194 and copies the five
+  fields at 198-202 (the exact assignment columns 27/20, 33/9/26,
+  35/9/28, 39/9/32 and 39/9/32 match the source text).  It sends the
+  event at 205 and drains the handler list at 208-212 with
+  `SLIST_REMOVE_HEAD`, `Block_release` and `kfree_type`.
+- `schedulePeriodicUpdate` (lines 217-226) uses `AbsoluteTime`, calls
+  `nanoseconds_to_absolutetime(24 * 60 * 60 * NSEC_PER_SEC, ...)`
+  (the constant 0x4e94914f0000 = 86,400,000,000,000 ns), computes
+  `deadline = mach_absolute_time() + absolutePeriod`, enters the
+  delayed thread call and sets `periodicEnabled`.
+- `cancelPeriodicUpdate` (lines 229-234) cancels the call and clears
+  the flag.
+- `sendPeriodic` (lines 237-266) allocates the empty periodic event at
+  242, takes the lock at 245, unlocks and returns when the tick was
+  disabled at 247/248, calls every handler with the local empty record
+  at 253/254, reschedules the next daily tick at 257, unlocks at 259
+  and sends the event at 265.
+
+Compiler and header notes: the empty `CA_EVENT(IOAnalyticsPeriodic)`
+invocation is accepted by the Apple clang 21 build that produced the
+reference but is rejected by clang 19 with the public 12377
+`coreanalytics.h` macro (the empty `_CA_FOREACH` expansion); the unit
+was verified locally with a temporary one-field periodic event, and
+every other line and statement anchor matches.  As in the other IOKit
+units, Apple clang attributes comparisons to the operator column
+(152:17) while clang 19 attributes them to the left operand (152:7),
+and the member-address stores of the block copies carry the macro
+column (0:19) instead of 109:9/131:9.
+
+The patch compiles with the reference RELEASE flags (C++2b,
+`-fapple-kext`) and applies to the series with tree hash
+4db37268bb5a01a17eebf2ed1f4be339e0cee81f.
+
+The patch series now has 64 entries; 49 explicit stubs remain.
