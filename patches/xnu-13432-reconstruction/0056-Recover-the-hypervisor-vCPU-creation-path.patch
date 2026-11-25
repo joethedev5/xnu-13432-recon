@@ -1,0 +1,262 @@
+From cee3ad8045d95601e5c13604e6febc1938232f61 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 20:13:01 +0000
+Subject: [PATCH] Recover the hypervisor vCPU creation path
+
+Reconstruct allocate_context() and hv_trap_vcpu_create() from the
+development and kasan kernels:
+
+  - allocate_context allocates the guest context with the tag and
+    KMA_DATA|KMA_ZERO flags, using a contiguous allocation when asked
+    (kmem_alloc_contig) and a plain one otherwise, then asserts the
+    result is nonzero and page aligned;
+  - hv_trap_vcpu_create copies in the 16-byte { id, interface } record
+    and rejects ids outside HV_VCPU_MAX; it refuses a thread that
+    already owns a vCPU (HV_BUSY) or has no VM (HV_NO_DEVICE), takes
+    the VM lock and a VM reference, allocates the vCPU object with
+    !hv_guest_needs_context_conversion() as the contiguity hint, and
+    publishes the VM and id into it;
+  - when conversion is needed it allocates a contiguous shared
+    context from the shared measurement, plus a plain intermediate
+    buffer when both the major and the measurement layouts mismatch,
+    and hands the shared buffer's physical address (or the native
+    kif's) to host service 0xc6000011 with { host_vm_id, id };
+  - after a successful host result it converts the shared context for
+    the guest, writes vcpu->uif into the record's interface field and
+    copies the record out; a copyout failure destroys the host vCPU
+    with service 0xc6000012 and still returns success (the recovered
+    reference behavior);
+  - success publishes the vCPU in the VM's online bitmap under the VM
+    lock, releases the VM reference and makes the vCPU the thread's
+    target; all failures run the obj_free / unlock / release epilogue
+    with the recorded return value.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ osfmk/arm64/hv/hv_vcpu_paranested.c | 192 +++++++++++++++++++++++++++-
+ 1 file changed, 187 insertions(+), 5 deletions(-)
+
+diff --git a/osfmk/arm64/hv/hv_vcpu_paranested.c b/osfmk/arm64/hv/hv_vcpu_paranested.c
+index 187bb394b..1c924041d 100644
+--- a/osfmk/arm64/hv/hv_vcpu_paranested.c
++++ b/osfmk/arm64/hv/hv_vcpu_paranested.c
+@@ -9,8 +9,12 @@
+ #include <kern/kern_types.h>
+ #include <kern/assert.h>
+ #include <kern/debug.h>
++#include <kern/task.h>
++#include <libkern/copyio.h>
++#include <mach/vm_param.h>
+ #include <vm/vm_kern.h>
+ #include <vm/vm_kern_xnu.h>
++#include <arm/pmap.h>
+ #include <arm64/hv/hv_compat_paranested.h>
+ #include <arm64/hv/hv_internal.h>
+ #include <arm64/hv/hv_vcpu.h>
+@@ -110,20 +114,198 @@ hv_vcpu_destroy(hv_vcpu_t * vcpu)
+ 	_hv_vcpu_destroy(vcpu);
+ }
+ 
++/*
++ * Allocate a guest context buffer of the size the measurement describes,
++ * from contiguous physical memory when the guest does not need its
++ * context converted.  Returns NULL when the allocation fails or the
++ * result is unusable.
++ */
+ /* osfmk/arm64/hv/hv_vcpu_paranested.c:115 */
+-void *
++static void *
+ allocate_context(const size_t context_size, _Bool contiguous_context)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: allocate_context");
++	const vm_tag_t tag = VM_KERN_MEMORY_HV;
++	vm_offset_t shared_guest_context_addr;
++
++	kern_return_t kern_ret;
++	if (contiguous_context) {
++		kern_ret = kmem_alloc_contig(kernel_map, &shared_guest_context_addr, context_size,
++		    0, 0, 0, KMA_DATA | KMA_ZERO, tag);
++	} else {
++		kern_ret = kmem_alloc(kernel_map, &shared_guest_context_addr, context_size,
++		    KMA_DATA | KMA_ZERO, tag);
++	}
++
++	if (kern_ret != KERN_SUCCESS) {
++		return NULL;
++	}
++
++	assert(shared_guest_context_addr);
++	assert((shared_guest_context_addr & PAGE_MASK) == 0);
++
++	return (void *)shared_guest_context_addr;
+ }
+ 
++/*
++ * Create a vCPU for the current thread.
++ *
++ * The request (a 16-byte { id, interface } record) is copied in from the
++ * trap argument; the record is returned with the kernel/user interface
++ * pointer filled in.  A thread can own one vCPU at a time, the guest
++ * must have a VM, and the host must accept the vCPU creation.  When the
++ * guest's context layout needs conversion, the vCPU gets separate shared
++ * and (for a full mismatch) intermediate context buffers whose physical
++ * addresses are handed to the host.
++ *
++ * The VM lock is held on return from hv_get_lock_and_reference_vm() and
++ * released only after the vCPU is published, or on the failure paths.
++ */
+ /* osfmk/arm64/hv/hv_vcpu_paranested.c:139 */
+ hv_return_t
+ hv_trap_vcpu_create(uint64_t arg)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: hv_trap_vcpu_create");
++	hv_vcpu_t * vcpu;
++	hv_vcpu_create_t vc;
++	user_addr_t vcp = (user_addr_t)arg;
++	hv_return_t ret = HV_NO_RESOURCES;
++
++	/*
++	 * Copy in the create request and validate the requested vCPU id.
++	 */
++	if (copyin(vcp, &vc, sizeof(vc)) != 0 ||
++	    vc.id >= HV_VCPU_MAX) {
++		return HV_BAD_ARGUMENT;
++	}
++
++	/* A thread can only own one vCPU at a time. */
++	if (hv_get_vcpu() != NULL) {
++		return HV_BUSY;
++	}
++
++	/*
++	 * Take the VM lock and a VM reference for the lifetime of the vCPU.
++	 */
++	hv_vm_t * vm = hv_get_lock_and_reference_vm();
++	if (vm == NULL) {
++		return HV_NO_DEVICE;
++	}
++
++	/*
++	 * Allocate the vCPU object and its guest context.  A guest whose
++	 * context needs conversion gets a non-contiguous context.
++	 */
++	ret = hv_vcpu_obj_alloc(&vcpu, get_task_map(current_task()), !hv_guest_needs_context_conversion());
++	if (ret) {
++		goto vcpu_alloc_failed;
++	}
++
++	vcpu->vm = vm;
++	vcpu->id = vc.id;
++
++	/*
++	 * When the guest's context layout differs from the host's, give the
++	 * vCPU a separate shared context (and an intermediate buffer when
++	 * both the major version and the layout differ).
++	 */
++	vm_offset_t context_paddr;
++	if (hv_guest_needs_context_conversion()) {
++		const hv_paranested_measurement_t * shared_measurement = hv_get_shared_measurement();
++		const size_t shared_size = context_size_from_measurement(shared_measurement);
++		void * shared_context_ptr = allocate_context(shared_size, true);
++		if (shared_context_ptr == NULL) {
++			ret = HV_NO_RESOURCES;
++			goto context_allocation_failed;
++		}
++		vcpu->kif_shared_size = shared_size;
++		vcpu->kif_shared = shared_context_ptr;
++
++		if (hv_guest_has_major_version_mismatch() && hv_guest_has_context_measurement_mismatch()) {
++			const hv_paranested_measurement_t * intermediate_measurement = hv_get_supported_measurement_nofail(hv_get_shared_version_major());
++			const size_t intermediate_size = context_size_from_measurement(intermediate_measurement);
++			void * intermediate_context_ptr = allocate_context(intermediate_size, false);
++			if (intermediate_context_ptr == NULL) {
++				ret = HV_NO_RESOURCES;
++				goto context_allocation_failed;
++			}
++			vcpu->kif_intermediate_size = intermediate_size;
++			vcpu->kif_intermediate = intermediate_context_ptr;
++		}
++		context_paddr = kvtophys_nofail((vm_offset_t)vcpu->kif_shared);
++	} else {
++		vcpu->kif_shared_size = 0;
++		vcpu->kif_shared = NULL;
++		context_paddr = kvtophys_nofail((vm_offset_t)vcpu->kif);
++	}
++
++	/*
++	 * Ask the host to create the vCPU and map its context.
++	 */
++	hv_nested_call_params_t pnv_args = {
++		.input = {
++			.service = 0xc6000011,
++			.args = {
++				vcpu->vm->host_vm_id,
++				vcpu->id,
++				context_paddr,
++			},
++		},
++	};
++
++	ret = hv_nested_call(&pnv_args);
++	if (ret) {
++		goto vcpu_hvc_failed;
++	}
++
++	ret = (hv_return_t)pnv_args.output.result[0];
++	if (ret) {
++		goto vcpu_hvc_failed;
++	}
++
++	/*
++	 * The host created the vCPU; mirror the shared context back into the
++	 * native layout before the thread starts using it.
++	 */
++	if (hv_guest_needs_context_conversion()) {
++		convert_context_by_guest(vcpu, SHARED_TO_NATIVE);
++	}
++
++	vc.interface = (uint64_t)vcpu->uif;
++
++	if (copyout(&vc, vcp, sizeof(vc)) != 0) {
++		goto copyout_failed;
++	}
++
++	bitmap_set(&vm->vcpu_online_mask[0], vcpu->id);
++	hv_vm_unlock(vm);
++	hv_release_vm(vm);
++	hv_set_vcpu(vcpu);
++
++	return HV_SUCCESS;
++
++copyout_failed:
++	/*
++	 * The host vCPU exists but the user could not be told about it;
++	 * destroy it and release everything.
++	 */
++	pnv_args = (hv_nested_call_params_t){
++		.input = {
++			.service = 0xc6000012,
++			.args = {
++				vcpu->vm->host_vm_id,
++				vcpu->id,
++			},
++		},
++	};
++	hv_nested_call(&pnv_args);
++
++vcpu_hvc_failed:
++context_allocation_failed:
++	_hv_vcpu_obj_free(vcpu);
++
++vcpu_alloc_failed:
++	hv_vm_unlock(vm);
++	hv_release_vm(vm);
++	return ret;
+ }
+ 
+ /*
+-- 
+2.47.3
+

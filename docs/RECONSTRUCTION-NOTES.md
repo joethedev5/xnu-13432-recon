@@ -1563,3 +1563,63 @@ only).
   thread has no vCPU and `HV_SUCCESS` otherwise.
 
 The patch series now has 55 entries; 86 explicit stubs remain.
+
+## 2026-11-25: the vCPU creation path
+
+`allocate_context` (static, decl 115, brace 116) takes the context size
+and a contiguity flag.  `tag` is declared at 117 and the context
+address at 118; `kern_ret` at 120 selects `kmem_alloc_contig` (call at
+122:14) or `kmem_alloc` (call at 125:14), both with the 0x8080
+KMA_DATA|KMA_ZERO flags and tag 0x1c (VM_KERN_MEMORY_HV).  The failure
+branch returns NULL at 129:6, and the assertions at 132:2 and 133:2
+are `shared_guest_context_addr` and
+`(shared_guest_context_addr & PAGE_MASK) == 0`; the closing return is
+at 135 and the brace at 136.
+
+`hv_trap_vcpu_create` (decl 139, brace 140:0) has locals `vcpu` (141),
+`vc` (142, a 16-byte `hv_vcpu_create_t` whose members are `id` and
+`interface`), `vcp` (143, the user address), `ret` (144, initialized to
+HV_NO_RESOURCES), `vm` (163), `context_paddr` (192), the shared
+measurement/size/pointer (196/197/198), the intermediate
+measurement/size/pointer (208/209/210) and `pnv_args` (225), with the
+labels `copyout_failed` (278), `vcpu_hvc_failed` (290),
+`context_allocation_failed` (291) and `vcpu_alloc_failed` (294).
+
+- 149:6 copies in the record (16 bytes) and rejects `vc.id` values
+  above 0x3f (HV_VCPU_MAX) with HV_BAD_ARGUMENT; 155:6 refuses a
+  thread that already has a vCPU (HV_BUSY); 163:16 is
+  `hv_vm_t *vm = hv_get_lock_and_reference_vm()` and a NULL VM
+  returns HV_NO_DEVICE (164).
+- 173 is
+  `ret = hv_vcpu_obj_alloc(&vcpu, get_task_map(current_task()), !hv_guest_needs_context_conversion())`
+  and its failure jumps to `vcpu_alloc_failed` (174); 179/181 publish
+  `vcpu->vm = vm` and `vcpu->id = vc.id`.
+- 195 branches on `hv_guest_needs_context_conversion()`: 196/197 take
+  the shared measurement and its size, 198 allocates a contiguous
+  context (`true`), 199 tests the NULL result, 203/204 store
+  `kif_shared_size` and `kif_shared`; 207 requires both
+  `hv_guest_has_major_version_mismatch()` and
+  `hv_guest_has_context_measurement_mismatch()`, after which 208-210
+  take the nofail measurement for the shared major, its size and a
+  plain (`false`) allocation, stored at 215/216.  218/222 set
+  `context_paddr = kvtophys_nofail((vm_offset_t)vcpu->kif_shared)` or
+  `...vcpu->kif`, and the else branch (219-221) clears the shared
+  fields.
+- 225-233 build the nested call with service 0xc6000011 and
+  `{ vcpu->vm->host_vm_id, vcpu->id, context_paddr }`; 236:8 calls it,
+  237 and 242 return to `vcpu_hvc_failed` on a call error or a nonzero
+  host result (241 loads result[0]).  251/252 mirror the shared
+  context with `convert_context_by_guest(vcpu, SHARED_TO_NATIVE)`,
+  256 writes `vc.interface = (uint64_t)vcpu->uif` and 258 copies the
+  record out.
+- On success 264 sets `bitmap_set(&vm->vcpu_online_mask[0], vcpu->id)`,
+  268 unlocks the VM, 272 releases it, 275 makes the vCPU the thread
+  target and the function returns HV_SUCCESS.
+- A copyout failure lands at 278, rebuilds the call record as a
+  compound literal (279) with service 0xc6000012 and
+  `{ host_vm_id, vcpu->id }`, issues it at 288 and falls through the
+  two failure labels into `_hv_vcpu_obj_free` (292); the allocation
+  failures reuse the same label.  295/296 unlock and release the VM and
+  297 returns `ret`.
+
+The patch series now has 56 entries; 84 explicit stubs remain.

@@ -9,7 +9,7 @@ Apply in numeric order from a clean checkout:
 
 ```
 git checkout xnu-12377.121.6
-git am 0001-*.patch ... 0055-*.patch
+git am 0001-*.patch ... 0056-*.patch
 ```
 
 Contents:
@@ -163,6 +163,14 @@ Contents:
     removal under the VM lock), the tail-calling `hv_vcpu_destroy`
     wrapper, `hv_trap_vcpu_destroy` (thread target clear) and the
     accessor-based `hv_trap_vcpu_sysregs_sync`.
+56. The hypervisor vCPU creation path: the static
+    `allocate_context` (contiguous or plain measurement-sized context
+    with its nonzero/page-aligned assertions) and
+    `hv_trap_vcpu_create` (16-byte create record copy-in with the id
+    bound and thread/VM checks, the vCPU object allocation, the
+    shared/intermediate context buffers for conversion guests, host
+    service 0xc6000011, the post-create conversion, the copyout and
+    its host-destroy failure path, and the online-bitmap publication).
 
 The patches contain only public xnu text plus original reconstruction;
 no Apple binary, dSYM, SDK payload or extracted proprietary header is
