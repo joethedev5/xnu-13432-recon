@@ -1469,3 +1469,47 @@ dst_size, dst_measurement, copy_ro) and the body brace is 231:0.
   pairs and the `ccmp` range checks seen in both kernels.
 
 The patch series now has 54 entries; 91 explicit stubs remain.
+
+## 2026-11-25: convert_context_by_guest (in progress)
+
+`convert_context_by_guest` (decl 261, body brace 262:0, closing brace
+312:1) is the only remaining stub in `hv_compat_paranested.c`.  The
+recovered frame:
+
+- asserts at 264:2 (`vcpu->kif_shared != NULL && vcpu->kif != NULL &&
+  vcpu->kif != vcpu->kif_shared`; the dev build compares
+  `[vcpu+0x18]`, `[vcpu+8]` and uses `ccmp ... #4, ne`) and 265:2
+  (`direction == NATIVE_TO_SHARED || direction == SHARED_TO_NATIVE`).
+- The direction selects four pairs on lines 267-274 and sets
+  `copy_ro` at 278:33 (`direction == SHARED_TO_NATIVE`):
+    NATIVE_TO_SHARED: src = kif, src_size = 0x8000,
+      src_measurement = native_measurement, dst = kif_shared,
+      dst_size = kif_shared_size, dst_measurement = shared_measurement;
+    SHARED_TO_NATIVE: the reverse pair.
+  The compiled selects use `[vcpu+8]` (kif), `[vcpu+0x18]`
+  (kif_shared) and `[vcpu+0x20]` (kif_shared_size).
+- 280/281 load the two handshake flags (inlined accessors at 204:9 and
+  210:9); 282/283 compute the two state version majors (the shared
+  side is the halfword at +0x16).  The dev build's decisions are:
+    major=0: line 285 onward, then the assert at 304
+      (`!major_version_mismatch && context_measurement_mismatch`,
+      descriptor 0x...5fc) and, when it passes, the conversion call at
+      305 (dev 0x770a5a0-0x770a5b8).
+    major=1, context=1: the major-conversion path at 0x770a5fc-0x770a6ec:
+      `hv_get_shared_version_major()` (shared+0x16 halfword),
+      `hv_get_supported_measurement_nofail(...)` (asserts at 65/66/67,
+      returning native_measurement for 0x300), then a
+      `hv_convert_context_from_measurements` call through
+      `vcpu->kif_intermediate` (`[vcpu+0x28]`, size `[vcpu+0x30]`) and
+      the inlined `hv_convert_context_major_version` instances at
+      291:4, 296:4, 298:4 and 302:3 (its unsupported-combination
+      `assert(false)` is at line 166 and descriptors 0x...624/0x...ac0).
+    major=1, context=0: the same inlined major path but without the
+      shared-context conversion.
+- 307:29 tests `direction == SHARED_TO_NATIVE` and the major flag, then
+  310:9/14/21 stores 0x2068797003000004 at `kif + 0x4000` (the start of
+  the read-only half of the guest context).
+
+Completing this function needs the major-version converter's body
+(decl 157, inlined only) and the intermediate-buffer layout; it remains
+a RECON stub until then.
