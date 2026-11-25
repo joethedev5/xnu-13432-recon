@@ -9,7 +9,7 @@ Apply in numeric order from a clean checkout:
 
 ```
 git checkout xnu-12377.121.6
-git am 0001-*.patch ... 0042-*.patch
+git am 0001-*.patch ... 0043-*.patch
 ```
 
 Contents:
@@ -81,6 +81,10 @@ Contents:
     backoff accounting, RTT sampling and the data-received gate,
     plus the helper-based enter/backoff refactors and the
     `cycle_measure_ts` duration measurement.
+43. The threadpair wait-owner path: the `kThreadWaitThreadpair`
+    block hint, `kdp_threadpair_find_owner` and the stackshot
+    dispatch, plus `TURNSTILE_THREADPAIR` in the turnstile enum and
+    both policy tables.
 
 The patches contain only public xnu text plus original reconstruction;
 no Apple binary, dSYM, SDK payload or extracted proprietary header is

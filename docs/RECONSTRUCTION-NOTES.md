@@ -768,3 +768,27 @@ reconstruction no longer marks them static and `tcp_subr.c` uses an
 extern declaration.
 
 The patch series now has 42 entries; 143 explicit stubs remain.
+
+## 2026-11-25: threadpair wait-owner and the turnstile type
+
+`stackshot_thread_wait_owner_info` gains the `kThreadWaitThreadpair`
+(0x23) case, dispatching to the new `kdp_threadpair_find_owner` in
+`osfmk/kern/matchmaker.c`.  The function returns early when the waitq
+interlock ticket is held and otherwise reports
+`thread_tid(tp->tp_recver)`, matching the inlined instance at
+`kern_stackshot.c:6644` (the `ldrh [+6]; eor lsr#8; tst #0xfe` ticket
+check and `tp_recver` at offset 0x18).
+
+The reference `turnstile_type` enum carries `TURNSTILE_THREADPAIR = 11`
+with `TURNSTILE_TOTAL_TYPES = 12`; the promote policy table at
+0xfffffe0007008c98 holds twelve entries ending in `0x2`
+(`TURNSTILE_USER_PROMOTE`).  The hash lock policy entry is
+`TURNSTILE_HASH_LOCK_POLICY_NONE`: the reference build folds the whole
+array to constant comparisons, and only `TURNSTILE_SLEEP_INHERITOR`
+takes the irq-unsafe/locked path, so type 11 uses the irq-safe table
+with `splsched()` locking.  With the two array lines added, every later
+function definition in `turnstile.c` sits exactly two lines below its
+public-12377 counterpart, confirming the reference delta is only the
+two table entries.
+
+The patch series now has 43 entries; 142 explicit stubs remain.

@@ -1,7 +1,7 @@
 From 90a1c832c5e22938931cbba09048500611483bc3 Mon Sep 17 00:00:00 2001
 From: joethedev5 <deepsbx1@proton.me>
 Date: Wed, 25 Nov 2026 02:30:26 +0000
-Subject: [PATCH 15/42] Recover vm_page_telemetry_init
+Subject: [PATCH 15/43] Recover vm_page_telemetry_init
 
 Allocate the drain thread call from the reference kalloc-type zone with
 vmpt_drain_thread as the callback and store it in the module's

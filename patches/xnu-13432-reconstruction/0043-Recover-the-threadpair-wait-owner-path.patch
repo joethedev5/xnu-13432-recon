@@ -1,0 +1,113 @@
+From 222a909d411375b0613311760d68ccd8c531d1f5 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 05:08:50 +0000
+Subject: [PATCH 43/43] Recover the threadpair wait-owner path
+
+Add kdp_threadpair_find_owner in matchmaker.c, the kThreadWaitThreadpair
+block hint, and the stackshot wait-owner dispatch for it.  Register
+TURNSTILE_THREADPAIR in the turnstile type enum and both policy tables.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ osfmk/kern/block_hint.h     |  2 ++
+ osfmk/kern/kern_stackshot.c |  3 +++
+ osfmk/kern/matchmaker.c     | 11 +++++++++--
+ osfmk/kern/turnstile.c      |  2 ++
+ osfmk/kern/turnstile.h      |  3 ++-
+ 5 files changed, 18 insertions(+), 3 deletions(-)
+
+diff --git a/osfmk/kern/block_hint.h b/osfmk/kern/block_hint.h
+index a4c2e2916..4729a334d 100644
+--- a/osfmk/kern/block_hint.h
++++ b/osfmk/kern/block_hint.h
+@@ -72,6 +72,7 @@ typedef enum thread_snapshot_wait_flags {
+ 	kThreadWaitVMEntryExclEvent     = 0x20,
+ 	kThreadWaitVMEntrySharedEvent   = 0x21,
+ 	kThreadWaitVMEntryKUnwireEvent  = 0x22,
++	kThreadWaitThreadpair           = 0x23,
+ } __attribute__((packed)) block_hint_t;
+ 
+ _Static_assert(sizeof(block_hint_t) <= sizeof(short),
+@@ -104,6 +105,7 @@ extern void kdp_ipc_fill_splabel(struct ipc_service_port_label *ispl, struct por
+ extern void kdp_ipc_splabel_size(size_t *ispl_size, size_t *maxnamelen);
+ extern const bool kdp_ipc_have_splabel;
+ void kdp_eventlink_find_owner(struct waitq *waitq, event64_t event, thread_waitinfo_t *waitinfo);
++extern void kdp_threadpair_find_owner(struct waitq *waitq, event64_t event, thread_waitinfo_t *waitinfo);
+ #if CONFIG_EXCLAVES
+ extern void kdp_esync_find_owner(struct waitq *waitq, event64_t event, thread_waitinfo_t *waitinfo);
+ #endif /* CONFIG_EXCLAVES */
+diff --git a/osfmk/kern/kern_stackshot.c b/osfmk/kern/kern_stackshot.c
+index 970a39a02..2977de2f8 100644
+--- a/osfmk/kern/kern_stackshot.c
++++ b/osfmk/kern/kern_stackshot.c
+@@ -6496,6 +6496,9 @@ stackshot_thread_wait_owner_info(thread_t thread, thread_waitinfo_v2_t *waitinfo
+ 	case kThreadWaitPageBusy:
+ 		kdp_vm_page_sleep_find_owner(thread->wait_event, waitinfo_v1);
+ 		break;
++	case kThreadWaitThreadpair:
++		kdp_threadpair_find_owner(thread->waitq.wq_q, thread->wait_event, waitinfo_v1);
++		break;
+ 	case kThreadWaitPagingInProgress:
+ 	case kThreadWaitPagingActivity:
+ 	case kThreadWaitPLReqInProgress:
+diff --git a/osfmk/kern/matchmaker.c b/osfmk/kern/matchmaker.c
+index 71603a4ca..373b1c579 100644
+--- a/osfmk/kern/matchmaker.c
++++ b/osfmk/kern/matchmaker.c
+@@ -12,6 +12,9 @@
+ #include <kern/zalloc.h>
+ #include <sys/systm.h>
+ #include <kern/matchmaker.h>
++#include <kern/thread.h>
++#include <kern/threadpair.h>
++#include <kern/ticket_lock.h>
+ 
+ #define RECON_OSFMK_KERN_MATCHMAKER_C 1
+ 
+@@ -19,6 +22,10 @@
+ void
+ kdp_threadpair_find_owner(struct waitq * waitq, event64_t event, thread_waitinfo_t * waitinfo)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: kdp_threadpair_find_owner");
++	if (hw_lck_ticket_held(&waitq->waitq_interlock)) {
++		return;
++	}
++
++	threadpair_t tp = (threadpair_t)event;
++	waitinfo->owner = thread_tid(tp->tp_recver);
+ }
+diff --git a/osfmk/kern/turnstile.c b/osfmk/kern/turnstile.c
+index e1175ab49..541e0918f 100644
+--- a/osfmk/kern/turnstile.c
++++ b/osfmk/kern/turnstile.c
+@@ -72,6 +72,7 @@ static const turnstile_promote_policy_t turnstile_promote_policy[TURNSTILE_TOTAL
+ 	[TURNSTILE_SLEEP_INHERITOR] = TURNSTILE_KERNEL_PROMOTE,
+ 	[TURNSTILE_EPOCH_KERNEL]  = TURNSTILE_KERNEL_PROMOTE,
+ 	[TURNSTILE_EPOCH_USER]    = TURNSTILE_USER_PROMOTE,
++	[TURNSTILE_THREADPAIR]    = TURNSTILE_USER_PROMOTE,
+ };
+ 
+ /* Global table for turnstile hash lock policy for all type of turnstiles */
+@@ -87,6 +88,7 @@ static const turnstile_hash_lock_policy_t turnstile_hash_lock_policy[TURNSTILE_T
+ 	[TURNSTILE_SLEEP_INHERITOR] = (TURNSTILE_IRQ_UNSAFE_HASH | TURNSTILE_LOCKED_HASH),
+ 	[TURNSTILE_EPOCH_KERNEL]  = TURNSTILE_HASH_LOCK_POLICY_NONE,
+ 	[TURNSTILE_EPOCH_USER]    = TURNSTILE_HASH_LOCK_POLICY_NONE,
++	[TURNSTILE_THREADPAIR]    = TURNSTILE_HASH_LOCK_POLICY_NONE,
+ };
+ 
+ os_refgrp_decl(static, turnstile_refgrp, "turnstile", NULL);
+diff --git a/osfmk/kern/turnstile.h b/osfmk/kern/turnstile.h
+index 580669448..ed9983174 100644
+--- a/osfmk/kern/turnstile.h
++++ b/osfmk/kern/turnstile.h
+@@ -73,7 +73,8 @@ typedef enum __attribute__((packed)) turnstile_type {
+ 	TURNSTILE_SLEEP_INHERITOR = 8,
+ 	TURNSTILE_EPOCH_KERNEL = 9,
+ 	TURNSTILE_EPOCH_USER = 10,
+-	TURNSTILE_TOTAL_TYPES = 11,
++	TURNSTILE_THREADPAIR = 11,
++	TURNSTILE_TOTAL_TYPES = 12,
+ } turnstile_type_t;
+ 
+ /*

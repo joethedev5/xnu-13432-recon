@@ -1,7 +1,7 @@
 From c0f7aaf26b74810645ba021d9cd04fbef88ba2a5 Mon Sep 17 00:00:00 2001
 From: joethedev5 <deepsbx1@proton.me>
 Date: Wed, 25 Nov 2026 04:08:42 +0000
-Subject: [PATCH 39/42] Recover the reference delayed-ACK policy
+Subject: [PATCH 39/43] Recover the reference delayed-ACK policy
 
 tcp_delay_ack moves the delay decision from the congestion-control
 modules into tcp_ack.c as an external _Bool helper.  Modes 1 and 2
