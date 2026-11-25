@@ -72,3 +72,35 @@
 - Is full DWARF type info present in kernel.dSYM, or only line tables?
 - Can the runner's kernel collection be copied/decompressed legitimately
   (kmutil inspect metadata + `/System/Library/Kernels` files)?
+
+## 2026-11-25: Exact target kernel recovered from the KDK
+
+The KDK is not limited to the x86_64 kernel: it ships every release variant,
+including **`kernel.release.vmapple`**, whose version string matches the
+reference host exactly:
+
+```
+Darwin Kernel Version 27.0.0: Tue Aug 11 21:00:07 PDT 2026;
+root:xnu-13432.1.9~1/RELEASE_ARM64_VMAPPLE
+```
+
+`kernel.release.vmapple` is a 16 MB arm64e Mach-O; its dSYM is 73 MB with
+54,360 functions, 201,159 inlined functions, 263,794 unique source variables
+and full DWARF v5 type/line information (Apple clang 21, LTO, `-O2`,
+`-march=armv8.5a+sme2+amx1`, `ARM64_BOARD_CONFIG_VMAPPLE`). This is the
+build target itself, not an approximation.
+
+DWARF compile units: **1,046**, each `DW_AT_name` an absolute path under
+`.../Sources/xnu/`. The embedded producer strings carry the full per-file
+clang command lines, including all `-D` defines and search paths.
+
+Local analysis pipeline:
+- `tools/macho_dwarf.py` — dumps `__DWARF` sections from a thin Mach-O dSYM
+  into a synthetic ELF that pyelftools can parse.
+- `tools/dwarf_db.py` — builds a SQLite model (`cu`, `source_file`, `func`,
+  `func_param`, `func_range`, `type`, `member`, `enumerator`, `line`).
+- Reference extracts and derived ELF/DB files stay local and are gitignored;
+  they are never committed or uploaded to the public repository.
+
+Public repo: https://github.com/joethedev5/xnu-13432-recon
+Private reference store: https://github.com/joethedev5/xnu-13432-refs

@@ -16,3 +16,7 @@ build/
 .venv/
 __pycache__/
 *.pyc
+analysis/*.db
+analysis/*.elf
+analysis/*.dwarf.*
+analysis/*.jsonl
