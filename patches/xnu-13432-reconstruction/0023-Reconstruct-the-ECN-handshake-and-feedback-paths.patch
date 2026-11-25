@@ -1,0 +1,914 @@
+From c4a029d225614aa0ba2e6f2707d3c14f87e9266f Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 03:05:31 +0000
+Subject: [PATCH 23/25] Reconstruct the ECN handshake and feedback paths
+
+Recover 16 of the 26 tcp_ecn.c stubs from the reference disassembly:
+
+- tcp_ecn_process_syn and tcp_accecn_process_ip_ecn: the server-side
+  SYN ACE decoding, with the ip_ecn-to-TE_ACE_SETUP_* mapping.
+- tcp_ecn_process_synack, tcp_accecn_process_last_ack: the client-side
+  SYN-ACK and last-ACK state machines, including the 13432-only
+  TE_SEND_ECT1 (0x08000000) branches that turn ECT1/CE feedback into
+  success and non-ECT/ECT0 feedback into mangling.
+- tcp_ecn_send_flags_on_syn, tcp_ecn_syn_respond, tcp_ecn_synack_respond:
+  SYN/SYN-ACK ACE setup, including the reference's decision to set
+  TE_SENDIPECT already on an L4S AccECN SYN.
+- tcp_ecn_update_counters, tcp_ecn_ip_feedback: receive-side IP-ECN
+  accounting (the 13432 helper no longer takes an inpcb), window checks
+  and ACE-bleaching detection.
+- tcp_accecn_feedback, tcp_classic_ecn_feedback, tcp_ecn_feedback: the
+  ACK feedback dispatcher, classic ECE fast-recovery entry and the
+  AccECN packet-count/options path.
+- tcp_classic_ecn_set_flags, tcp_accecn_set_ace_flags, tcp_ecn_set_flags:
+  CWR/ECE emission and ACE field encoding from r.cep.
+- tcp_accecn_add_option: the AccECN option writer, relocated from the
+  public tcp_output.c text and renamed to the 13432 symbol.
+
+tcp_var.h gains TE_SEND_ECT1 (0x08000000) for the new L4S ECT1 state.
+
+Remaining explicit stubs: 243.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ bsd/netinet/tcp_ecn.c | 760 ++++++++++++++++++++++++++++++++++++++++--
+ bsd/netinet/tcp_var.h |   1 +
+ 2 files changed, 727 insertions(+), 34 deletions(-)
+
+diff --git a/bsd/netinet/tcp_ecn.c b/bsd/netinet/tcp_ecn.c
+index 53ff1a5da..473aab549 100644
+--- a/bsd/netinet/tcp_ecn.c
++++ b/bsd/netinet/tcp_ecn.c
+@@ -23,16 +23,49 @@ uint32_t tcp_ecn_ce_heur_skipped;
+ void
+ tcp_accecn_process_ip_ecn(struct tcpcb * tp, uint8_t ip_ecn)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_accecn_process_ip_ecn");
++	switch (ip_ecn) {
++	case IPTOS_ECN_NOTECT:
++		tp->ecn_flags |= TE_ACE_SETUP_NON_ECT;
++		break;
++	case IPTOS_ECN_ECT1:
++		tp->ecn_flags |= TE_ACE_SETUP_ECT1;
++		break;
++	case IPTOS_ECN_ECT0:
++		tp->ecn_flags |= TE_ACE_SETUP_ECT0;
++		break;
++	case IPTOS_ECN_CE:
++		tp->ecn_flags |= TE_ACE_SETUP_CE;
++		break;
++	default:
++		break;
++	}
+ }
+ 
+ /* bsd/netinet/tcp_ecn.c:84 */
+ void
+ tcp_ecn_process_syn(struct tcpcb * tp, int ace_flags, uint8_t ip_ecn)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_ecn_process_syn");
++	if (ace_flags == 0) {
++		/* No ECN */
++		tp->t_server_accecn_state = tcp_connection_server_no_ecn_requested;
++		return;
++	}
++	if (ace_flags == (TH_CWR | TH_ECE)) {
++		/* Legacy ECN-setup */
++		tp->ecn_flags |= (TE_SETUPRECEIVED | TE_SENDIPECT);
++		tp->t_server_accecn_state = tcp_connection_server_classic_ecn_requested;
++		return;
++	}
++	if (!tp->l4s_enabled) {
++		return;
++	}
++	tcp_accecn_process_ip_ecn(tp, ip_ecn);
++	tp->ecn_flags |= TE_ACE_SETUPRECEIVED;
++
++	/* Initialize ECT byte counter to 1 to distinguish zeroing of options */
++	tp->t_aecn.t_rcv_ect1_bytes = tp->t_aecn.t_rcv_ect0_bytes = 1;
++	tp->t_aecn.t_snd_ect1_bytes = tp->t_aecn.t_snd_ect0_bytes = 1;
++	tp->t_server_accecn_state = tcp_connection_server_accurate_ecn_requested;
+ }
+ 
+ /* bsd/netinet/tcp_ecn.c:116 */
+@@ -61,42 +94,473 @@ tcp_ecn_update_heuristics_synack(struct tcpcb * tp)
+ 
+ /* bsd/netinet/tcp_ecn.c:265 */
+ void
+-tcp_ecn_process_synack(struct tcpcb * tp, struct tcpopt * to, int thflags, int ace_flags, uint8_t ip_ecn, uint32_t tlen, uint32_t segment_count)
++tcp_ecn_process_synack(struct tcpcb * tp, struct tcpopt * to, int thflags,
++    int ace_flags, uint8_t ip_ecn, uint32_t tlen, uint32_t segment_count)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_ecn_process_synack");
++	if ((thflags & (TH_ECE | TH_CWR)) == TH_ECE) {
++		/* Receiving Any|0|1 is classic ECN-setup SYN-ACK */
++		tp->ecn_flags |= TE_SETUPRECEIVED;
++		if (TCP_ECN_ENABLED(tp)) {
++			tcp_heuristic_ecn_success(tp);
++			tcpstat.tcps_ecn_client_success++;
++		}
++
++		if (tp->ecn_flags & TE_ACE_SETUPSENT) {
++			/*
++			 * Sent AccECN SYN but received classic ECN SYN-ACK.
++			 * Set classic ECN related flags.
++			 */
++			tp->ecn_flags |= (TE_SETUPSENT | TE_SENDIPECT);
++			tp->ecn_flags &= ~TE_ACE_SETUPSENT;
++			if (tp->t_client_accecn_state ==
++			    tcp_connection_client_accurate_ecn_feature_enabled) {
++				tp->t_client_accecn_state =
++				    tcp_connection_client_classic_ecn_available;
++			}
++		}
++	} else if (tp->l4s_enabled && ace_flags != 0 && ace_flags != TH_ACE) {
++		uint32_t ecn_flags;
++
++		/* Initialize sender side packet & byte counters */
++		tp->t_aecn.t_snd_ce_packets = 5;
++		tp->t_aecn.t_snd_ect1_bytes = tp->t_aecn.t_snd_ect0_bytes = 1;
++		tp->t_aecn.t_snd_ce_bytes = 0;
++
++		ecn_flags = tp->ecn_flags;
++		switch (ace_flags) {
++		case (0 | TH_CWR | 0):
++			/*
++			 * Non-ECT SYN was delivered.  The reference treats
++			 * this as mangling and stops sending IP ECT.
++			 */
++			tp->ecn_flags = (ecn_flags & ~TE_SENDIPECT) |
++			    TE_ACE_FINAL_ACK_3WHS | TE_ACE_SETUPRECEIVED;
++			tcpstat.tcps_ecn_ace_syn_not_ect++;
++			tp->t_client_accecn_state =
++			    tcp_connection_client_accurate_ecn_negotiation_success_ect_mangling_detected;
++			break;
++		case (0 | TH_CWR | TH_ECE):
++			/* ECT1 SYN was delivered */
++			tp->ecn_flags = ecn_flags | TE_ACE_FINAL_ACK_3WHS |
++			    TE_ACE_SETUPRECEIVED | TE_SENDIPECT;
++			tcpstat.tcps_ecn_ace_syn_ect1++;
++			tp->t_client_accecn_state =
++			    tcp_connection_client_accurate_ecn_negotiation_success;
++			break;
++		case (TH_AE | 0 | 0):
++			/* ECT0 SYN was delivered, mangling detected */
++			tp->ecn_flags = (ecn_flags & ~TE_SENDIPECT) |
++			    TE_ACE_FINAL_ACK_3WHS | TE_ACE_SETUPRECEIVED;
++			tcpstat.tcps_ecn_ace_syn_ect0++;
++			tp->t_client_accecn_state =
++			    tcp_connection_client_accurate_ecn_negotiation_success_ect_mangling_detected;
++			break;
++		case (TH_AE | TH_CWR | 0):
++			/* CE SYN was delivered */
++			tp->ecn_flags = ecn_flags | TE_ACE_FINAL_ACK_3WHS |
++			    TE_ACE_SETUPRECEIVED | TE_SENDIPECT;
++			tp->t_client_accecn_state =
++			    tcp_connection_client_accurate_ecn_negotiation_success;
++			if (tp->t_maxseg != 0) {
++				tp->snd_cwnd = 2 * tp->t_maxseg;
++			}
++			tcpstat.tcps_ecn_ace_syn_ce++;
++			break;
++		default:
++			/* Unused values for forward compatibility */
++			tp->ecn_flags = (ecn_flags & ~TE_SENDIPECT) |
++			    TE_ACE_FINAL_ACK_3WHS;
++			break;
++		}
++		tcp_set_accurate_ecn(tp);
++
++		if (TCP_ECN_ENABLED(tp)) {
++			tcp_heuristic_ecn_success(tp);
++			tcpstat.tcps_ecn_client_success++;
++		}
++		/*
++		 * A TCP client in AccECN mode MUST feed back which of the 4
++		 * possible values of the IP-ECN field was received in the
++		 * SYN/ACK.  Initialize the receive counters first.
++		 */
++		tp->t_aecn.t_rcv_ce_packets = 5;
++		tp->t_aecn.t_rcv_ect0_bytes = tp->t_aecn.t_rcv_ect1_bytes = 1;
++		tp->t_aecn.t_rcv_ce_bytes = 0;
++
++		/* Increment packet & byte counters based on IP-ECN */
++		tcp_ecn_update_counters(tp, tlen, segment_count, ip_ecn);
++		switch (ip_ecn) {
++		case IPTOS_ECN_NOTECT:
++			/* Not-ECT SYN-ACK was received */
++			tp->ecn_flags |= TE_ACE_SETUP_NON_ECT;
++			break;
++		case IPTOS_ECN_ECT1:
++			/* ECT1 SYN-ACK was received */
++			tp->ecn_flags |= TE_ACE_SETUP_ECT1;
++			break;
++		case IPTOS_ECN_ECT0:
++			/* ECT0 SYN-ACK was received */
++			tp->ecn_flags |= TE_ACE_SETUP_ECT0;
++			break;
++		case IPTOS_ECN_CE:
++			/* CE SYN-ACK was received */
++			tp->ecn_flags |= TE_ACE_SETUP_CE;
++			break;
++		}
++		/* Update the time for this newly received SYN-ACK */
++		if ((to->to_flags & TOF_TS) != 0 && to->to_tsecr != 0 &&
++		    (tp->t_last_ack_tsecr == 0 ||
++		    (int32_t)(to->to_tsecr - tp->t_last_ack_tsecr) >= 0)) {
++			tp->t_last_ack_tsecr = to->to_tsecr;
++		}
++	} else {
++		if ((tp->ecn_flags & (TE_SETUPSENT | TE_ACE_SETUPSENT)) &&
++		    tp->t_rxtshift == 0) {
++			tcp_heuristic_ecn_success(tp);
++			tcpstat.tcps_ecn_not_supported++;
++		}
++		if (((tp->ecn_flags & TE_SETUPSENT) != 0 && tp->t_rxtshift == 1) ||
++		    ((tp->ecn_flags & TE_ACE_SETUPSENT) != 0 && tp->t_rxtshift == 2)) {
++			/*
++			 * The SYN ECN option was likely dropped at the
++			 * network; check the ACK for the retransmission.
++			 */
++			tcp_heuristic_ecn_loss(tp);
++		}
++
++		/* non-ECN-setup SYN-ACK */
++		tp->ecn_flags &= ~TE_SENDIPECT;
++		/*
++		 * If the Accurate ECN SYN was retransmitted twice and a
++		 * non-ECN SYN-ACK was received, consider AccECN blackholed.
++		 */
++		if ((tp->ecn_flags & TE_LOST_SYN) && tp->t_rxtshift <= 2 &&
++		    tp->t_client_accecn_state ==
++		    tcp_connection_client_accurate_ecn_feature_enabled) {
++			tp->t_client_accecn_state =
++			    tcp_connection_client_accurate_ecn_negotiation_blackholed;
++		}
++		if (tp->t_client_accecn_state ==
++		    tcp_connection_client_accurate_ecn_feature_enabled) {
++			tp->t_client_accecn_state =
++			    tcp_connection_client_ecn_not_available;
++		}
++	}
+ }
+ 
+ /* bsd/netinet/tcp_ecn.c:290 */
+ void
+ tcp_accecn_process_last_ack(struct tcpcb * tp, struct tcpopt * to, uint32_t tlen, uint16_t ace_flags, _Bool syn_cookie_processed)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_accecn_process_last_ack");
++	if (syn_cookie_processed) {
++		/* Set AccECN and L4S flags as if these were negotiated successfully. */
++		if (tp->l4s_enabled) {
++			tp->ecn_flags |= (TE_SEND_ECT1 | TE_ACC_ECN_ON |
++			    TE_SENDIPECT);
++			tp->accurate_ecn_on = true;
++		}
++		tp->t_aecn.t_rcv_ce_packets = 5;
++		tp->t_aecn.t_snd_ce_packets = 5;
++		/* Initialize CE byte counter to 0 */
++		tp->t_aecn.t_rcv_ce_bytes = tp->t_aecn.t_snd_ce_bytes = 0;
++		/* Initialize ECT byte counter to 1 to distinguish zeroing of options */
++		tp->t_aecn.t_rcv_ect1_bytes = tp->t_aecn.t_rcv_ect0_bytes = 1;
++		tp->t_aecn.t_snd_ect1_bytes = tp->t_aecn.t_snd_ect0_bytes = 1;
++	}
++
++	if (tlen == 0 && to->to_nsacks == 0) {
++		/*
++		 * ACK for SYN-ACK reflects the state (ECN) in which SYN-ACK
++		 * packet was delivered.  Use Table 4 of Accurate ECN draft to
++		 * decode only when a pure ACK with no SACK block is received.
++		 * 0|0|0 will fail Accurate ECN negotiation and disable ECN.
++		 */
++		switch (ace_flags) {
++		case (0 | TH_CWR | 0):
++			/* Non-ECT SYN-ACK was delivered */
++			tp->t_aecn.t_snd_ce_packets = 5;
++			if (tp->ecn_flags & TE_SEND_ECT1) {
++				/* We sent ECT1, so non-ECT indicates mangling */
++				tp->ecn_flags &= ~TE_SENDIPECT;
++				if (tp->t_server_accecn_state ==
++				    tcp_connection_server_accurate_ecn_requested ||
++				    syn_cookie_processed) {
++					tp->t_server_accecn_state =
++					    tcp_connection_server_accurate_ecn_negotiation_success_ect_mangling_detected;
++				}
++			} else if (tp->t_server_accecn_state ==
++			    tcp_connection_server_accurate_ecn_requested ||
++			    syn_cookie_processed) {
++				tp->t_server_accecn_state =
++				    tcp_connection_server_accurate_ecn_negotiation_success;
++			}
++			break;
++		case (0 | TH_CWR | TH_ECE):
++			/* ECT1 SYN-ACK was delivered */
++			tp->t_aecn.t_snd_ce_packets = 5;
++			if (tp->ecn_flags & TE_SEND_ECT1) {
++				if (tp->t_server_accecn_state ==
++				    tcp_connection_server_accurate_ecn_requested ||
++				    syn_cookie_processed) {
++					tp->t_server_accecn_state =
++					    tcp_connection_server_accurate_ecn_negotiation_success;
++				}
++			} else {
++				/* Mangling detected */
++				tp->ecn_flags &=
++				    ~(TE_SEND_ECT1 | TE_SENDIPECT);
++				if (tp->t_server_accecn_state ==
++				    tcp_connection_server_accurate_ecn_requested ||
++				    syn_cookie_processed) {
++					tp->t_server_accecn_state =
++					    tcp_connection_server_accurate_ecn_negotiation_success_ect_mangling_detected;
++				}
++			}
++			break;
++		case (TH_AE | 0 | 0):
++			/* ECT0 SYN-ACK was delivered, mangling detected */
++			tp->t_aecn.t_snd_ce_packets = 5;
++			tp->ecn_flags &= ~TE_SENDIPECT;
++			if (tp->t_server_accecn_state ==
++			    tcp_connection_server_accurate_ecn_requested ||
++			    syn_cookie_processed) {
++				tp->t_server_accecn_state =
++				    tcp_connection_server_accurate_ecn_negotiation_success_ect_mangling_detected;
++			}
++			break;
++		case (TH_AE | TH_CWR | 0):
++			/*
++			 * CE SYN-ACK was delivered, even though mangling
++			 * happened, CE could indicate congestion at a node
++			 * after mangling occurred.  Set cwnd to 2 segments.
++			 */
++			tp->t_aecn.t_snd_ce_packets = 6;
++			if (tp->t_maxseg != 0) {
++				tp->snd_cwnd = 2 * tp->t_maxseg;
++			}
++			if (tp->ecn_flags & TE_SEND_ECT1) {
++				if (tp->t_server_accecn_state ==
++				    tcp_connection_server_accurate_ecn_requested ||
++				    syn_cookie_processed) {
++					tp->t_server_accecn_state =
++					    tcp_connection_server_accurate_ecn_negotiation_success;
++				}
++			} else {
++				tp->ecn_flags &=
++				    ~(TE_SEND_ECT1 | TE_SENDIPECT);
++				if (tp->t_server_accecn_state ==
++				    tcp_connection_server_accurate_ecn_requested ||
++				    syn_cookie_processed) {
++					tp->t_server_accecn_state =
++					    tcp_connection_server_accurate_ecn_negotiation_success_ect_mangling_detected;
++				}
++			}
++			break;
++		case (0 | 0 | 0):
++			/* Disable ECN, as ACE fields were zeroed */
++			tp->ecn_flags &= ~(TE_SETUPRECEIVED | TE_SENDIPECT |
++			    TE_SENDCWR | TE_ACE_SETUPRECEIVED);
++			tp->accurate_ecn_on = false;
++			/*
++			 * Since last ACK has no ECN flag set and TE_LOST_SYNACK
++			 * is set, this is in response to the second (non-ECN
++			 * setup) SYN-ACK retransmission.  In such a case, we
++			 * assume that AccECN SYN-ACK was blackholed.
++			 */
++			if ((tp->ecn_flags & TE_LOST_SYNACK) &&
++			    tp->t_rxtshift <= 2 &&
++			    (tp->t_server_accecn_state ==
++			    tcp_connection_server_classic_ecn_requested ||
++			    tp->t_server_accecn_state ==
++			    tcp_connection_server_accurate_ecn_requested ||
++			    syn_cookie_processed)) {
++				tp->t_server_accecn_state =
++				    tcp_connection_server_accurate_ecn_negotiation_blackholed;
++			}
++			/*
++			 * SYN-ACK hasn't been retransmitted twice yet, so this
++			 * could likely mean bleaching of ACE on the path from
++			 * client to server on last ACK.
++			 */
++			if (tp->t_server_accecn_state ==
++			    tcp_connection_server_accurate_ecn_requested) {
++				tp->t_server_accecn_state =
++				    tcp_connection_server_accurate_ecn_ace_bleaching_detected;
++			}
++			break;
++		default:
++			/* Unused values for forward compatibility */
++			tp->t_aecn.t_snd_ce_packets = 5;
++			tp->ecn_flags &= ~TE_SENDIPECT;
++			break;
++		}
++		/* Update the time for this newly received last ACK */
++		if ((to->to_flags & TOF_TS) != 0 && to->to_tsecr != 0 &&
++		    (tp->t_last_ack_tsecr == 0 ||
++		    TSTMP_GEQ(to->to_tsecr, tp->t_last_ack_tsecr))) {
++			tp->t_last_ack_tsecr = to->to_tsecr;
++		}
++	} else if (to->to_nsacks == 0) {
++		/*
++		 * If the 3rd ACK is lost, we won't receive the last ACK
++		 * encoding.  We will move the server to AccECN mode
++		 * regardless.
++		 */
++		tp->t_aecn.t_snd_ce_packets = 5;
++		if (tp->t_server_accecn_state ==
++		    tcp_connection_server_accurate_ecn_requested ||
++		    syn_cookie_processed) {
++			tp->t_server_accecn_state =
++			    tcp_connection_server_accurate_ecn_negotiation_success;
++		}
++	}
++	tp->ecn_flags &= ~TE_SEND_ECT1;
++	tp->t_aecn.accecn_processed = true;
+ }
+ 
+ /* bsd/netinet/tcp_ecn.c:442 */
+ _Bool
+ tcp_ecn_send_flags_on_syn(struct tcpcb * tp)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_ecn_send_flags_on_syn");
++	/* We allow Accurate ECN negotiation on the first retransmission too */
++	bool send_on_first_retrans = (tp->ecn_flags & TE_ACE_SETUPSENT) &&
++	    (tp->t_rxtshift <= 1);
++
++	return !(tp->ecn_flags & (TE_SETUPSENT | TE_ACE_SETUPSENT)) ||
++	       send_on_first_retrans;
+ }
+ 
+ /* bsd/netinet/tcp_ecn.c:452 */
+ uint16_t
+ tcp_ecn_syn_respond(struct tcpcb * tp, uint16_t thflags)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_ecn_syn_respond");
++	if (tcp_ecn_send_flags_on_syn(tp)) {
++		if (tp->l4s_enabled) {
++			/*
++			 * We are negotiating AccECN in SYN.  The reference
++			 * starts sending IP ECT already on the SYN.
++			 */
++			thflags |= TH_ACE;
++			tp->ecn_flags |= (TE_ACE_SETUPSENT | TE_SENDIPECT);
++		} else {
++			/*
++			 * Setting TH_ECE and TH_CWR makes this an
++			 * ECN-setup SYN.
++			 */
++			thflags |= (TH_ECE | TH_CWR);
++			tp->ecn_flags |= (TE_SETUPSENT | TE_SENDIPECT);
++		}
++		tcpstat.tcps_ecn_client_setup++;
++		tp->ecn_flags |= TE_CLIENT_SETUP;
++	} else {
++		/*
++		 * We sent an ECN-setup SYN but it was dropped.  Fall back
++		 * to non-ECN and clear the IP ECT send flag.
++		 */
++		tcpstat.tcps_ecn_lost_syn++;
++		tp->ecn_flags &= ~TE_SENDIPECT;
++		tp->ecn_flags |= TE_LOST_SYN;
++	}
++	return thflags;
+ }
+ 
+ /* bsd/netinet/tcp_ecn.c:500 */
+ uint16_t
+ tcp_ecn_synack_respond(struct tcpcb * tp, uint16_t thflags)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_ecn_synack_respond");
++	/* Server received either legacy or Accurate ECN setup SYN */
++	if (tp->ecn_flags & (TE_SETUPRECEIVED | TE_ACE_SETUPRECEIVED)) {
++		if (tcp_ecn_send_flags_on_syn(tp)) {
++			if (tp->l4s_enabled &&
++			    (tp->ecn_flags & TE_ACE_SETUPRECEIVED)) {
++				/*
++				 * Accurate ECN mode is on.  Initialize packet
++				 * and byte counters for the server sending
++				 * SYN-ACK.  Non-zero initial values are used
++				 * to support a stateless handshake and to be
++				 * distinct from cases where the fields are
++				 * incorrectly zeroed.
++				 */
++				tp->t_aecn.t_rcv_ce_packets = 5;
++				tp->t_aecn.t_snd_ce_packets = 5;
++
++				/* Initialize CE byte counter to 0 */
++				tp->t_aecn.t_rcv_ce_bytes =
++				    tp->t_aecn.t_snd_ce_bytes = 0;
++
++				if (tp->ecn_flags & TE_ACE_SETUP_NON_ECT) {
++					tp->t_prev_ace_flags = TH_CWR;
++					thflags |= tp->t_prev_ace_flags;
++					/* Remove the setup flag as it is also used for final ACK */
++					tp->ecn_flags &= ~TE_ACE_SETUP_NON_ECT;
++					tcpstat.tcps_ecn_ace_syn_not_ect++;
++				} else if (tp->ecn_flags & TE_ACE_SETUP_ECT1) {
++					tp->t_prev_ace_flags = (TH_CWR | TH_ECE);
++					thflags |= tp->t_prev_ace_flags;
++					tp->ecn_flags &= ~TE_ACE_SETUP_ECT1;
++					tcpstat.tcps_ecn_ace_syn_ect1++;
++				} else if (tp->ecn_flags & TE_ACE_SETUP_ECT0) {
++					tp->t_prev_ace_flags = TH_AE;
++					thflags |= tp->t_prev_ace_flags;
++					tp->ecn_flags &= ~TE_ACE_SETUP_ECT0;
++					tcpstat.tcps_ecn_ace_syn_ect0++;
++				} else if (tp->ecn_flags & TE_ACE_SETUP_CE) {
++					tp->t_prev_ace_flags = (TH_AE | TH_CWR);
++					thflags |= tp->t_prev_ace_flags;
++					tp->ecn_flags &= ~TE_ACE_SETUP_CE;
++					tcpstat.tcps_ecn_ace_syn_ce++;
++				} else {
++					if (tp->t_prev_ace_flags != 0) {
++						/*
++						 * Set the flags for a
++						 * retransmitted SYN-ACK same
++						 * as the previous one.
++						 */
++						thflags |= tp->t_prev_ace_flags;
++					} else {
++						/* We shouldn't come here */
++						panic("ECN flags (0x%x) not set correctly @%s:%d",
++						    tp->ecn_flags, __FILE__, __LINE__);
++					}
++				}
++				/*
++				 * We now send ECT1 packets when L4S and
++				 * Accurate ECN mode is on.
++				 */
++				tp->ecn_flags |= (TE_SEND_ECT1 |
++				    TE_ACE_SETUPSENT | TE_SENDIPECT);
++				tcp_set_accurate_ecn(tp);
++			} else if (tp->ecn_flags & TE_SETUPRECEIVED) {
++				/*
++				 * Setting TH_ECE makes this an ECN-setup
++				 * SYN-ACK.
++				 */
++				thflags |= TH_ECE;
++				/*
++				 * Record that we sent the ECN-setup and
++				 * default to setting IP ECT.
++				 */
++				tp->ecn_flags |= (TE_SETUPSENT | TE_SENDIPECT);
++			}
++			tcpstat.tcps_ecn_server_setup++;
++			tcpstat.tcps_ecn_server_success++;
++		} else {
++			/*
++			 * We sent an ECN-setup SYN-ACK but it was dropped.
++			 * Fall back to a non-ECN-setup SYN-ACK and clear the
++			 * flag to indicate we should not send IP ECT.
++			 */
++			tcpstat.tcps_ecn_lost_synack++;
++			tcpstat.tcps_ecn_server_success--;
++			if (!tp->l4s_enabled) {
++				/* Do this only for classic ECN. */
++				tp->ecn_flags &= ~(TE_SETUPRECEIVED |
++				    TE_SENDIPECT | TE_SENDCWR);
++			}
++			tp->ecn_flags |= TE_LOST_SYNACK;
++		}
++	}
++	return thflags;
+ }
+ 
+ /* bsd/netinet/tcp_ecn.c:628 */
+@@ -119,8 +583,25 @@ tcp_accecn_disable_option(struct tcpcb * tp)
+ void
+ tcp_ecn_update_counters(struct tcpcb * tp, uint32_t tlen, uint32_t segment_count, uint8_t ip_ecn)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_ecn_update_counters");
++	switch (ip_ecn) {
++	case IPTOS_ECN_CE:
++		tp->t_aecn.t_rcv_ce_packets += segment_count;
++		tp->t_aecn.t_rcv_ce_bytes += tlen;
++		tp->t_ecn_recv_ce++;
++		tcpstat.tcps_ecn_recv_ce++;
++		break;
++	case IPTOS_ECN_ECT0:
++		tp->ecn_flags |= TE_ACO_ECT0;
++		tp->t_aecn.t_rcv_ect0_bytes += tlen;
++		break;
++	case IPTOS_ECN_ECT1:
++		tp->ecn_flags |= TE_ACO_ECT1;
++		tp->t_aecn.t_rcv_ect1_bytes += tlen;
++		break;
++	default:
++		/* No counter for Not-ECT */
++		break;
++	}
+ }
+ 
+ /* bsd/netinet/tcp_ecn.c:691 */
+@@ -145,8 +626,62 @@ tcp_get_ace(struct tcphdr *th)
+ void
+ tcp_ecn_ip_feedback(struct tcpcb * tp, struct tcphdr * th, int tlen, int segment_count, u_char ip_ecn)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_ecn_ip_feedback");
++	if (!tp->accurate_ecn_on) {
++		/*
++		 * Explicit Congestion Notification - flag that we need to
++		 * send ECE if the IP congestion experienced flag was set,
++		 * we negotiated ECN in the TCP setup, this isn't a pure ACK
++		 * and the data is in the valid window.
++		 */
++		if (tlen < 1) {
++			return;
++		}
++		if (ip_ecn != IPTOS_ECN_CE) {
++			return;
++		}
++		if ((tp->ecn_flags & TE_ECN_ON) != TE_ECN_ON) {
++			return;
++		}
++		if ((int32_t)(th->th_seq - tp->last_ack_sent) < 0) {
++			return;
++		}
++		if ((int32_t)(th->th_seq -
++		    (tp->last_ack_sent + tp->rcv_wnd)) >= 0) {
++			return;
++		}
++		tp->t_ecn_recv_ce++;
++		tcpstat.tcps_ecn_recv_ce++;
++		/* Mark this connection as it received CE from network */
++		tp->ecn_flags |= TE_RECV_ECN_CE;
++		if ((tp->ecn_flags & 0x04000000 /* 13432-only AccECN flag */) == 0) {
++			tp->ecn_flags |= TE_SENDECE;
++		}
++		return;
++	}
++
++	/*
++	 * Accurate ECN feedback for data receiver: process IP-ECN bits and
++	 * update r.cep for CE marked pure ACKs or valid data packets.
++	 */
++	if (tlen != 0) {
++		if (tlen < 1) {
++			goto ace_bleaching;
++		}
++		if ((int32_t)(th->th_seq - tp->last_ack_sent) < 0 ||
++		    (int32_t)(th->th_seq -
++		    (tp->last_ack_sent + tp->rcv_wnd)) >= 0) {
++			goto ace_bleaching;
++		}
++	}
++	tcp_ecn_update_counters(tp, (uint32_t)tlen, (uint32_t)segment_count,
++	    ip_ecn);
++
++ace_bleaching:
++	/* Test for ACE bleaching, initial value of ace should be non-zero */
++	if (th->th_seq == tp->iss + 1 && tcp_get_ace(th) == 0) {
++		tp->t_client_accecn_state =
++		    tcp_connection_client_accurate_ecn_ace_bleaching_detected;
++	}
+ }
+ 
+ /* bsd/netinet/tcp_ecn.c:751 */
+@@ -210,56 +745,213 @@ tcp_process_accecn(struct tcpcb *tp, struct tcpopt *to, struct tcphdr *th,
+ void
+ tcp_accecn_feedback(struct tcpcb * tp, struct tcpopt * to, struct tcphdr * th, uint32_t bytes_acked, _Bool control_pkt_acked)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_accecn_feedback");
++	if (tp->t_aecn.accecn_processed) {
++		return;
++	}
++
++	uint8_t ace = tcp_get_ace(th);
++	uint32_t pkts_acked = 0;
++	if (tp->t_maxseg != 0) {
++		pkts_acked = bytes_acked / tp->t_maxseg;
++	}
++	if (bytes_acked != pkts_acked * tp->t_maxseg) {
++		pkts_acked++;
++	}
++	if (control_pkt_acked && pkts_acked == 0) {
++		tp->t_ecn_capable_packets_acked++;
++	}
++
++	bool newly_acked_time = false;
++	if (bytes_acked == 0 && (to->to_flags & TOF_TS) != 0) {
++		if (to->to_tsecr != 0 &&
++		    (tp->t_last_ack_tsecr == 0 ||
++		    TSTMP_GT(to->to_tsecr, tp->t_last_ack_tsecr))) {
++			newly_acked_time = true;
++		}
++		if (control_pkt_acked && newly_acked_time) {
++			tcp_process_accecn(tp, to, th, 1, ace);
++			return;
++		}
++	}
++	if (pkts_acked != 0 || newly_acked_time) {
++		tcp_process_accecn(tp, to, th, pkts_acked, ace);
++	}
+ }
+ 
+ /* bsd/netinet/tcp_ecn.c:908 */
+ void
+ tcp_classic_ecn_feedback(struct tcpcb * tp, struct tcphdr * th, uint32_t bytes_acked)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_classic_ecn_feedback");
++	uint32_t pkts_acked = tcp_packets_this_ack(tp, bytes_acked);
++
++	/*
++	 * For classic ECN, congestion event is receiving TH_ECE.
++	 * Disable ECN if > 90% marking is observed in ACK packets.
++	 */
++	tcp_ece_aggressive_heur(tp, pkts_acked);
++	/*
++	 * Reduce the congestion window if we haven't done so.
++	 */
++	if (!IN_FASTRECOVERY(tp)) {
++		/*
++		 * Although we enter Fast Recovery in the below function
++		 * we exit it immediately below as th_ack >= snd_recover.
++		 */
++		tcp_enter_fast_recovery(tp);
++		tp->ecn_flags |= (TE_INRECOVERY | TE_SENDCWR);
++		/*
++		 * Also note that the connection received ECE at least once.
++		 * We increment t_ecn_capable_packets_marked when we first
++		 * enter fast recovery.
++		 */
++		tp->ecn_flags |= TE_RECV_ECN_ECE;
++		tcpstat.tcps_ecn_recv_ece++;
++		tp->t_ecn_capable_packets_marked += pkts_acked;
++		tcp_ccdbg_trace(tp, th, TCP_CC_ECN_RCVD);
++	}
+ }
+ 
+ /* bsd/netinet/tcp_ecn.c:935 */
+ void
+ tcp_ecn_feedback(struct tcpcb * tp, struct tcphdr * th, struct tcpopt * to, uint8_t thflags, uint32_t bytes_acked)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_ecn_feedback");
++	if (!(thflags & TH_SYN) && tp->accurate_ecn_on) {
++		tcp_accecn_feedback(tp, to, th, bytes_acked, false);
++	} else if ((thflags & TH_ECE) &&
++	    (tp->ecn_flags & TE_ECN_ON) == TE_ECN_ON) {
++		tcp_classic_ecn_feedback(tp, th, bytes_acked);
++	}
+ }
+ 
+ /* bsd/netinet/tcp_ecn.c:956 */
+ uint16_t
+ tcp_classic_ecn_set_flags(struct tcpcb * tp, uint16_t thflags, int len, _Bool rxmt)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_classic_ecn_set_flags");
++	/*
++	 * CWR flag is sent when we reduced the congestion window because we
++	 * received a TCP ECE or performed a fast retransmit.  We never set
++	 * the CWR flag on retransmitted packets and only on data packets.
++	 */
++	if ((tp->ecn_flags & TE_SENDCWR) != 0 && len != 0 &&
++	    !SEQ_LT(tp->snd_nxt, tp->snd_max) && !rxmt) {
++		tp->ecn_flags &= ~TE_SENDCWR;
++		thflags |= TH_CWR;
++	}
++	/* Check if we should set the TCP ECE flag. */
++	if ((tp->ecn_flags & TE_SENDECE) != 0 && len == 0) {
++		tcpstat.tcps_ecn_sent_ece++;
++		thflags |= TH_ECE;
++	}
++	return thflags;
+ }
+ 
+ /* bsd/netinet/tcp_ecn.c:983 */
+ uint16_t
+ tcp_accecn_set_ace_flags(struct tcpcb * tp, uint16_t thflags)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_accecn_set_ace_flags");
++	if ((tp->ecn_flags & TE_ACE_FINAL_ACK_3WHS) == 0) {
++		/* Encode the receive CE packet counter in the ACE field */
++		thflags &= ~TH_ACE;
++		thflags |= (tp->t_aecn.t_rcv_ce_packets & 0x7) << 6;
++	}
++	return thflags;
+ }
+ 
+ /* bsd/netinet/tcp_ecn.c:1006 */
+ uint16_t
+ tcp_ecn_set_flags(struct tcpcb * tp, uint16_t thflags, int len, _Bool rxmt)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_ecn_set_flags");
++	if (TCP_ECN_ENABLED(tp)) {
++		thflags = tcp_classic_ecn_set_flags(tp, thflags, len, rxmt);
++	} else if (tp->accurate_ecn_on) {
++		thflags = tcp_accecn_set_ace_flags(tp, thflags);
++	}
++	return thflags;
+ }
+ 
+ /* bsd/netinet/tcp_ecn.c:1027 */
+ void
+-tcp_accecn_add_option(struct tcpcb * tp, uint16_t flags, bitmap_t *lp, uint8_t * optlen)
++tcp_accecn_add_option(struct tcpcb * tp, uint16_t flags, uint32_t *__indexable lp, uint8_t * optlen)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_accecn_add_option");
++	uint8_t max_len = TCP_MAXOLEN - *optlen;
++	uint8_t len = TCPOLEN_ACCECN_EMPTY;
++
++	uint32_t e1b = (uint32_t)(tp->t_aecn.t_rcv_ect1_bytes & TCP_ACO_MASK);
++	uint32_t e0b = (uint32_t)(tp->t_aecn.t_rcv_ect0_bytes & TCP_ACO_MASK);
++	uint32_t ceb = (uint32_t)(tp->t_aecn.t_rcv_ce_bytes & TCP_ACO_MASK);
++
++	if (max_len < TCPOLEN_ACCECN_EMPTY) {
++		TCP_LOG(tp, "not enough space to add any AccECN option");
++		return;
++	}
++
++	if (!(flags & TH_SYN || (tp->ecn_flags & TE_ACE_FINAL_ACK_3WHS) ||
++	    tp->snd_una == tp->iss + 1 ||
++	    tp->ecn_flags & (TE_ACO_ECT1 | TE_ACO_ECT0))) {
++		/*
++		 * Since this is neither a SYN-ACK packet, nor the final ACK of
++		 * the 3WHS (nor the first acked data segment) nor any of the
++		 * ECT byte counter flags are set, no need to send the option.
++		 */
++		return;
++	}
++
++	if ((flags & (TH_SYN | TH_ACK)) == (TH_SYN | TH_ACK) &&
++	    tp->t_rxtshift >= 1) {
++		/*
++		 * If this is a SYN-ACK retransmission (first), retry without
++		 * AccECN option and just with ACE fields.  From second
++		 * retransmission onwards, we don't send any Accurate ECN state.
++		 */
++		return;
++	}
++
++	if (max_len < (TCPOLEN_ACCECN_EMPTY + 1 * TCPOLEN_ACCECN_COUNTER)) {
++		/* Can carry EMPTY option (2 bytes) which can be used to test path in SYN-ACK packet */
++		if (flags & TH_SYN) {
++			*(uint16_t *)lp++ = htons((TCPOPT_ACCECN1 << 8) | len);
++			*optlen += len;
++		}
++	} else if (max_len < (TCPOLEN_ACCECN_EMPTY + 2 * TCPOLEN_ACCECN_COUNTER)) {
++		/* Can carry one option */
++		len += 1 * TCPOLEN_ACCECN_COUNTER;
++		if (tp->ecn_flags & TE_ACO_ECT1) {
++			*lp++ = htonl((TCPOPT_ACCECN1 << 24) | (len << 16) | ((e1b >> 8) & 0xffff));
++			*(uint16_t *)lp++ = htons((uint16_t)((e1b & 0xff) << 8) | TCPOPT_NOP);
++		} else {
++			*lp++ = htonl((TCPOPT_ACCECN0 << 24) | (len << 16) | ((e0b >> 8) & 0xffff));
++			*(uint16_t *)lp++ = htons((uint16_t)((e0b & 0xff) << 8) | TCPOPT_NOP);
++		}
++		*optlen += len + 1; /* 1 NOPs */
++	} else if (max_len < (TCPOLEN_ACCECN_EMPTY + 3 * TCPOLEN_ACCECN_COUNTER)) {
++		/* Can carry two options */
++		len += 2 * TCPOLEN_ACCECN_COUNTER;
++		if (tp->ecn_flags & TE_ACO_ECT1) {
++			*lp++ = htonl((TCPOPT_ACCECN1 << 24) | (len << 16) | ((e1b >> 8) & 0xffff));
++			*lp++ = htonl(((e1b & 0xff) << 24) | (ceb & 0xffffff));
++		} else {
++			*lp++ = htonl((TCPOPT_ACCECN0 << 24) | (len << 16) | ((e0b >> 8) & 0xffff));
++			*lp++ = htonl(((e0b & 0xff) << 24) | (ceb & 0xffffff));
++		}
++		*optlen += len; /* 0 NOPs */
++	} else {
++		/*
++		 * TCP option sufficient to hold full AccECN option
++		 * but send counter that changed during the entire connection.
++		 */
++		len += 3 * TCPOLEN_ACCECN_COUNTER;
++		/* Can carry all three options */
++		if (tp->ecn_flags & TE_ACO_ECT1) {
++			*lp++ = htonl((TCPOPT_ACCECN1 << 24) | (len << 16) | ((e1b >> 8) & 0xffff));
++			*lp++ = htonl(((e1b & 0xff) << 24) | (ceb & 0xffffff));
++			*lp++ = htonl(((e0b & 0xffffff) << 8) | TCPOPT_NOP);
++		} else {
++			*lp++ = htonl((TCPOPT_ACCECN0 << 24) | (len << 16) | ((e0b >> 8) & 0xffff));
++			*lp++ = htonl(((e0b & 0xff) << 24) | (ceb & 0xffffff));
++			*lp++ = htonl(((e1b & 0xffffff) << 8) | TCPOPT_NOP);
++		}
++		*optlen += len + 1; /* 1 NOP */
++	}
+ }
+ 
+ /* bsd/netinet/tcp_ecn.c:1112 */
+diff --git a/bsd/netinet/tcp_var.h b/bsd/netinet/tcp_var.h
+index 013573097..1d3675a71 100644
+--- a/bsd/netinet/tcp_var.h
++++ b/bsd/netinet/tcp_var.h
+@@ -573,6 +573,7 @@ struct tcpcb {
+ #define TE_ACE_SETUPRECEIVED    0x00200000  /* We have received Accurate ECN setup SYN or SYN-ACK */
+ #define TE_ACC_ECN_ON          (TE_ACE_SETUPSENT | TE_ACE_SETUPRECEIVED) /* Accurate ECN was negotiated */
+ #define TE_ACE_FINAL_ACK_3WHS   0x00400000  /* Client has received SYN-ACK and will now send final ACK of 3WHS, only used for AccECN */
++#define TE_SEND_ECT1            0x08000000  /* 13432: L4S AccECN sends ECT1 on data packets */
+ #define TE_ACO_ECT1             0x00800000  /* ECT1 counter changed flag, used to decide ordering for AccECN option */
+ #define TE_ACO_ECT0             0x01000000  /* ECT0 counter changed flag, used to decide ordering for AccECN option */
+ #define TE_RETRY_WITHOUT_ACO    0x02000000  /* Data segment with AccECN option was not acknowledged, retry without AccECN option */

@@ -9,7 +9,7 @@ Apply in numeric order from a clean checkout:
 
 ```
 git checkout xnu-12377.121.6
-git am 0001-*.patch ... 0022-*.patch
+git am 0001-*.patch ... 0025-*.patch
 ```
 
 Contents:
@@ -32,6 +32,10 @@ Contents:
    `tcp_timer_advanced.c`, its inline header API, the new
    `tcpcb.t_timer_entries[]` array and the two reused `t_flags`
    bits.
+23. The ECN handshake and feedback paths in `tcp_ecn.c`, including
+   the 13432-only `TE_SEND_ECT1` branch.
+24. The TCP Fast Open translation unit and its crypto context.
+25. The `tcp_seg_sent` RB tree generator (`RB_GENERATE`).
 
 The patches contain only public xnu text plus original reconstruction;
 no Apple binary, dSYM, SDK payload or extracted proprietary header is

@@ -1,0 +1,330 @@
+From 60831fdfd439a42b2dcc2847d4032f6498dfc0ed Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 03:08:04 +0000
+Subject: [PATCH 24/25] Reconstruct the TCP Fast Open translation unit
+
+Recover the six remaining tcp_fastopen.c stubs, relocating the public
+bodies where the reference keeps the same logic:
+
+- tcp_tfo_process_syn / tcp_tfo_process_synack: cookie validation and
+  SYN-ACK cookie installation, with the reference's non-atomic
+  tcp_tfo_halfcnt backlog check and the VERIFY on the cookie length.
+- tcp_tfo_check: the TFO-vs-fallback decision, dropping the public
+  FASTOPEN_REQ space test that the 13432 text no longer performs.
+- tcp_tfo_write_cookie_rep / tcp_tfo_write_cookie: the cookie option
+  writers.
+- tcp_tfo_init: key generation through read_frandom.
+
+The reference declares tfo_ctx (aes_encrypt_ctx) in tcp_fastopen.c at
+line 100, so the file now owns the crypto context and pulls in the AES,
+random and MPTCP headers its bodies need.
+
+Remaining explicit stubs: 237.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ bsd/netinet/tcp_fastopen.c | 249 +++++++++++++++++++++++++++++++++++--
+ 1 file changed, 237 insertions(+), 12 deletions(-)
+
+diff --git a/bsd/netinet/tcp_fastopen.c b/bsd/netinet/tcp_fastopen.c
+index fe7ebb20c..5751ec602 100644
+--- a/bsd/netinet/tcp_fastopen.c
++++ b/bsd/netinet/tcp_fastopen.c
+@@ -12,10 +12,16 @@
+ #include <netinet/tcp_fastopen.h>
+ #include <netinet/tcp_var.h>
+ #include <netinet/tcp_cache.h>
++#include <netinet/mptcp_var.h>
+ #include <sys/socketvar.h>
++#include <sys/random.h>
++#include <libkern/crypto/aes.h>
+ 
+ #define RECON_BSD_NETINET_TCP_FASTOPEN_C 1
+ 
++/* bsd/netinet/tcp_fastopen.c:100 */
++static aes_encrypt_ctx tfo_ctx; /* Crypto-context for TFO */
++
+ /* bsd/netinet/tcp_fastopen.c:103 */
+ static void
+ tcp_tfo_gen_cookie(struct inpcb *inp, u_char *out __sized_by(blk_size), size_t blk_size)
+@@ -41,16 +47,98 @@ tcp_tfo_gen_cookie(struct inpcb *inp, u_char *out __sized_by(blk_size), size_t b
+ boolean_t
+ tcp_tfo_process_syn(struct tcpcb * tp, struct tcpopt * to)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_tfo_process_syn");
++	u_char out[CCAES_BLOCK_SIZE];
++	unsigned char len;
++
++	if (!(to->to_flags & (TOF_TFO | TOF_TFOREQ)) ||
++	    !(tcp_fastopen & TCP_FASTOPEN_SERVER)) {
++		return FALSE;
++	}
++
++	if ((to->to_flags & TOF_TFOREQ)) {
++		tp->t_tfo_flags |= TFO_F_OFFER_COOKIE;
++
++		tp->t_tfo_stats |= TFO_S_COOKIEREQ_RECV;
++		tcpstat.tcps_tfo_cookie_req_rcv++;
++		return FALSE;
++	}
++
++	/* Ok, then it must be an offered cookie. We need to check that ... */
++	tcp_tfo_gen_cookie(tp->t_inpcb, out, sizeof(out));
++
++	len = *to->to_tfo - TCPOLEN_FASTOPEN_REQ;
++	to->to_tfo++;
++	to->to_tfo_size--;
++	if (memcmp(out, to->to_tfo, len)) {
++		/* Cookies are different! Let's return and offer a new cookie */
++		tp->t_tfo_flags |= TFO_F_OFFER_COOKIE;
++
++		tp->t_tfo_stats |= TFO_S_COOKIE_INVALID;
++		tcpstat.tcps_tfo_cookie_invalid++;
++		return FALSE;
++	}
++
++	if (tcp_tfo_halfcnt >= tcp_tfo_backlog) {
++		/* Need to back off as we are over the backlog */
++		return FALSE;
++	}
++	tcp_tfo_halfcnt++;
++
++	tp->t_tfo_flags |= TFO_F_COOKIE_VALID;
++
++	tp->t_tfo_stats |= TFO_S_SYNDATA_RCV;
++	tcpstat.tcps_tfo_syn_data_rcv++;
++
++	return TRUE;
+ }
+ 
+ /* bsd/netinet/tcp_fastopen.c:171 */
+ void
+ tcp_tfo_process_synack(struct tcpcb * tp, struct tcpopt * to)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_tfo_process_synack");
++	if (to->to_flags & TOF_TFO) {
++		unsigned char len = *to->to_tfo - TCPOLEN_FASTOPEN_REQ;
++
++		/*
++		 * If this happens, things have gone terribly wrong. len should
++		 * have been checked in tcp_dooptions.
++		 */
++		VERIFY(len <= TFO_COOKIE_LEN_MAX);
++
++		to->to_tfo++;
++		to->to_tfo_size--;
++
++		tcp_cache_set_cookie(tp, to->to_tfo, len);
++		tcp_heuristic_tfo_success(tp);
++
++		tp->t_tfo_stats |= TFO_S_COOKIE_RCV;
++		tcpstat.tcps_tfo_cookie_rcv++;
++		if (tp->t_tfo_flags & TFO_F_COOKIE_SENT) {
++			tcpstat.tcps_tfo_cookie_wrong++;
++			tp->t_tfo_stats |= TFO_S_COOKIE_WRONG;
++		}
++	} else {
++		/*
++		 * Thus, no cookie in the response, but we either asked for one
++		 * or sent SYN+DATA. Now, we need to check whether we had to
++		 * rexmit the SYN. If that's the case, it's better to start
++		 * backing off TFO-cookie requests.
++		 */
++		if (!(tp->t_flagsext & TF_FASTOPEN_FORCE_ENABLE) &&
++		    tp->t_tfo_flags & TFO_F_SYN_LOSS) {
++			tp->t_tfo_stats |= TFO_S_SYN_LOSS;
++			tcpstat.tcps_tfo_syn_loss++;
++
++			tcp_heuristic_tfo_loss(tp);
++		} else {
++			if (tp->t_tfo_flags & TFO_F_COOKIE_REQ) {
++				tp->t_tfo_stats |= TFO_S_NO_COOKIE_RCV;
++				tcpstat.tcps_tfo_no_cookie_rcv++;
++			}
++
++			tcp_heuristic_tfo_success(tp);
++		}
++	}
+ }
+ 
+ /* bsd/netinet/tcp_fastopen.c:219 */
+@@ -137,32 +225,169 @@ tcp_tfo_rcv_ack(struct tcpcb *tp, struct tcphdr *th)
+ int32_t
+ tcp_tfo_check(struct tcpcb * tp, int32_t len)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_tfo_check");
++	struct socket *__single so = tp->t_inpcb->inp_socket;
++	unsigned int optlen = 0;
++	unsigned int cookie_len;
++
++	if (tp->t_flags & TF_NOOPT) {
++		goto fallback;
++	}
++
++	if (!(tp->t_flagsext & TF_FASTOPEN_FORCE_ENABLE) &&
++	    !tcp_heuristic_do_tfo(tp)) {
++		tp->t_tfo_stats |= TFO_S_HEURISTICS_DISABLE;
++		tcpstat.tcps_tfo_heuristics_disable++;
++		goto fallback;
++	}
++
++	if (so->so_flags1 & SOF1_DATA_AUTHENTICATED) {
++		return len;
++	}
++
++	optlen += TCPOLEN_MAXSEG;
++
++	if (tp->t_flags & TF_REQ_SCALE) {
++		optlen += 4;
++	}
++
++#if MPTCP
++	if ((so->so_flags & SOF_MP_SUBFLOW) && mptcp_enable &&
++	    (tp->t_rxtshift <= mptcp_mpcap_retries ||
++	    (tptomptp(tp)->mpt_mpte->mpte_flags & MPTE_FORCE_ENABLE))) {
++		optlen += sizeof(struct mptcp_mpcapable_opt_common) +
++		    sizeof(mptcp_key_t);
++	}
++#endif /* MPTCP */
++
++	if (tp->t_flags & TF_REQ_TSTMP) {
++		optlen += TCPOLEN_TSTAMP_APPA;
++	}
++
++	if (SACK_ENABLED(tp)) {
++		optlen += TCPOLEN_SACK_PERMITTED;
++	}
++
++	/* Now, decide whether to use TFO or not */
++	cookie_len = tcp_cache_get_cookie_len(tp);
++	if (cookie_len == 0) {
++		/* No cookie, so we request one */
++		return 0;
++	}
++
++	/* There is not enough space for the cookie, so we cannot do TFO */
++	if (MAX_TCPOPTLEN - optlen < cookie_len) {
++		goto fallback;
++	}
++
++	/* Do not send SYN+data if there is more in the queue than MSS */
++	if (so->so_snd.sb_cc > (tp->t_maxopd - MAX_TCPOPTLEN)) {
++		goto fallback;
++	}
++
++	/* Ok, everything looks good. We can go on and do TFO */
++	return len;
++
++fallback:
++	tcp_disable_tfo(tp);
++	return 0;
+ }
+ 
+ /* bsd/netinet/tcp_fastopen.c:370 */
+ unsigned int
+ tcp_tfo_write_cookie_rep(struct tcpcb * tp, unsigned int optlen, u_char *opt __counted_by(optlen + 2 + 8))
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_tfo_write_cookie_rep");
++	u_char out[CCAES_BLOCK_SIZE];
++	unsigned ret = 0;
++	u_char *bp;
++
++	if (MAX_TCPOPTLEN - optlen <
++	    TCPOLEN_FASTOPEN_REQ + TFO_COOKIE_LEN_DEFAULT) {
++		return ret;
++	}
++
++	tcp_tfo_gen_cookie(tp->t_inpcb, out, sizeof(out));
++
++	bp = opt + optlen;
++
++	*bp++ = TCPOPT_FASTOPEN;
++	*bp++ = 2 + TFO_COOKIE_LEN_DEFAULT;
++	memcpy(bp, out, TFO_COOKIE_LEN_DEFAULT);
++	ret += 2 + TFO_COOKIE_LEN_DEFAULT;
++
++	tp->t_tfo_stats |= TFO_S_COOKIE_SENT;
++	tcpstat.tcps_tfo_cookie_sent++;
++
++	return ret;
+ }
+ 
+ /* bsd/netinet/tcp_fastopen.c:398 */
+ unsigned int
+ tcp_tfo_write_cookie(struct tcpcb * tp, unsigned int optlen, int32_t len, u_char *opt __counted_by(40))
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_tfo_write_cookie");
++	uint8_t tfo_len;
++	struct socket *__single so = tp->t_inpcb->inp_socket;
++	unsigned ret = 0;
++	int res;
++	u_char *bp;
++
++	if (TCPOLEN_FASTOPEN_REQ > MAX_TCPOPTLEN - optlen) {
++		return 0;
++	}
++	tfo_len = (uint8_t)(MAX_TCPOPTLEN - optlen - TCPOLEN_FASTOPEN_REQ);
++
++	if (so->so_flags1 & SOF1_DATA_AUTHENTICATED) {
++		/* If there is some data, let's track it */
++		if (len > 0) {
++			tp->t_tfo_stats |= TFO_S_SYN_DATA_SENT;
++			tcpstat.tcps_tfo_syn_data_sent++;
++		}
++
++		return 0;
++	}
++
++	bp = opt + optlen;
++
++	/*
++	 * The cookie will be copied in the appropriate place within the
++	 * TCP-option space. That way we avoid the need for an intermediate
++	 * variable.
++	 */
++	res = tcp_cache_get_cookie(tp, bp + TCPOLEN_FASTOPEN_REQ, tfo_len, &tfo_len);
++	if (res == 0) {
++		*bp++ = TCPOPT_FASTOPEN;
++		*bp++ = TCPOLEN_FASTOPEN_REQ;
++		ret += TCPOLEN_FASTOPEN_REQ;
++
++		tp->t_tfo_flags |= TFO_F_COOKIE_REQ;
++
++		tp->t_tfo_stats |= TFO_S_COOKIE_REQ;
++		tcpstat.tcps_tfo_cookie_req++;
++	} else {
++		*bp++ = TCPOPT_FASTOPEN;
++		*bp++ = TCPOLEN_FASTOPEN_REQ + tfo_len;
++
++		ret += TCPOLEN_FASTOPEN_REQ + tfo_len;
++
++		tp->t_tfo_flags |= TFO_F_COOKIE_SENT;
++
++		/* If there is some data, let's track it */
++		if (len > 0) {
++			tp->t_tfo_stats |= TFO_S_SYN_DATA_SENT;
++			tcpstat.tcps_tfo_syn_data_sent++;
++		}
++	}
++
++	return ret;
+ }
+ 
+ /* bsd/netinet/tcp_fastopen.c:458 */
+ void
+ tcp_tfo_init(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_tfo_init");
++	u_char key[TCP_FASTOPEN_KEYLEN];
++
++	read_frandom(key, sizeof(key));
++	aes_encrypt_key128(key, &tfo_ctx);
+ }
+ 
+ /* bsd/netinet/tcp_fastopen.c:467 */

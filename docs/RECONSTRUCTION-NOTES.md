@@ -368,3 +368,41 @@ reused `t_flags` bits are named `TF_TIMER_ADVANCED` (0x02000000) and
 loses its static linkage so the header inline can call it.
 
 The patch series now has 22 entries; 259 explicit stubs remain.
+
+## 2026-11-25: ECN handshake, TFO and the segment RB tree
+
+`tcp_ecn.c` gained 16 recovered bodies covering the full handshake
+and feedback path:
+
+- `tcp_ecn_process_syn`/`tcp_accecn_process_ip_ecn` and
+  `tcp_ecn_process_synack`/`tcp_accecn_process_last_ack` carry the
+  client and server AccECN state machines.  The reference treats
+  ECT1/CE feedback as success only when the new `TE_SEND_ECT1`
+  (0x08000000) bit is set; non-ECT/ECT0 feedback then marks ECT
+  mangling.  The same bit is what makes an L4S SYN set
+  `TE_SENDIPECT` from the start (`tcp_ecn_syn_respond`,
+  `tcp_ecn_synack_respond`).
+- `tcp_ecn_update_counters` no longer takes an inpcb; `tcp_ecn_ip_feedback`
+  folds the window check and ACE-bleaching detection, gating
+  `TE_SENDECE` on the 13432-only 0x04000000 heuristic flag.
+- `tcp_accecn_feedback`, `tcp_classic_ecn_feedback` and
+  `tcp_ecn_feedback` dispatch ACK feedback, classic ECE fast recovery
+  and packet-count accounting.
+- `tcp_classic_ecn_set_flags`, `tcp_accecn_set_ace_flags` and
+  `tcp_ecn_set_flags` emit CWR/ECE and encode r.cep into the ACE
+  field; `tcp_accecn_add_option` is the relocated AccECN option
+  writer.
+
+The six `tcp_fastopen.c` stubs are recovered by relocating the public
+text: `tcp_tfo_process_syn`/`tcp_tfo_process_synack`,
+`tcp_tfo_check`, the two cookie writers and `tcp_tfo_init`.  The
+reference keeps `tfo_ctx` (the AES context) in `tcp_fastopen.c` at
+line 100 rather than `tcp_subr.c`, and its half-counter check is the
+non-atomic `tcp_tfo_halfcnt` compare used by the image.
+
+The eleven `tcp_seg_sent_tree_head_RB_*` symbols at
+`tcp_segment.c:45` are one `RB_GENERATE(tcp_seg_sent_tree_head,
+tcp_seg_sent, seg_link, tcp_seg_cmp)`; the per-function stubs are
+replaced.
+
+The patch series now has 25 entries; 226 explicit stubs remain.

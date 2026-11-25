@@ -1,0 +1,115 @@
+From a07ff125e49db5fa6c5d4cea4e27caea42200291 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 03:08:53 +0000
+Subject: [PATCH 25/25] Restore the tcp_seg_sent RB tree generator
+
+The eleven tcp_seg_sent_tree_head_RB_* entries that DWARF reports at
+tcp_segment.c:45 are the functions emitted by one RB_GENERATE over
+tcp_seg_cmp.  Replace the per-function stubs with that macro, matching
+the reference's move of the generator out of tcp_subr.c.
+
+Remaining explicit stubs: 226.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ bsd/netinet/tcp_segment.c | 87 +--------------------------------------
+ 1 file changed, 1 insertion(+), 86 deletions(-)
+
+diff --git a/bsd/netinet/tcp_segment.c b/bsd/netinet/tcp_segment.c
+index 33275f742..4b52915e1 100644
+--- a/bsd/netinet/tcp_segment.c
++++ b/bsd/netinet/tcp_segment.c
+@@ -21,92 +21,7 @@ tcp_seg_cmp(const struct tcp_seg_sent *seg1, const struct tcp_seg_sent *seg2)
+ }
+ 
+ /* bsd/netinet/tcp_segment.c:45 */
+-struct tcp_seg_sent *
+-tcp_seg_sent_tree_head_RB_GETPARENT(struct tcp_seg_sent * elm)
+-{
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_seg_sent_tree_head_RB_GETPARENT");
+-}
+-
+-/* bsd/netinet/tcp_segment.c:45 */
+-int
+-tcp_seg_sent_tree_head_RB_GETCOLOR(struct tcp_seg_sent * elm)
+-{
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_seg_sent_tree_head_RB_GETCOLOR");
+-}
+-
+-/* bsd/netinet/tcp_segment.c:45 */
+-void
+-tcp_seg_sent_tree_head_RB_SETCOLOR(struct tcp_seg_sent * elm, int color)
+-{
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_seg_sent_tree_head_RB_SETCOLOR");
+-}
+-
+-/* bsd/netinet/tcp_segment.c:45 */
+-struct tcp_seg_sent *
+-tcp_seg_sent_tree_head_RB_SETPARENT(struct tcp_seg_sent * elm, struct tcp_seg_sent * parent)
+-{
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_seg_sent_tree_head_RB_SETPARENT");
+-}
+-
+-/* bsd/netinet/tcp_segment.c:45 */
+-void
+-tcp_seg_sent_tree_head_RB_INSERT_COLOR(struct tcp_seg_sent_tree_head * head, struct tcp_seg_sent * elm)
+-{
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_seg_sent_tree_head_RB_INSERT_COLOR");
+-}
+-
+-/* bsd/netinet/tcp_segment.c:45 */
+-void
+-tcp_seg_sent_tree_head_RB_REMOVE_COLOR(struct tcp_seg_sent_tree_head * head, struct tcp_seg_sent * parent, struct tcp_seg_sent * elm)
+-{
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_seg_sent_tree_head_RB_REMOVE_COLOR");
+-}
+-
+-/* bsd/netinet/tcp_segment.c:45 */
+-struct tcp_seg_sent *
+-tcp_seg_sent_tree_head_RB_REMOVE(struct tcp_seg_sent_tree_head * head, struct tcp_seg_sent * elm)
+-{
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_seg_sent_tree_head_RB_REMOVE");
+-}
+-
+-/* bsd/netinet/tcp_segment.c:45 */
+-struct tcp_seg_sent *
+-tcp_seg_sent_tree_head_RB_INSERT(struct tcp_seg_sent_tree_head * head, struct tcp_seg_sent * elm)
+-{
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_seg_sent_tree_head_RB_INSERT");
+-}
+-
+-/* bsd/netinet/tcp_segment.c:45 */
+-struct tcp_seg_sent *
+-tcp_seg_sent_tree_head_RB_FIND(struct tcp_seg_sent_tree_head * head, struct tcp_seg_sent * elm)
+-{
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_seg_sent_tree_head_RB_FIND");
+-}
+-
+-/* bsd/netinet/tcp_segment.c:45 */
+-struct tcp_seg_sent *
+-tcp_seg_sent_tree_head_RB_MINMAX(struct tcp_seg_sent_tree_head * head, int val)
+-{
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_seg_sent_tree_head_RB_MINMAX");
+-}
+-
+-/* bsd/netinet/tcp_segment.c:45 */
+-struct tcp_seg_sent *
+-tcp_seg_sent_tree_head_RB_NEXT(struct tcp_seg_sent * elm)
+-{
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_seg_sent_tree_head_RB_NEXT");
+-}
++RB_GENERATE(tcp_seg_sent_tree_head, tcp_seg_sent, seg_link, tcp_seg_cmp)
+ 
+ /* bsd/netinet/tcp_segment.c:48 */
+ static uint32_t

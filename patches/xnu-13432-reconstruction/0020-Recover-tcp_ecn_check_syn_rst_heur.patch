@@ -1,7 +1,7 @@
 From 9394912481d9e07ffe6f266695f67f2998bf0135 Mon Sep 17 00:00:00 2001
 From: joethedev5 <deepsbx1@proton.me>
 Date: Wed, 25 Nov 2026 02:34:52 +0000
-Subject: [PATCH 20/22] Recover tcp_ecn_check_syn_rst_heur
+Subject: [PATCH 20/25] Recover tcp_ecn_check_syn_rst_heur
 
 Apply the heuristic only while classic or accurate ECN setup is
 outstanding (setup sent, no SYN-RST seen yet).  Local connections mark
