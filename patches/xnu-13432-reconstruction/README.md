@@ -9,7 +9,7 @@ Apply in numeric order from a clean checkout:
 
 ```
 git checkout xnu-12377.121.6
-git am 0001-*.patch ... 0030-*.patch
+git am 0001-*.patch ... 0032-*.patch
 ```
 
 Contents:
@@ -45,6 +45,12 @@ Contents:
 30. The remaining AccECN acknowledgement paths: SYN-ACK dispatch and
     helpers, last-ACK response, the ACE and option decoders moved out
     of `tcp_input.c`, and the ECN marking helpers.
+31. The reference TCP receive accounting: `total_packets_received`,
+    `t_recv_bg_algo`, and the move of ECN feedback dispatch into
+    `tcp_ecn.c`.
+32. The process virtual-environment integration: `proc.p_virtual_env`,
+    fork/exit/exec lifetime, the posix_spawn subsystem-root creation
+    path and the `PSPA_VIRTUAL_ENV` port action.
 
 The patches contain only public xnu text plus original reconstruction;
 no Apple binary, dSYM, SDK payload or extracted proprietary header is

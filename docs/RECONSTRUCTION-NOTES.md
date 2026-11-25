@@ -460,3 +460,37 @@ rather than the removed `total_ect_packets_*` fields; the remaining
 existing-file delta.
 
 The patch series now has 30 entries; 185 explicit stubs remain.
+
+## 2026-11-25: Process virtual environment integration and TCP accounting
+
+`struct proc` now carries `struct virtual_env *p_virtual_env` at offset
+1976 in place of the public `p_subsystem_root_path` string.  The
+reference disassembly pins each use: `forkproc` retains the parent's
+environment into the child (line 1242), `forkproc_free` and `proc_exit`
+release it, `bsd_init` clears it, and `csops` tests it for the LV-clear
+path.  `kern_exec` publishes the path through
+`virtual_env_get_subsystem_root_path` instead of copying a string.
+
+posix_spawn creates the child environment from a spawn-time subsystem
+root with `virtual_env_create_from_subsystem_root_path`, and the new
+`PSPA_VIRTUAL_ENV` port action (enum value 6) lets an entitled parent
+supply an existing environment.  `exec_handle_virtual_env_port_actions`
+requires `com.apple.private.virtualenv.spawn` on the parent task,
+rejects a second environment with EEXIST, and converts the action port
+with `convert_port_to_virtual_env`; on failure the destroy path releases
+the send right.  The `exec_port_actions` layout gains
+`virtual_env_port` at offset 56 (size 64), matching the DWARF.
+
+The TCP receive path now follows the reference's `tcpcb` layout:
+`total_ect_packets_marked/acked` are gone, replaced by
+`total_packets_received` at offset 408, and `t_recv_bg_algo` fills
+offset 495.  `tcp_input` adds `segment_count` to that counter at both
+receive-statistic sites and delegates ECN feedback: the data, control
+and SACK paths call `tcp_accecn_feedback` (bytes acked, zero with the
+control-packet flag, and SACK bytes respectively), while the main ACK
+path calls `tcp_ecn_feedback`.  The last-ACK decoder and aggressive ECE
+heuristic are only in `tcp_ecn.c`; the classic feedback path calls
+`tcp_ecn_check_ece_heur`, whose reference mask clears `TE_SETUPSENT`
+as well as `TE_SENDIPECT` and the heuristic bit.
+
+The patch series now has 32 entries; 185 explicit stubs remain.

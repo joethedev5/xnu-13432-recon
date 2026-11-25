@@ -1,0 +1,331 @@
+From e8bff54858cbd22126a044a915d7ef5c95b210a5 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 03:43:05 +0000
+Subject: [PATCH 32/32] Reconstruct the process virtual-environment integration
+
+The reference proc carries a virtual_env pointer at offset 1976 in
+place of the public subsystem-root path string.  Fork retains it into
+the child, exit and forkproc_free release it, and bsd_init clears it.
+
+kern_exec now creates the environment from a posix_spawn subsystem
+root, installs one supplied by a new PSPA_VIRTUAL_ENV port action
+(with the com.apple.private.virtualenv.spawn entitlement and the
+single-environment restriction), publishes its path to image_params,
+and releases the port in exec_port_actions_destroy.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ bsd/kern/bsd_init.c      |  2 +-
+ bsd/kern/kern_exec.c     | 91 ++++++++++++++++++++++++++++++++++++----
+ bsd/kern/kern_exit.c     |  7 ++--
+ bsd/kern/kern_fork.c     | 16 ++++---
+ bsd/kern/kern_proc.c     |  2 +-
+ bsd/sys/proc_internal.h  |  8 +---
+ bsd/sys/spawn_internal.h |  1 +
+ 7 files changed, 99 insertions(+), 28 deletions(-)
+
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index ffe7ce093..6c5f102ce 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -660,7 +660,7 @@ bsd_init(void)
+ 
+ 	smr_init_store(&kernproc->p_limit, &limit0);
+ 	kernproc->p_stats = &pstats0;
+-	kernproc->p_subsystem_root_path = NULL;
++	kernproc->p_virtual_env = NULL;
+ 
+ 	/*
+ 	 * Charge root for one process: launchd.
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 8a48498ef..8305ea667 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -140,6 +140,7 @@
+ #include <kern/affinity.h>
+ #include <kern/assert.h>
+ #include <kern/ipc_kobject.h>
++#include <kern/virtual_env.h>
+ #include <kern/task.h>
+ #include <kern/thread.h>
+ #include <kern/coalition.h>
+@@ -385,6 +386,7 @@ struct exec_port_actions {
+ 	struct exception_port_action_t *excport_array;
+ 	ipc_port_t *portwatch_array;
+ 	ipc_port_t registered_array[TASK_PORT_REGISTER_MAX];
++	ipc_port_t virtual_env_port;
+ };
+ 
+ struct image_params;    /* Forward */
+@@ -406,6 +408,8 @@ static int process_signature(proc_t, struct image_params *);
+ static void exec_prefault_data(proc_t, struct image_params *, load_result_t *);
+ static errno_t exec_handle_port_actions(struct image_params *imgp,
+     struct exec_port_actions *port_actions);
++static errno_t exec_handle_virtual_env_port_actions(proc_t p, task_t old_task,
++    ipc_port_t virtual_env_port);
+ static errno_t exec_handle_exception_port_actions(const struct image_params *imgp,
+     const struct exec_port_actions *port_actions);
+ static errno_t exec_handle_spawnattr_policy(proc_t p, thread_t thread, int psa_apptype, uint64_t psa_qos_clamp,
+@@ -3220,6 +3224,11 @@ exec_port_actions_destroy(struct exec_port_actions *port_actions)
+ 			ipc_port_release_send(port);
+ 		}
+ 	}
++
++	if (port_actions->virtual_env_port != IPC_PORT_NULL) {
++		ipc_port_release_send(port_actions->virtual_env_port);
++		port_actions->virtual_env_port = IPC_PORT_NULL;
++	}
+ }
+ 
+ /*
+@@ -3252,6 +3261,7 @@ exec_handle_port_actions(struct image_params *imgp,
+ 	boolean_t task_has_watchport_boost = task_has_watchports(current_task());
+ 	boolean_t in_exec = (imgp->ip_flags & IMGPF_EXEC);
+ 	int ptrauth_task_port_count = 0;
++	int virtual_env_port_count = 0;
+ 
+ 	for (i = 0; i < pacts->pspa_count; i++) {
+ 		act = &pacts->pspa_actions[i];
+@@ -3286,6 +3296,12 @@ exec_handle_port_actions(struct image_params *imgp,
+ 				goto done;
+ 			}
+ 			break;
++		case PSPA_VIRTUAL_ENV:
++			if (++virtual_env_port_count > 1) {
++				ret = EINVAL;
++				goto done;
++			}
++			break;
+ 		default:
+ 			ret = EINVAL;
+ 			goto done;
+@@ -3391,6 +3407,9 @@ exec_handle_port_actions(struct image_params *imgp,
+ 			/* consume the port right in case of success */
+ 			ipc_port_release_send(port);
+ 			break;
++		case PSPA_VIRTUAL_ENV:
++			actions->virtual_env_port = port;
++			break;
+ 		default:
+ 			ret = EINVAL;
+ 			break;
+@@ -3411,6 +3430,50 @@ done:
+ }
+ 
+ 
++/*
++ * exec_handle_virtual_env_port_actions
++ *
++ * Description:	Install the virtual environment provided by a posix_spawn
++ *		port action.  Only a task holding the spawn entitlement may
++ *		provide one, and a process may only have one.
++ *
++ * Parameters:	proc_t				Child process
++ *		task_t				Parent task
++ *		ipc_port_t			Virtual environment port
++ *
++ * Returns:	0			Success
++ *		ENOENT			Virtual environments unavailable
++ *		EPERM			Missing entitlement
++ *		EEXIST			Process already has a virtual environment
++ *		EINVAL			Not a virtual environment port
++ */
++static errno_t
++exec_handle_virtual_env_port_actions(proc_t p, task_t old_task,
++    ipc_port_t virtual_env_port)
++{
++	virtual_env_t venv;
++
++	if (!virtual_env_is_available()) {
++		return ENOENT;
++	}
++	if (!IOTaskHasEntitlement(old_task,
++	    "com.apple.private.virtualenv.spawn")) {
++		return EPERM;
++	}
++	if (p->p_virtual_env != NULL) {
++		return EEXIST;
++	}
++
++	venv = convert_port_to_virtual_env(virtual_env_port);
++	if (venv == NULL) {
++		return EINVAL;
++	}
++
++	p->p_virtual_env = venv;
++	return 0;
++}
++
++
+ /*
+  * exec_handle_exception_port_actions
+  *
+@@ -4785,10 +4848,12 @@ do_fork1:
+ 	assert(p != NULL);
+ 
+ 	if (subsystem_root_path) {
+-		/* If a subsystem root was specified, swap it in */
+-		char * old_subsystem_root_path = p->p_subsystem_root_path;
+-		p->p_subsystem_root_path = subsystem_root_path;
+-		subsystem_root_path = old_subsystem_root_path;
++		/* If a subsystem root was specified, create the child's virtual environment */
++		error = virtual_env_create_from_subsystem_root_path(
++		    subsystem_root_path, &p->p_virtual_env);
++		if (error != 0) {
++			goto bad;
++		}
+ 	}
+ 
+ 	p->p_crash_behavior = crash_behavior;
+@@ -4797,9 +4862,6 @@ do_fork1:
+ 	p->p_crash_count = px_sa.psa_crash_count;
+ 	p->p_throttle_timeout = px_sa.psa_throttle_timeout;
+ 
+-	/* We'll need the subsystem root for setting up Apple strings */
+-	imgp->ip_subsystem_root_path = p->p_subsystem_root_path;
+-
+ 	context.vc_thread = imgp->ip_new_thread;
+ 	context.vc_ucred = proc_ucred_unsafe(p);  /* in init */
+ 
+@@ -4851,8 +4913,20 @@ do_fork1:
+ 		if (error != 0) {
+ 			goto bad;
+ 		}
++
++		if (port_actions.virtual_env_port != IPC_PORT_NULL) {
++			error = exec_handle_virtual_env_port_actions(p, old_task,
++			    port_actions.virtual_env_port);
++			if (error != 0) {
++				goto bad;
++			}
++		}
+ 	}
+ 
++	/* We'll need the subsystem root for setting up Apple strings */
++	imgp->ip_subsystem_root_path =
++	    virtual_env_get_subsystem_root_path(p->p_virtual_env);
++
+ 	/* Has spawn attr? */
+ 	if (imgp->ip_px_sa != NULL) {
+ 		/*
+@@ -6050,7 +6124,8 @@ __mac_execve(proc_t p, struct __mac_execve_args *uap, int32_t *retval __unused)
+ 	context.vc_thread = imgp->ip_new_thread;
+ 	context.vc_ucred = kauth_cred_proc_ref(p);      /* XXX must NOT be kauth_cred_get() */
+ 
+-	imgp->ip_subsystem_root_path = p->p_subsystem_root_path;
++	imgp->ip_subsystem_root_path =
++	    virtual_env_get_subsystem_root_path(p->p_virtual_env);
+ 
+ 	proc_transend(p, 0);
+ 	proc_signalend(p, 0);
+diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
+index b5633e45b..322b0a6c0 100644
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -120,6 +120,7 @@
+ 
+ #include <kern/exc_resource.h>
+ #include <kern/kern_types.h>
++#include <kern/virtual_env.h>
+ #include <kern/kalloc.h>
+ #include <kern/task.h>
+ #include <corpses/task_corpse.h>
+@@ -2676,9 +2677,9 @@ proc_exit(proc_t p)
+ 	zfree(proc_stats_zone, p->p_stats);
+ 	p->p_stats = NULL;
+ 
+-	if (p->p_subsystem_root_path) {
+-		zfree(ZV_NAMEI, p->p_subsystem_root_path);
+-		p->p_subsystem_root_path = NULL;
++	if (p->p_virtual_env) {
++		virtual_env_release(p->p_virtual_env);
++		p->p_virtual_env = NULL;
+ 	}
+ 
+ 	proc_limitdrop(p);
+diff --git a/bsd/kern/kern_fork.c b/bsd/kern/kern_fork.c
+index 1d8db27f3..44795c809 100644
+--- a/bsd/kern/kern_fork.c
++++ b/bsd/kern/kern_fork.c
+@@ -120,6 +120,7 @@ static void (*dtrace_proc_waitfor_hook)(proc_t) = NULL;
+ #include <mach/mach_types.h>
+ #include <kern/coalition.h>
+ #include <kern/ipc_kobject.h>
++#include <kern/virtual_env.h>
+ #include <kern/kern_types.h>
+ #include <kern/kalloc.h>
+ #include <kern/mach_param.h>
+@@ -893,9 +894,9 @@ forkproc_free(proc_t p)
+ 	/* Free allocated memory */
+ 	zfree(proc_stats_zone, p->p_stats);
+ 	p->p_stats = NULL;
+-	if (p->p_subsystem_root_path) {
+-		zfree(ZV_NAMEI, p->p_subsystem_root_path);
+-		p->p_subsystem_root_path = NULL;
++	if (p->p_virtual_env) {
++		virtual_env_release(p->p_virtual_env);
++		p->p_virtual_env = NULL;
+ 	}
+ 
+ 	proc_checkdeadrefs(p);
+@@ -1223,12 +1224,9 @@ forkproc(proc_t parent_proc, cloneproc_flags_t clone_flags)
+ 	child_proc->p_memstat_idledeadline = 0;
+ #endif /* CONFIG_MEMORYSTATUS */
+ 
+-	if (parent_proc->p_subsystem_root_path) {
+-		size_t parent_length = strlen(parent_proc->p_subsystem_root_path) + 1;
+-		assert(parent_length <= MAXPATHLEN);
+-		child_proc->p_subsystem_root_path = zalloc_flags(ZV_NAMEI,
+-		    Z_WAITOK | Z_ZERO);
+-		memcpy(child_proc->p_subsystem_root_path, parent_proc->p_subsystem_root_path, parent_length);
++	if (parent_proc->p_virtual_env) {
++		child_proc->p_virtual_env =
++		    virtual_env_retain(parent_proc->p_virtual_env);
+ 	}
+ 
+ bad:
+diff --git a/bsd/kern/kern_proc.c b/bsd/kern/kern_proc.c
+index dfb3a4506..01b305987 100644
+--- a/bsd/kern/kern_proc.c
++++ b/bsd/kern/kern_proc.c
+@@ -4058,7 +4058,7 @@ csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user
+ 		 */
+ 		if (forself == 1 && IOTaskHasEntitlement(proc_task(pt), CLEAR_LV_ENTITLEMENT)) {
+ 			proc_lock(pt);
+-			if (!(proc_getcsflags(pt) & CS_INSTALLER) && (pt->p_subsystem_root_path == NULL)) {
++			if (!(proc_getcsflags(pt) & CS_INSTALLER) && (pt->p_virtual_env == NULL)) {
+ 				proc_csflags_clear(pt, CS_REQUIRE_LV | CS_FORCED_LV);
+ 				error = 0;
+ 			} else {
+diff --git a/bsd/sys/proc_internal.h b/bsd/sys/proc_internal.h
+index 2a7c279a1..930199062 100644
+--- a/bsd/sys/proc_internal.h
++++ b/bsd/sys/proc_internal.h
+@@ -511,13 +511,9 @@ struct proc {
+ 	uint64_t        p_user_data;                    /* general-purpose storage for userland-provided data */
+ #endif /* CONFIG_PROC_UDATA_STORAGE */
+ 
+-	char * p_subsystem_root_path;
+-
+ 	/*
+-	 * RECON(13432): the reference kernel removed p_subsystem_root_path
+-	 * and placed struct virtual_env *p_virtual_env at offset 1976.  The
+-	 * public-base field above is kept until the exec and fork paths that
+-	 * use it are reconstructed, so this pointer currently lands at 1984.
++	 * RECON(13432): replaces the public p_subsystem_root_path; the path
++	 * is owned by the virtual environment object (offset 1976).
+ 	 */
+ 	struct virtual_env *p_virtual_env;
+ };
+diff --git a/bsd/sys/spawn_internal.h b/bsd/sys/spawn_internal.h
+index 4586f2931..f663b0eb9 100644
+--- a/bsd/sys/spawn_internal.h
++++ b/bsd/sys/spawn_internal.h
+@@ -80,6 +80,7 @@ typedef enum {
+ 	PSPA_IMP_WATCHPORTS = 3,
+ 	PSPA_REGISTERED_PORTS = 4,
+ 	PSPA_PTRAUTH_TASK_PORT = 5,
++	PSPA_VIRTUAL_ENV = 6,
+ } pspa_t;
+ 
+ /*

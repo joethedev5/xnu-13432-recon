@@ -1,0 +1,372 @@
+From 8999319c52144cacd5da0a2d0694c41b67e95493 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 03:43:03 +0000
+Subject: [PATCH 31/32] Match the reference TCP receive accounting and ECN
+ feedback flow
+
+The 13432 tcpcb replaces total_ect_packets_marked/acked with a single
+total_packets_received at offset 408 and adds t_recv_bg_algo at 495;
+tcp_input now counts received packets in that field.
+
+tcp_input delegates AccECN feedback to tcp_accecn_feedback and the
+combined ECN feedback path to tcp_ecn_feedback, as the reference's
+calls at its input lines 1619, 2951, 3008 and 3416 show.  The last-ACK
+decoder and the aggressive ECE heuristic had already moved to
+tcp_ecn.c; their tcp_input copies are removed.  tcp_classic_ecn_feedback
+uses tcp_ecn_check_ece_heur, whose reference mask also clears
+TE_SETUPSENT.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ bsd/netinet/tcp_ecn.c   |   5 +-
+ bsd/netinet/tcp_input.c | 229 ++--------------------------------------
+ bsd/netinet/tcp_var.h   |  10 +-
+ 3 files changed, 18 insertions(+), 226 deletions(-)
+
+diff --git a/bsd/netinet/tcp_ecn.c b/bsd/netinet/tcp_ecn.c
+index f8522d9cb..ad8215c4c 100644
+--- a/bsd/netinet/tcp_ecn.c
++++ b/bsd/netinet/tcp_ecn.c
+@@ -864,7 +864,7 @@ tcp_classic_ecn_feedback(struct tcpcb * tp, struct tcphdr * th, uint32_t bytes_a
+ 	 * For classic ECN, congestion event is receiving TH_ECE.
+ 	 * Disable ECN if > 90% marking is observed in ACK packets.
+ 	 */
+-	tcp_ece_aggressive_heur(tp, pkts_acked);
++	tcp_ecn_check_ece_heur(tp, pkts_acked);
+ 	/*
+ 	 * Reduce the congestion window if we haven't done so.
+ 	 */
+@@ -1124,7 +1124,8 @@ tcp_ecn_check_ece_heur(struct tcpcb * tp, uint32_t pkts_acked)
+ 	}
+ 
+ 	tcp_heuristic_ecn_aggressive(tp);
+-	tp->ecn_flags &= ~(TE_SENDIPECT | TE_ECEHEURI_SET);
++	/* The reference also clears classic ECN setup, disabling ECN outright. */
++	tp->ecn_flags &= ~(TE_SETUPSENT | TE_SENDIPECT | TE_ECEHEURI_SET);
+ 	tp->ecn_flags |= TE_ECEHEURI_SET;
+ }
+ 
+diff --git a/bsd/netinet/tcp_input.c b/bsd/netinet/tcp_input.c
+index 6f9f353a8..81a68784c 100644
+--- a/bsd/netinet/tcp_input.c
++++ b/bsd/netinet/tcp_input.c
+@@ -1329,133 +1329,6 @@ tcp_input_process_accecn_synack(struct tcpcb *tp, struct inpcb *inp, struct tcpo
+ 	}
+ }
+ 
+-static void
+-tcp_input_process_accecn_last_ack(struct tcpcb *tp, struct tcpopt *to,
+-    uint32_t tlen, uint16_t ace_flags, bool syn_cookie_processed)
+-{
+-	if (syn_cookie_processed) {
+-		/* Set AccECN and L4S flags as if these were negotiated successfully. */
+-		if (tp->l4s_enabled) {
+-			tp->ecn_flags |= (TE_ACC_ECN_ON | TE_SENDIPECT);
+-			tcp_set_accurate_ecn(tp);
+-		}
+-		tp->t_aecn.t_rcv_ce_packets = 5;
+-		tp->t_aecn.t_snd_ce_packets = 5;
+-		/* Initialize CE byte counter to 0 */
+-		tp->t_aecn.t_rcv_ce_bytes = tp->t_aecn.t_snd_ce_bytes = 0;
+-		/* Initialize ECT byte counter to 1 to distinguish zeroing of options */
+-		tp->t_aecn.t_rcv_ect1_bytes = tp->t_aecn.t_rcv_ect0_bytes = 1;
+-		tp->t_aecn.t_snd_ect1_bytes = tp->t_aecn.t_snd_ect0_bytes = 1;
+-	}
+-	if (tlen == 0 && to->to_nsacks == 0) {
+-		/*
+-		 * ACK for SYN-ACK reflects the state (ECN) in which SYN-ACK packet
+-		 * was delivered. Use Table 4 of Accurate ECN draft to decode only
+-		 * when a pure ACK with no SACK block is received.
+-		 * 0|0|0 will fail Accurate ECN negotiation and disable ECN.
+-		 */
+-		switch (ace_flags) {
+-		case (0 | TH_CWR | 0):
+-			/* Non-ECT SYN-ACK was delivered */
+-			tp->t_aecn.t_snd_ce_packets = 5;
+-			if (tp->t_server_accecn_state == tcp_connection_server_accurate_ecn_requested || syn_cookie_processed) {
+-				tp->t_server_accecn_state = tcp_connection_server_accurate_ecn_negotiation_success;
+-			}
+-			break;
+-		case (0 | TH_CWR | TH_ECE):
+-			/* ECT1 SYN-ACK was delivered, mangling detected */
+-			OS_FALLTHROUGH;
+-		case (TH_AE | 0 | 0):
+-			/* ECT0 SYN-ACK was delivered, mangling detected */
+-			tp->t_aecn.t_snd_ce_packets = 5;
+-			if (tp->t_server_accecn_state == tcp_connection_server_accurate_ecn_requested || syn_cookie_processed) {
+-				tp->t_server_accecn_state = tcp_connection_server_accurate_ecn_negotiation_success_ect_mangling_detected;
+-			}
+-			break;
+-		case (TH_AE | TH_CWR | 0):
+-			/*
+-			 * CE SYN-ACK was delivered, even though mangling happened,
+-			 * CE could indicate congestion at a node after mangling occured.
+-			 * Set cwnd to 2 segments
+-			 */
+-			tp->t_aecn.t_snd_ce_packets = 6;
+-			tp->snd_cwnd = 2 * tp->t_maxseg;
+-			if (tp->t_server_accecn_state == tcp_connection_server_accurate_ecn_requested || syn_cookie_processed) {
+-				tp->t_server_accecn_state = tcp_connection_server_accurate_ecn_negotiation_success_ect_mangling_detected;
+-			}
+-			break;
+-		case (0 | 0 | 0):
+-			/* Disable ECN, as ACE fields were zeroed */
+-			tp->ecn_flags &= ~(TE_SETUPRECEIVED | TE_SENDIPECT |
+-			    TE_SENDCWR | TE_ACE_SETUPRECEIVED);
+-			tcp_set_accurate_ecn(tp);
+-			/*
+-			 * Since last ACK has no ECN flag set and TE_LOST_SYNACK is set, this is in response
+-			 * to the second (non-ECN setup) SYN-ACK retransmission. In such a case, we assume
+-			 * that AccECN SYN-ACK was blackholed.
+-			 */
+-			if ((tp->ecn_flags & TE_LOST_SYNACK) && tp->t_rxtshift <= 2 &&
+-			    (tp->t_server_accecn_state == tcp_connection_server_classic_ecn_requested ||
+-			    tp->t_server_accecn_state == tcp_connection_server_accurate_ecn_requested ||
+-			    syn_cookie_processed)) {
+-				tp->t_server_accecn_state = tcp_connection_server_accurate_ecn_negotiation_blackholed;
+-			}
+-			/*
+-			 * SYN-ACK hasn't been retransmitted twice yet, so this could likely mean bleaching of ACE
+-			 * on the path from client to server on last ACK.
+-			 */
+-			if (tp->t_server_accecn_state == tcp_connection_server_accurate_ecn_requested) {
+-				tp->t_server_accecn_state = tcp_connection_server_accurate_ecn_ace_bleaching_detected;
+-			}
+-			break;
+-		default:
+-			/* Unused values for forward compatibility */
+-			tp->t_aecn.t_snd_ce_packets = 5;
+-			break;
+-		}
+-		/* Update the time for this newly received last ACK */
+-		if ((to->to_flags & TOF_TS) != 0 && (to->to_tsecr != 0) &&
+-		    (tp->t_last_ack_tsecr == 0 || TSTMP_GEQ(to->to_tsecr, tp->t_last_ack_tsecr))) {
+-			tp->t_last_ack_tsecr = to->to_tsecr;
+-		}
+-	} else if (to->to_nsacks == 0) {
+-		/*
+-		 * If 3rd ACK is lost, we won't receive the last ACK
+-		 * encoding. We will move the server to AccECN mode
+-		 * regardless.
+-		 */
+-		tp->t_aecn.t_snd_ce_packets = 5;
+-		if (tp->t_server_accecn_state == tcp_connection_server_accurate_ecn_requested || syn_cookie_processed) {
+-			tp->t_server_accecn_state = tcp_connection_server_accurate_ecn_negotiation_success;
+-		}
+-	}
+-}
+-
+-static void
+-tcp_ece_aggressive_heur(struct tcpcb *tp, uint32_t pkts_acked)
+-{
+-	if (tp->ecn_flags & TE_ECEHEURI_SET) {
+-		/* ECN heuristic already determined */
+-		return;
+-	}
+-
+-	tp->t_ecn_recv_ece_pkt += pkts_acked;
+-
+-	if (tp->t_ecn_capable_packets_acked < ECN_MIN_CE_PROBES) {
+-		/* Still in learning phase - insufficient probe data */
+-		return;
+-	}
+-
+-	if (tp->t_ecn_recv_ece_pkt > ECN_MAX_CE_RATIO) {
+-		/* Excessive congestion detected - disable ECN */
+-		tcp_heuristic_ecn_aggressive(tp);
+-		tp->ecn_flags |= TE_ECEHEURI_SET;
+-		tp->ecn_flags &= ~TE_SENDIPECT; /* Disable ECT for future packets */
+-	} else {
+-		/* Path is suitable for ECN */
+-		tp->ecn_flags |= TE_ECEHEURI_SET;
+-	}
+-}
+ /*
+  * Process SYN from clients and create a new connecting socket
+  * from the listener socket. If the listen queue exceeds a certain
+@@ -2525,17 +2398,7 @@ syn_cookie_valid:
+ 
+ 				/* TE_SENDIPECT is only set when L4S sysctl is enabled */
+ 				if (tp->accurate_ecn_on && (tp->ecn_flags & TE_SENDIPECT)) {
+-					uint32_t pkts_acked = tcp_packets_this_ack(tp, acked);
+-					tp->total_ect_packets_acked += pkts_acked;
+-
+-					bool newly_acked_time = false;
+-					if (acked == 0 && (to.to_flags & TOF_TS) != 0 && to.to_tsecr != 0 &&
+-					    TSTMP_GT(to.to_tsecr, tp->t_last_ack_tsecr)) {
+-						newly_acked_time = true;
+-					}
+-					if (acked > 0 || newly_acked_time) {
+-						tcp_process_accecn(tp, &to, th, pkts_acked, ace);
+-					}
++					tcp_accecn_feedback(tp, &to, th, acked, false);
+ 				}
+ 
+ 				/*
+@@ -2686,6 +2549,7 @@ syn_cookie_valid:
+ 			 */
+ 			tp->rcv_up = tp->rcv_nxt;
+ 			TCP_INC_VAR(tcpstat.tcps_rcvpack, segment_count);
++			tp->total_packets_received += segment_count;
+ 			tcpstat.tcps_rcvbyte += tlen;
+ 			if (nstat_collect) {
+ 				INP_ADD_RXSTAT(inp, ifnet_count_type, 1, tlen);
+@@ -3694,7 +3558,7 @@ close:
+ 		    && (thflags & (TH_SYN | TH_ACK)) == TH_ACK) {
+ 			uint16_t aceflags = tcp_get_flags(th);
+ 			aceflags &= TH_ACE;
+-			tcp_input_process_accecn_last_ack(tp, &to, (uint32_t)tlen, aceflags, syn_cookie_processed);
++			tcp_accecn_process_last_ack(tp, &to, (uint32_t)tlen, aceflags, syn_cookie_processed);
+ 			/* Increment receive side counters based on IP-ECN */
+ 			tcp_input_ip_ecn(tp, inp, (uint32_t)tlen, (uint32_t)segment_count, ip_ecn);
+ 		}
+@@ -3886,16 +3750,7 @@ close:
+ 			 */
+ 			if (tp->accurate_ecn_on && (tp->ecn_flags & TE_SENDIPECT) &&
+ 			    (sack_bytes_acked == 0)) {
+-				tp->total_ect_packets_acked += 1;
+-
+-				bool newly_acked_time = false;
+-				if (acked == 0 && (to.to_flags & TOF_TS) != 0 && to.to_tsecr != 0 &&
+-				    TSTMP_GT(to.to_tsecr, tp->t_last_ack_tsecr)) {
+-					newly_acked_time = true;
+-				}
+-				if (newly_acked_time) {
+-					tcp_process_accecn(tp, &to, th, 1, ace);
+-				}
++				tcp_accecn_feedback(tp, &to, th, 0, true);
+ 			}
+ 
+ 			if (tlen == 0 && (tiwin == tp->snd_wnd ||
+@@ -3951,9 +3806,7 @@ process_dupack:
+ 
+ 				if (sack_bytes_acked > 0 && tp->accurate_ecn_on &&
+ 				    (tp->ecn_flags & TE_SENDIPECT) && tp->t_state == TCPS_ESTABLISHED) {
+-					uint32_t pkts_sacked = tcp_packets_this_ack(tp, sack_bytes_acked);
+-					tp->total_ect_packets_acked += pkts_sacked;
+-					tcp_process_accecn(tp, &to, th, pkts_sacked, ace);
++					tcp_accecn_feedback(tp, &to, th, sack_bytes_acked, false);
+ 				}
+ 				/*
+ 				 * Check if we need to reset the limit on
+@@ -4343,76 +4196,7 @@ process_ACK:
+ 		}
+ 
+ 		if ((tp->ecn_flags & TE_SENDIPECT)) {
+-			/*
+-			 * draft-ietf-tcpm-accurate-ecn-28
+-			 * Accurate ECN feedback processing for data sender,
+-			 * Process peer's feedback in received TCP thflags and update s.cep
+-			 * Since SYN-ACK has a special encoding, exclude it from below.
+-			 * Only perform it before CC is called and snd_una is updated.
+-			 */
+-			if (tp->accurate_ecn_on && !(thflags & TH_SYN)) {
+-				/*
+-				 * For a server in SYN_RECEIVED state (that switched to
+-				 * ESTABLISHED in this ACK, exclude processing the last ACK
+-				 */
+-				if (th->th_ack == tp->iss + 1) {
+-					acked = 0;
+-				}
+-				uint32_t pkts_acked = tcp_packets_this_ack(tp, acked);
+-				tp->total_ect_packets_acked += pkts_acked;
+-				/*
+-				 * Calculate newly_acked_time used for AccECN feedback parsing
+-				 * for data sender if ACK acknowledges packets without data
+-				 * if reordering happens and certain packets have same TS.
+-				 * Right now, we consider that new time was ACKed if the TS
+-				 * was GT previous value, but we need to think about how to
+-				 * differentiate between reordering and wrapping when TS is same
+-				 * as previous value.
+-				 */
+-				bool newly_acked_time = false;
+-				if (acked == 0 && sack_bytes_acked == 0 &&
+-				    (to.to_flags & TOF_TS) != 0 && to.to_tsecr != 0 &&
+-				    (tp->t_last_ack_tsecr == 0 || TSTMP_GT(to.to_tsecr, tp->t_last_ack_tsecr))) {
+-					newly_acked_time = true;
+-				}
+-				/*
+-				 * Update s.cep if bytes have been newly S/ACKed
+-				 * otherwise, this ACK has already been superseded.
+-				 */
+-				if (acked > 0 || sack_bytes_acked > 0 || newly_acked_time) {
+-					tcp_process_accecn(tp, &to, th, pkts_acked, ace);
+-				}
+-			} else if (TCP_ECN_ENABLED(tp) && (thflags & TH_ECE)) {
+-				uint32_t pkts_acked = tcp_packets_this_ack(tp, acked);
+-				/*
+-				 * For classic ECN, congestion event is receiving TH_ECE.
+-				 * Disable ECN if > 90% marking is observed in ACK packets
+-				 */
+-				tcp_ece_aggressive_heur(tp, pkts_acked);
+-				/*
+-				 * Reduce the congestion window if we haven't
+-				 * done so.
+-				 */
+-				if (!IN_FASTRECOVERY(tp)) {
+-					/*
+-					 * Although we enter Fast Recovery in the below function
+-					 * we exit it immediately below as th_ack >= snd_recover
+-					 */
+-					tcp_enter_fast_recovery(tp);
+-					tp->ecn_flags |= (TE_INRECOVERY | TE_SENDCWR);
+-					/*
+-					 * Also note that the connection received
+-					 * ECE atleast once. We increment
+-					 * t_ecn_capable_packets_marked when we first
+-					 * enter fast recovery.
+-					 */
+-					tp->ecn_flags |= TE_RECV_ECN_ECE;
+-					INP_INC_IFNET_STAT(inp, ecn_recv_ece);
+-					tcpstat.tcps_ecn_recv_ece++;
+-					tp->t_ecn_capable_packets_marked += pkts_acked;
+-					tcp_ccdbg_trace(tp, th, TCP_CC_ECN_RCVD);
+-				}
+-			}
++			tcp_ecn_feedback(tp, th, &to, thflags, acked);
+ 		}
+ 
+ 		/*
+@@ -4765,6 +4549,7 @@ dodata:
+ 			thflags = th->th_flags & TH_FIN;
+ 			TCP_INC_VAR(tcpstat.tcps_rcvpack, segment_count);
+ 			tcpstat.tcps_rcvbyte += tlen;
++			tp->total_packets_received += segment_count;
+ 			if (nstat_collect) {
+ 				INP_ADD_RXSTAT(inp, ifnet_count_type, 1, tlen);
+ 			}
+diff --git a/bsd/netinet/tcp_var.h b/bsd/netinet/tcp_var.h
+index 1d3675a71..dca35402b 100644
+--- a/bsd/netinet/tcp_var.h
++++ b/bsd/netinet/tcp_var.h
+@@ -526,8 +526,7 @@ struct tcpcb {
+ 	tcp_seq         last_ack_sent;
+ 
+ 	uint32_t        t_bytes_acked;  /* RFC 3465 variable for ABC, used by CCA only */
+-	uint32_t        total_ect_packets_marked; /* Cumulative count of total ECT packets marked */
+-	uint32_t        total_ect_packets_acked;  /* Cumulative count of total ECT packets acked */
++	uint32_t        total_packets_received; /* Packets received on this connection */
+ 
+ 	int             t_lastchain;    /* amount of packets chained last time around */
+ 	uint16_t        t_unacksegs;    /* received but unacked segments for delaying acks */
+@@ -592,6 +591,7 @@ struct tcpcb {
+ 	uint32_t        t_last_ack_tsecr;       /* TS Echo Reply for last ACK that acknowledged a data or control packet */
+ 	uint16_t        t_prev_ace_flags;   /* ACE flags that were sent in previous packet, used for retransmitting after timeout */
+ 	uint8_t         t_prev_ip_ecn;      /* IP ECN flag on the previous packet, used for change-triggered ACKs */
++	uint8_t         t_recv_bg_algo;     /* receive background algorithm */
+ 
+ 	struct accecn   t_aecn;         /* AccECN related byte counters */
+ 
+@@ -1883,6 +1883,12 @@ void     tcp_set_l4s(struct tcpcb *tp, struct ifnet *ifp);
+ void     tcp_set_accurate_ecn(struct tcpcb *tp);
+ bool tcp_ecn_enabled(uint32_t ecn_flags);
+ uint8_t  tcp_get_ace(struct tcphdr *th);
++void     tcp_accecn_process_last_ack(struct tcpcb *, struct tcpopt *,
++    uint32_t, uint16_t, _Bool);
++void     tcp_accecn_feedback(struct tcpcb *, struct tcpopt *, struct tcphdr *,
++    uint32_t, _Bool);
++void     tcp_ecn_feedback(struct tcpcb *, struct tcphdr *, struct tcpopt *,
++    uint8_t, uint32_t);
+ uint32_t tcp_flight_size(struct tcpcb *tp);
+ extern void tcp_get_ports_used(ifnet_t ifp, int, u_int32_t, bitstr_t *__counted_by(bitstr_size(IP_PORTRANGE_SIZE)));
+ uint32_t tcp_count_opportunistic(unsigned int ifindex, u_int32_t flags);
