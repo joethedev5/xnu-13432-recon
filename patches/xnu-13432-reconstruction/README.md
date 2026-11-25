@@ -9,7 +9,7 @@ Apply in numeric order from a clean checkout:
 
 ```
 git checkout xnu-12377.121.6
-git am 0001-*.patch ... 0020-*.patch
+git am 0001-*.patch ... 0021-*.patch
 ```
 
 Contents:
@@ -27,7 +27,8 @@ Contents:
 7-18. RBBR state management, tunables, utilization/RTT-median and
    phase-log code, `tcp_tfo_process_last_ack`, VM page telemetry
    init, the receive-window selector and its SYN-ACK call site, and
-   the AccECN/ECN heuristic functions, including the SYN-RST path.
+   the AccECN/ECN heuristic functions, including the SYN-RST path,
+   and the TFO faulty-middlebox path.
 
 The patches contain only public xnu text plus original reconstruction;
 no Apple binary, dSYM, SDK payload or extracted proprietary header is

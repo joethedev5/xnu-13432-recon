@@ -1,7 +1,7 @@
 From 7b27b0793516e882b6792effcf1a6293b7dd6198 Mon Sep 17 00:00:00 2001
 From: joethedev5 <deepsbx1@proton.me>
 Date: Wed, 25 Nov 2026 02:11:15 +0000
-Subject: [PATCH 01/20] Reconstruct xnu-13432 syscall and trap entry points
+Subject: [PATCH 01/21] Reconstruct xnu-13432 syscall and trap entry points
 
 Add the nine syscalls and one Mach trap that the KDK 27.0.1
 kernel.release.vmapple dispatch tables expose beyond the public

@@ -1,7 +1,7 @@
 From 81230cc9147acd5dfbca59192ff6f3608b4be01a Mon Sep 17 00:00:00 2001
 From: joethedev5 <deepsbx1@proton.me>
 Date: Wed, 25 Nov 2026 02:26:33 +0000
-Subject: [PATCH 08/20] Reconstruct RBBR state management and register the
+Subject: [PATCH 08/21] Reconstruct RBBR state management and register the
  algorithm
 
 DWARF variable locations identify the real RBBR globals:

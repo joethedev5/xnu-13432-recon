@@ -1,0 +1,58 @@
+From 01d13b070b00b142379c377bb2c29bc507974439 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 02:35:47 +0000
+Subject: [PATCH 21/21] Recover tcp_tfo_synack_faulty_middlebox
+
+On a one-byte-ACK middlebox, after a TFO SYN with data is exactly one
+byte ahead of snd_una, run tcp_heuristic_tfo_middlebox, set
+so_error = 0x60, notify the socket with LOCKED|MP_SUB_ERROR, and set
+TFO_S_ONE_BYTE_PROXY.  Skip when the 13432-only t_flagsext bit 24 is
+set.
+
+Remaining explicit stubs: 287.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ bsd/netinet/tcp_fastopen.c | 22 ++++++++++++++++++++--
+ 1 file changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/bsd/netinet/tcp_fastopen.c b/bsd/netinet/tcp_fastopen.c
+index c8391971d..fe7ebb20c 100644
+--- a/bsd/netinet/tcp_fastopen.c
++++ b/bsd/netinet/tcp_fastopen.c
+@@ -10,6 +10,9 @@
+ #include <sys/systm.h>
+ #include <sys/kernel.h>
+ #include <netinet/tcp_fastopen.h>
++#include <netinet/tcp_var.h>
++#include <netinet/tcp_cache.h>
++#include <sys/socketvar.h>
+ 
+ #define RECON_BSD_NETINET_TCP_FASTOPEN_C 1
+ 
+@@ -54,8 +57,23 @@ tcp_tfo_process_synack(struct tcpcb * tp, struct tcpopt * to)
+ void
+ tcp_tfo_synack_faulty_middlebox(struct tcpcb * tp, struct socket * so, struct tcphdr * th)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_tfo_synack_faulty_middlebox");
++	if ((tp->t_flagsext & 0x01000000) != 0) { /* 13432-only TFO flag */
++		return;
++	}
++	if ((tp->t_tfo_stats & TFO_S_SYN_DATA_SENT) == 0) {
++		return;
++	}
++	if (tp->snd_max != th->th_seq + 1) {
++		return;
++	}
++	if (tp->snd_max <= tp->snd_una + 1) {
++		return;
++	}
++
++	tcp_heuristic_tfo_middlebox(tp);
++	so->so_error = 0x60; /* reference literal */
++	soevent(so, SO_FILT_HINT_LOCKED | SO_FILT_HINT_MP_SUB_ERROR);
++	tp->t_tfo_stats |= TFO_S_ONE_BYTE_PROXY;
+ }
+ 
+ /* bsd/netinet/tcp_fastopen.c:236 */

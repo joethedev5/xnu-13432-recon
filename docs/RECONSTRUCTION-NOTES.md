@@ -326,3 +326,12 @@ setup is outstanding; local connections mark `TE_RCVD_SYN_RST` and
 return the reference reason value `0x02010001`, while remote
 connections invoke `tcp_heuristic_ecn_synrst`. Patch series: 20
 entries; remaining explicit stubs: 288.
+
+## 2026-11-25: TFO faulty-middlebox path
+
+`tcp_tfo_synack_faulty_middlebox` detects a middlebox acknowledging
+only one TFO byte, runs `tcp_heuristic_tfo_middlebox`, sets
+`so_error = 0x60`, raises `SO_FILT_HINT_LOCKED |
+SO_FILT_HINT_MP_SUB_ERROR`, and marks `TFO_S_ONE_BYTE_PROXY`; a
+13432-only `t_flagsext` bit 24 suppresses it. Patch series: 21
+entries, 287 explicit stubs remain.

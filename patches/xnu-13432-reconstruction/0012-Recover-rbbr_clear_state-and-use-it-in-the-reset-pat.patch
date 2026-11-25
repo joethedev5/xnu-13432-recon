@@ -1,7 +1,7 @@
 From 38f1cc224173a7b8560aa4954453a06cda89b05a Mon Sep 17 00:00:00 2001
 From: joethedev5 <deepsbx1@proton.me>
 Date: Wed, 25 Nov 2026 02:28:51 +0000
-Subject: [PATCH 12/20] Recover rbbr_clear_state and use it in the reset paths
+Subject: [PATCH 12/21] Recover rbbr_clear_state and use it in the reset paths
 
 The initializer, switch_to and after_idle bodies all zero the full
 tcp_rbbr_state (0x160 bytes) before restoring preserved fields; the
