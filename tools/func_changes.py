@@ -131,7 +131,7 @@ def main():
     for rel, d in out.items():
         for f in d["changed"]:
             allch.append((abs(f["span_delta"]), rel, f))
-    allch.sort(reverse=True)
+    allch.sort(key=lambda x: x[0], reverse=True)
     lines.append("| file | function | dwarf span | public span | delta | dwarf line | public line |")
     lines.append("|---|---|---|---|---|---|---|")
     for _, rel, f in allch[:120]:

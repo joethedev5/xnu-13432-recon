@@ -20,3 +20,7 @@ analysis/*.db
 analysis/*.elf
 analysis/*.dwarf.*
 analysis/*.jsonl
+
+# Derived analysis corpora (keep only curated docs in git)
+analysis/
+probe-artifact/

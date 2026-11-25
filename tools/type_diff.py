@@ -109,8 +109,8 @@ def main():
     for r in sorted(out["changed"], key=lambda x: (-(len(x["added"]) + len(x["removed"])), x["file"]))[:120]:
         lines.append("| %s | %s %s | %d | %d | %s | %s |" %
                      (r["file"], r["kind"], r["name"], len(r["items"]),
-                      len(r["public_items"]), ", ".join(r["added"][:8]) or "-",
-                      ", ".join(r["removed"][:8]) or "-"))
+                      len(r["public_items"]), ", ".join(str(x) for x in r["added"][:8]) or "-",
+                      ", ".join(str(x) for x in r["removed"][:8]) or "-"))
     lines.append("\n## New types (public name absent)\n")
     for r in sorted(out["new"], key=lambda x: (x["file"], x["name"]))[:200]:
         lines.append("- `%s %s` in `%s` (size %s)" % (r["kind"], r["name"], r["file"], r["size"]))

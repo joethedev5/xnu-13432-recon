@@ -124,7 +124,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default="analysis/xnu-13432.dwarf.db")
     ap.add_argument("--kernel", default="kdk/root/System/Library/Kernels/kernel.release.vmapple")
-    ap.add_argument("--public", default="/srv/sandboxes/deepsbx/work/xnu-12377.121.6")
+    ap.add_argument("--public", default="xnu-12377.121.6")
     ap.add_argument("--outdir", default="analysis/tables")
     args = ap.parse_args()
     os.makedirs(args.outdir, exist_ok=True)

@@ -132,3 +132,56 @@ Source set: 56 files in the 13432 DWARF are absent from public
 `xnu-12377.121.6`. Largest groups: TCP modularisation (16 new `tcp_*.c`
 files), arm64 hypervisor/PPL (`osfmk/arm64/hv/*`, `ppl/*`), DRAM ECC,
 exclaves, telemetry, threadpair, virtual_env, task_apt, IOKit analytics.
+
+## 2026-11-25: entry points implemented and validated against the reference
+
+The reconstruction tree now implements every BSD/Mach entry point that is new
+or changed in 13432:
+
+- Nine new BSD syscalls (`pipe2`, `sys_dup3`, `fchflagsat`, `getumask`,
+  `aio_readv`, `aio_writev`, `fsctlat`, `guarded_ftruncate_np`,
+  `register_uexc_handler`) plus their `syscalls.master` rows.
+- Mach trap 108 `thread_set_x86_64_compat_trap` with its name-table entry.
+- Supporting refactors recovered from disassembly and DWARF signatures:
+  `dup_internal`, `close_fp_for_dup`, `fd_expand_descr_table_locked`,
+  `fp_close_and_unlock_with_action`, `ftruncate_internal`,
+  `fchflagsat_internal`, `fsctlat_internal`, `configure_uexc_handler`,
+  `handle_uexc_fault`, and the `ml_satisfies_x86_64_requirements` /
+  entitlement path.
+
+Validation: running `bsd/kern/makesyscalls.sh syscalls.master` reproduces the
+dispatch table decoded from `kernel.release.vmapple` byte-for-byte for all
+nine new entries — handler symbol, munge (`munge_ww`, `munge_www`,
+`munge_wwww`, `munge_wwl`, `munge_wwwww`, NULL), return type, and argument
+byte count. The reference `sysent` layout (`sy_call` 0, `sy_arg_munge32` 8,
+`sy_return_type` 16, `sy_narg` 20, `sy_arg_bytes` 22) and trap-108 record
+(`arg_count=1`, `u32_words=1`, `munge_w`) were both matched.
+
+Type findings from the exact dSYM were applied where they live in shared
+headers: `arm64_uexc_region_t` and the 32-byte `task.uexc` field at 0x368,
+`task.x86_64_compat_entitled` at 0x38b, and `machine_thread.x86_64_compat`
+at offset 48 after the matrix-state union.
+
+## 2026-11-25: 56 new translation units reconstructed
+
+`tools/newfile_recon.py` generates all 56 files that the 13432 DWARF places
+in the tree but public `xnu-12377.121.6` lacks, preserving reference function
+order, signatures and declaration lines. Current contents:
+
+- **464 functions** with DWARF-exact signatures.
+- **91 bodies relocated** verbatim from the public tree (4,025 lines removed
+  from their public locations), chiefly the TCP modularisation splits
+  (`tcp_segment.c`, `tcp_recovery.c`, `tcp_sack`-adjacent helpers) and
+  `kern_exec_security.c`.
+- **373 explicit stubs** carrying `RECON(13432)` markers and panic bodies.
+- Every file registered in the matching `conf/files*` build list.
+
+Per-file counts are in [NEW-FILES.md](NEW-FILES.md); the machine-readable
+report (`analysis/newfile-report.json`) stays local.
+
+Known deltas at this stage:
+- The 13432 `nameidata` split (`ni_resolveflags` at offset 336 and renamed
+  `NAMEI_*` values, `NAMEI_ATFD=0x400`) is recorded but not applied
+  tree-wide; new code uses the public namei API.
+- Stub bodies, include blocks and a few cross-file static call sites still
+  need disassembly-driven completion/validation.

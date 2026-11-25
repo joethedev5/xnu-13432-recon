@@ -68,7 +68,7 @@ class Types:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default="analysis/xnu-13432.dwarf.db")
-    ap.add_argument("--public", default="/srv/sandboxes/deepsbx/work/xnu-12377.121.6")
+    ap.add_argument("--public", default="xnu-12377.121.6")
     ap.add_argument("--outdir", default="analysis/dossiers")
     args = ap.parse_args()
     os.makedirs(args.outdir, exist_ok=True)
@@ -114,22 +114,23 @@ def main():
             label = name or (link.lstrip("_") if link else "?")
             own.append((fid, label, line, low, high, inline))
         params = defaultdict(list)
-        own_ids = [x[0] for x in own]
-        for fid, ordinal, name, toff in db.execute(
-                "SELECT func_id,ordinal,name,type_offset FROM func_param WHERE func_id IN (%s)"
-                " ORDER BY func_id,ordinal" % ",".join("?" * len(own)),
-                [x[0] for x in own] or [0]):
-            params[fid].append((name or "arg", types.desc(toff)))
-        var_count = dict(db.execute(
-            "SELECT func_id,count(*) FROM variable WHERE func_id IN (%s) GROUP BY func_id"
-            % ",".join("?" * len(own)) if own else "SELECT 1,0 WHERE 0", own_ids).fetchall())
+        var_count = {}
         calls = defaultdict(Counter)
-        for fid, origin in db.execute(
-                "SELECT func_id,call_origin FROM call_site WHERE func_id IN (%s)"
-                % ",".join("?" * len(own)) if own else "SELECT 1,0 WHERE 0", own_ids):
-            callee = func_by_offset.get(origin)
-            if callee:
-                calls[fid][callee] += 1
+        own_ids = [x[0] for x in own]
+        if own_ids:
+            qm = ",".join("?" * len(own_ids))
+            for fid, ordinal, name, toff in db.execute(
+                    "SELECT func_id,ordinal,name,type_offset FROM func_param WHERE func_id IN (%s)"
+                    " ORDER BY func_id,ordinal" % qm, own_ids):
+                params[fid].append((name or "arg", types.desc(toff)))
+            var_count = dict(db.execute(
+                "SELECT func_id,count(*) FROM variable WHERE func_id IN (%s) GROUP BY func_id"
+                % qm, own_ids).fetchall())
+            for fid, origin in db.execute(
+                    "SELECT func_id,call_origin FROM call_site WHERE func_id IN (%s)" % qm, own_ids):
+                callee = func_by_offset.get(origin)
+                if callee:
+                    calls[fid][callee] += 1
         trows = []
         for (tid, tag, name, size, decl_file, decl_line) in db.execute(
                 "SELECT id,tag,name,byte_size,decl_file,decl_line FROM type "
