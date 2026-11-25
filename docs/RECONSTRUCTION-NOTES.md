@@ -104,3 +104,31 @@ Local analysis pipeline:
 
 Public repo: https://github.com/joethedev5/xnu-13432-recon
 Private reference store: https://github.com/joethedev5/xnu-13432-refs
+
+## 2026-11-25: dispatch tables and source deltas
+
+DWARF model: 1,046 CUs, 76,861 subprograms, 308,987 types, 986,315 members,
+368,826 variables, 126,767 call sites, 1,112,400 line-table rows.
+
+Dispatch tables decoded from the exact VMAPPLE kernel using DWARF variable
+locations and arm64e chained-pointer fixups (stride 4, unauth target =
+vm offset from image base 0xfffffe0007004000):
+
+- `sysent` @ `0xfffffe00072675e8`: 558 × 24 B, same field layout as public.
+- `mach_trap_table` @ `0xfffffe0007236b40`: 128 × 24 B,
+  `{arg_count:u8,u32_words:u8,returns_port:u8,pad:u8,fn@8,munge@16}`.
+- First entries resolve exactly: `sysent[0]=nosys`, `sysent[1]=exit`.
+
+BSD syscalls: 22 entries differ from public `syscalls.master`. Reserved
+`nosys`/`enosys` slots now carry real handlers, including `pipe2` (148),
+`sys_dup3` (149), `fchflagsat` (214), `getumask` (215), `aio_readv` (246),
+`aio_writev` (247), `fsctlat` (249), `guarded_ftruncate_np` (352), and
+`register_uexc_handler` (519).
+
+Mach traps: 128 entries; the `mach_syscall_name_table` names line up with
+the public `syscall_sw.c` table once that table block is parsed correctly.
+
+Source set: 56 files in the 13432 DWARF are absent from public
+`xnu-12377.121.6`. Largest groups: TCP modularisation (16 new `tcp_*.c`
+files), arm64 hypervisor/PPL (`osfmk/arm64/hv/*`, `ppl/*`), DRAM ECC,
+exclaves, telemetry, threadpair, virtual_env, task_apt, IOKit analytics.
