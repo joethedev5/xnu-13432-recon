@@ -1,0 +1,695 @@
+From 282896e7d18181599e9f7bf81725d6d1ec023549 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 21:03:14 +0000
+Subject: [PATCH] Recover vm_page_telemetry.c
+
+Reconstruct the page telemetry ring and its CoreAnalytics drain path
+from the reference kernel: the static ring entry, dedupe table and lock
+state, the Jenkins-hashed dedupe probes and compare-and-swap marking,
+the per-process zero-wired-pages event, the one-shot drain thread call
+and the two emit entry points with their single-argument overload.
+
+The panic message keeps the reference's line number through a #line
+directive so the drain-thread allocation failure reports the same
+location.
+
+Remaining explicit stubs: 62.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ osfmk/vm/vm_page_telemetry.c | 485 ++++++++++++++++++++++++++++++++---
+ osfmk/vm/vm_page_telemetry.h |  87 ++++++-
+ 2 files changed, 522 insertions(+), 50 deletions(-)
+
+diff --git a/osfmk/vm/vm_page_telemetry.c b/osfmk/vm/vm_page_telemetry.c
+index 72e464088..b7f3b09d5 100644
+--- a/osfmk/vm/vm_page_telemetry.c
++++ b/osfmk/vm/vm_page_telemetry.c
+@@ -1,106 +1,507 @@
+ /*
+- * Reconstruction of osfmk/vm/vm_page_telemetry.c from the xnu-13432 reference kernel.
++ * Reconstruction of osfmk/vm/vm_page_telemetry.c from the xnu-13432
++ * reference kernel.
+  *
+- * Function signatures and ordering are derived from the KDK 27.0.1
+- * DWARF.  Functions marked RECON were moved from the public xnu source
+- * when the reference kernel placed them in this file; bodies marked
+- * "body not recovered" are still stubs.
+- */
+-#include <kern/kern_types.h>
+-#include <kern/assert.h>
+-#include <kern/debug.h>
+-#include <kern/zalloc.h>
+-#include <sys/systm.h>
+-#include <vm/vm_page_telemetry.h>
++ * Function signatures, ordering, local variables and statement lines are
++ * derived from the KDK 27.0.1 DWARF (kernel.kasan.vmapple, which carries
++ * line and column tables for every inlined call) and cross-checked
++ * against the RELEASE and DEVELOPMENT vmapple kernels.  The bodies marked
++ * with a reference line were recovered instruction by instruction; the
++ * reference line of each definition and of the notable statements is
++ * given for cross-checking.
++ *
++ * The ring serializes events from the recording sites to a single drain
++ * thread call which turns them into CoreAnalytics events.  A small open
++ * addressed hash table suppresses identical events (same code, subcode
++ * and backtrace) that repeat.
++ */
++#include <string.h>
++#include <kern/locks.h>
+ #include <kern/thread_call.h>
++#include <vm/vm_page_telemetry.h>
++#include <kern/backtrace.h>
++#include <kern/zalloc.h>
++#include <kern/panic_call.h>
++#include <libkern/coreanalytics/coreanalytics.h>
++#include <libkern/OSKextLibPrivate.h>
++#include <kern/telemetry.h>
++#include <libkern/os/hash.h>
++#include <os/atomic_private.h>
++#include <sys/codesign.h>
++#include <uuid/uuid.h>
+ 
+ #define RECON_OSFMK_VM_VM_PAGE_TELEMETRY_C 1
+ 
++/*
++ * The BSD process helpers are declared here rather than by including the
++ * BSD headers, as in the reference.
++ */
++/* osfmk/vm/vm_page_telemetry.c:43 */
++extern struct proc * current_proc(void);
++/* osfmk/vm/vm_page_telemetry.c:44 */
++extern char * proc_name_address(struct proc * p);
++/* osfmk/vm/vm_page_telemetry.c:45 */
++extern void proc_getexecutableuuid(struct proc * p, unsigned char * uuidbuf,
++    unsigned long size);
++
++/* Number of entries in the event ring and in the dedupe table. */
++#define VMPT_RING_SIZE          32
++#define VMPT_DEDUPE_SIZE        4096
++/* Number of open-addressed probes before a hash is declared unmarkable. */
++#define VMPT_DEDUPE_PROBES      128
++/* Backtrace depth carried by an event. */
++#define VMPT_MAX_FRAMES         16
++/* Distinct kexts whose identifiers are added to one event. */
++#define VMPT_MAX_KEXTS          4
++
++/* osfmk/vm/vm_page_telemetry.c:84 */
++CA_EVENT(vm_page_event,
++    CA_STATIC_STRING(388), backtrace,
++    CA_STATIC_STRING(256), kext_ids,
++    CA_INT, code,
++    CA_INT, subcode);
++
++/*
++ * Newer, non-public events are reported under a separate name.  The
++ * event is only built by development kernels; release kernels always
++ * emit vm_page_event.
++ */
++#if DEVELOPMENT || DEBUG
++/* osfmk/vm/vm_page_telemetry.c:91 */
++CA_EVENT(vm_page_event_internal,
++    CA_STATIC_STRING(388), backtrace,
++    CA_STATIC_STRING(256), kext_ids,
++    CA_INT, code,
++    CA_INT, subcode);
++#endif /* DEVELOPMENT || DEBUG */
++
++/* osfmk/vm/vm_page_telemetry.c:124 */
++typedef struct vmpt_ring_entry {
++	vm_page_telemetry_event_t code;
++	uint64_t subcode;
++	uint64_t kext_timestamp;
++	unsigned int frame_count;
++	uintptr_t frames[VMPT_MAX_FRAMES];
++} vmpt_ring_entry_t;
++
++/*
++ * Deduplication state.  A hash of zero means "empty", so vmpt_hash()
++ * never returns zero.  vmpt_disable is a latch set when the dedupe table
++ * cannot accept new hashes; vmpt_disable_reported records that the single
++ * VMPT_DISABLED event has already been queued.
++ */
++/* osfmk/vm/vm_page_telemetry.c:139 */
++static uint32_t vmpt_dedupe_table[VMPT_DEDUPE_SIZE];
++/* osfmk/vm/vm_page_telemetry.c:140 */
++static bool vmpt_disable;
++/* osfmk/vm/vm_page_telemetry.c:141 */
++static bool vmpt_disable_reported;
++
++/* osfmk/vm/vm_page_telemetry.c:148 */
++static LCK_GRP_DECLARE(vmpt_lock_grp, "vm_page_telemetry");
++/* osfmk/vm/vm_page_telemetry.c:149 */
++static LCK_SPIN_DECLARE(vmpt_lock, &vmpt_lock_grp);
++
++/*
++ * Producer/consumer ring.  Recording sites append under vmpt_lock; the
++ * drain thread call drains it without holding the lock while it formats
++ * and sends the events.
++ */
++/* osfmk/vm/vm_page_telemetry.c:151 */
++static vmpt_ring_entry_t vmpt_ring[VMPT_RING_SIZE];
++/* osfmk/vm/vm_page_telemetry.c:152 */
++static size_t vmpt_ring_rd;
++/* osfmk/vm/vm_page_telemetry.c:153 */
++static size_t vmpt_ring_wr;
++/* osfmk/vm/vm_page_telemetry.c:154 */
++static size_t vmpt_ring_count;
++/* osfmk/vm/vm_page_telemetry.c:156 */
+ static thread_call_t vmpt_drain_thread_call;
+ 
++/*
++ * Hash an event identity: the event code, its subcode and the captured
++ * frames.  The result is used as the dedupe table key and must be
++ * non-zero.
++ */
+ /* osfmk/vm/vm_page_telemetry.c:168 */
+-uint32_t
+-vmpt_hash(vm_page_telemetry_event_t code, uint64_t subcode, uintptr_t * frames, unsigned int frame_count)
++static inline uint32_t
++vmpt_hash(vm_page_telemetry_event_t code, uint64_t subcode,
++    uintptr_t * frames, unsigned int frame_count)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: vmpt_hash");
++	uint32_t h = 0;
++
++	h = os_hash_jenkins_update(&code, sizeof(code), h);
++	h = os_hash_jenkins_update(&subcode, sizeof(subcode), h);
++	h = os_hash_jenkins_update(frames, frame_count * sizeof(*frames), h);
++	h = os_hash_jenkins_finish(h);
++
++	return h ?: 1;
+ }
+ 
++/*
++ * Probe the dedupe table for hash.  The probe sequence walks forward
++ * from the hash until it finds the hash itself, an empty slot, or the
++ * probe limit.
++ */
+ /* osfmk/vm/vm_page_telemetry.c:186 */
+-_Bool
++static inline bool
+ vmpt_is_duplicate(uint32_t hash)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: vmpt_is_duplicate");
++	size_t idx;
++
++	for (size_t i = 0, probe = hash; i < VMPT_DEDUPE_PROBES; i++, probe++) {
++		idx = probe & (VMPT_DEDUPE_SIZE - 1);
++
++		uint32_t existing = vmpt_dedupe_table[idx];
++
++		if (existing == hash) {
++			return true;
++		}
++		if (existing == 0) {
++			return false;
++		}
++	}
++
++	return false;
+ }
+ 
++/*
++ * Mark hash in the dedupe table.  Returns true when the hash is present
++ * (either it was already there or the compare-and-swap installed it),
++ * false when no empty slot was found within the probe limit.
++ */
+ /* osfmk/vm/vm_page_telemetry.c:215 */
+-_Bool
++static inline bool
+ vmpt_mark_duplicate(uint32_t hash)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: vmpt_mark_duplicate");
++	size_t idx;
++
++	for (size_t i = 0, probe = hash; i < VMPT_DEDUPE_PROBES; i++, probe++) {
++		idx = probe & (VMPT_DEDUPE_SIZE - 1);
++
++		uint32_t existing = vmpt_dedupe_table[idx];
++
++		if (existing == hash) {
++			return true;
++		}
++		if (existing == 0) {
++			if (os_atomic_cmpxchg(&vmpt_dedupe_table[idx], 0, hash,
++			    relaxed)) {
++				return true;
++			}
++		}
++	}
++
++	return false;
+ }
+ 
++/*
++ * Allocate the CoreAnalytics event for an event code.  Event codes of
++ * 100 and above are internal events and use their own event name in
++ * development kernels.
++ */
+ /* osfmk/vm/vm_page_telemetry.c:243 */
+-ca_event_t
++static inline ca_event_t
+ vmpt_alloc_ca_event(vm_page_telemetry_event_t code)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: vmpt_alloc_ca_event");
++	ca_event_t ca_event;
++	const zalloc_flags_t flags = Z_WAITOK_ZERO;
++
++#if DEVELOPMENT || DEBUG
++	if (code < 100) {
++		ca_event = CA_EVENT_ALLOCATE_FLAGS(vm_page_event, flags);
++	} else {
++		ca_event = CA_EVENT_ALLOCATE_FLAGS(vm_page_event_internal, flags);
++	}
++#else /* DEVELOPMENT || DEBUG */
++	ca_event = CA_EVENT_ALLOCATE_FLAGS(vm_page_event, flags);
++#endif /* DEVELOPMENT || DEBUG */
++
++	return ca_event;
+ }
+ 
++/*
++ * Convert one ring entry into a CoreAnalytics event and send it.
++ *
++ * The captured frames are rendered into the backtrace string; the kexts
++ * that contain them are looked up and their identifiers joined into the
++ * kext_ids string.  The lookups are only valid while the loaded kext
++ * summaries are the ones that were current when the frame addresses were
++ * captured, which the entry's kext_timestamp records.
++ */
+ /* osfmk/vm/vm_page_telemetry.c:267 */
+-void
++static inline void
+ vmpt_send_ca_event(vmpt_ring_entry_t * entry)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: vmpt_send_ca_event");
++	ca_event_t ca_event = vmpt_alloc_ca_event(entry->code);
++
++	if (ca_event == NULL) {
++		return;
++	}
++
++	CA_EVENT_TYPE(vm_page_event) * event = ca_event->data;
++
++	telemetry_backtrace_to_string(event->backtrace, sizeof(event->backtrace),
++	    entry->frame_count, entry->frames);
++
++	if (entry->kext_timestamp == gLoadedKextSummariesTimestamp) {
++		unsigned int seen_count = 0;
++		uint32_t seen_tags[VMPT_MAX_KEXTS] = {};
++
++		for (unsigned int i = 0; i < entry->frame_count && seen_count < VMPT_MAX_KEXTS;
++		    i++) {
++			OSKextLoadedKextSummary summary = {};
++
++			if (OSKextGetLoadedKextSummaryForAddress((const void *)entry->frames[i],
++			    &summary) != KERN_SUCCESS) {
++				continue;
++			}
++
++			bool already_seen = false;
++
++			for (unsigned int j = 0; j < seen_count; j++) {
++				if (seen_tags[j] == summary.loadTag) {
++					already_seen = true;
++					break;
++				}
++			}
++
++			if (already_seen) {
++				continue;
++			}
++
++			seen_tags[seen_count] = summary.loadTag;
++			seen_count++;
++
++			char * ids = event->kext_ids;
++			size_t max_sz = sizeof(event->kext_ids);
++
++			if (ids[0] != '\0') {
++				strlcat(ids, ",", max_sz);
++			}
++			strlcat(ids, summary.name, max_sz);
++			if (strlen(ids) >= max_sz - 1) {
++				break;
++			}
++		}
++	}
++
++	event->code = entry->code;
++	event->subcode = entry->subcode;
++
++	core_analytics_send_event(ca_event);
+ }
+ 
++/*
++ * Drain thread callback.  The ring is drained in batches: the batch size
++ * and starting index are taken under the lock, the lock is dropped while
++ * the events are formatted and sent, then the read index and remaining
++ * count are advanced under the lock.  New events that arrived meanwhile
++ * are picked up by the next iteration.
++ */
+ /* osfmk/vm/vm_page_telemetry.c:334 */
+-void
++static void
+ vmpt_drain_thread(thread_call_param_t p0, thread_call_param_t p1)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: vmpt_drain_thread");
++	size_t drain_count;
++	size_t drain_rd;
++
++	lck_spin_lock(&vmpt_lock);
++
++	while ((drain_count = vmpt_ring_count) != 0) {
++		drain_rd = vmpt_ring_rd;
++		lck_spin_unlock(&vmpt_lock);
++
++		for (size_t i = 0; i < drain_count; i++) {
++			const size_t idx = (drain_rd + i) % VMPT_RING_SIZE;
++			vmpt_ring_entry_t * entry = &vmpt_ring[idx];
++
++			vmpt_send_ca_event(entry);
++		}
++
++		lck_spin_lock(&vmpt_lock);
++		vmpt_ring_rd = (vmpt_ring_rd + drain_count) % VMPT_RING_SIZE;
++		vmpt_ring_count -= drain_count;
++	}
++
++	lck_spin_unlock(&vmpt_lock);
+ }
+ 
++/*
++ * Allocate the one-shot drain thread call.  Called from the kernel
++ * bootstrap once thread calls are available.
++ */
+ /* osfmk/vm/vm_page_telemetry.c:366 */
+ void
+ vm_page_telemetry_init(void)
+ {
+-	vmpt_drain_thread_call = thread_call_allocate(vmpt_drain_thread, NULL);
++	vmpt_drain_thread_call = thread_call_allocate_with_options(
++		vmpt_drain_thread, NULL, THREAD_CALL_PRIORITY_KERNEL,
++		THREAD_CALL_OPTIONS_ONCE);
++
++	if (vmpt_drain_thread_call == NULL) {
++#line 373 "vm_page_telemetry.c"
++		panic("vm_page_telemetry: failed to allocate drain thread");
++#line 348 "osfmk/vm/vm_page_telemetry.c"
++	}
+ }
+ 
++/*
++ * Append an entry to the ring.  Returns false when the ring is full or,
++ * for the VMPT_DISABLED event, when it has already been reported.  The
++ * drain thread call is only entered once the thread call subsystem is
++ * initialized.
++ */
+ /* osfmk/vm/vm_page_telemetry.c:383 */
+-_Bool
++static bool
+ vmpt_enqueue(vmpt_ring_entry_t * entry)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: vmpt_enqueue");
++	lck_spin_lock(&vmpt_lock);
++
++	if (vmpt_ring_count == VMPT_RING_SIZE) {
++		lck_spin_unlock(&vmpt_lock);
++
++		return false;
++	}
++
++	if (entry->code == VMPT_DISABLED) {
++		if (os_atomic_load(&vmpt_disable_reported, relaxed)) {
++			lck_spin_unlock(&vmpt_lock);
++			return false;
++		}
++		os_atomic_store(&vmpt_disable_reported, true, relaxed);
++	}
++
++	memmove(&vmpt_ring[vmpt_ring_wr], entry, sizeof(*entry));
++	vmpt_ring_wr = (vmpt_ring_wr + 1) % VMPT_RING_SIZE;
++	vmpt_ring_count++;
++
++	lck_spin_unlock(&vmpt_lock);
++
++	if (vmpt_drain_thread_call != NULL &&
++	    startup_phase >= STARTUP_SUB_THREAD_CALL) {
++		thread_call_enter(vmpt_drain_thread_call);
++	}
++
++	return true;
+ }
+ 
++/*
++ * Queue the single VMPT_DISABLED event, unless it was already reported.
++ */
+ /* osfmk/vm/vm_page_telemetry.c:423 */
+-void
++static inline void
+ vmpt_emit_disabled(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: vmpt_emit_disabled");
++	if (os_atomic_load(&vmpt_disable_reported, relaxed)) {
++		return;
++	}
++
++	vmpt_ring_entry_t entry = {
++		.code = VMPT_DISABLED,
++	};
++
++	vmpt_enqueue(&entry);
+ }
+ 
++/*
++ * Record an event: backtrace the caller, hash the identity, drop it if
++ * it is a duplicate of a recent event, queue it, and mark it in the
++ * dedupe table.  When the dedupe table is full, recording stops and the
++ * disable event is queued in place of the dropped event.
++ */
+ /* osfmk/vm/vm_page_telemetry.c:438 */
+ void
+ vm_page_telemetry_emit(vm_page_telemetry_event_t code, uint64_t subcode)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: vm_page_telemetry_emit");
++	vmpt_ring_entry_t entry = {};
++	struct backtrace_control ctl = {};
++	backtrace_info_t info = 0;
++
++	if (os_atomic_load(&vmpt_disable, relaxed)) {
++		vmpt_emit_disabled();
++		return;
++	}
++
++	ctl.btc_frame_addr = (uintptr_t)__builtin_frame_address(0);
++	entry.frame_count = backtrace(entry.frames, VMPT_MAX_FRAMES, &ctl, &info);
++
++	entry.code = code;
++	entry.subcode = subcode;
++
++	/*
++	 * Remember which generation of the loaded kext summaries the
++	 * captured frame addresses belong to.
++	 */
++	entry.kext_timestamp = gLoadedKextSummariesTimestamp;
++
++	uint32_t hash = vmpt_hash(code, subcode, entry.frames, entry.frame_count);
++
++	if (vmpt_is_duplicate(hash)) {
++		return;
++	}
++
++	if (!vmpt_enqueue(&entry)) {
++		return;
++	}
++
++	if (!vmpt_mark_duplicate(hash)) {
++		/*
++		 * The dedupe table has no room left for this hash.  Stop
++		 * recording further events and report the shutdown once.
++		 */
++		os_atomic_store(&vmpt_disable, true, relaxed);
++		vmpt_emit_disabled();
++	}
+ }
+ 
++/* osfmk/vm/vm_page_telemetry.c:493 */
++CA_EVENT(vm_zero_wired_pages,
++    CA_STATIC_STRING(CA_PROCNAME_LEN), process_name,
++    CA_STATIC_STRING(CA_SIGNINGID_MAX_LEN), process_signing_id,
++    CA_STATIC_STRING(CA_UUID_LEN), process_uuid);
++
++/*
++ * Report the process that zeroed a range of wired pages: its name, its
++ * signing identity and its executable UUID.
++ */
+ /* osfmk/vm/vm_page_telemetry.c:499 */
+ void
+ vm_page_telemetry_emit_zwp(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: vm_page_telemetry_emit_zwp");
++	struct proc * p;
++
++	if (!(p = current_proc())) {
++		return;
++	}
++
++	ca_event_t ca_event = CA_EVENT_ALLOCATE_FLAGS(vm_zero_wired_pages,
++	    Z_WAITOK_ZERO);
++
++	if (ca_event == NULL) {
++		return;
++	}
++
++	CA_EVENT_TYPE(vm_zero_wired_pages) * event = ca_event->data;
++
++	const char * proc_name = proc_name_address(p);
++
++	if (proc_name != NULL) {
++		strlcpy(event->process_name, proc_name,
++		    sizeof(event->process_name));
++	}
++
++	const char * signing_id = csproc_get_identity(p);
++
++	if (signing_id != NULL) {
++		strlcpy(event->process_signing_id, signing_id,
++		    sizeof(event->process_signing_id));
++	}
++
++	uuid_t uuid = {};
++
++	proc_getexecutableuuid(p, uuid, sizeof(uuid));
++	uuid_unparse_upper(uuid, event->process_uuid);
++
++	core_analytics_send_event(ca_event);
+ }
+diff --git a/osfmk/vm/vm_page_telemetry.h b/osfmk/vm/vm_page_telemetry.h
+index dd489ed3b..f0ccefd0f 100644
+--- a/osfmk/vm/vm_page_telemetry.h
++++ b/osfmk/vm/vm_page_telemetry.h
+@@ -1,31 +1,102 @@
+ /*
+- * Reconstruction of osfmk/vm/vm_page_telemetry.h from the xnu-13432 reference kernel.
++ * Reconstruction of osfmk/vm/vm_page_telemetry.h from the xnu-13432
++ * reference kernel.
+  *
+- * Declarations are derived from the KDK 27.0.1 DWARF.  Include order and
+- * macros used by the original header are not recovered here.
++ * Declarations and line numbers are derived from the KDK 27.0.1 DWARF
++ * (kernel.kasan.vmapple).  The event enumeration occupies reference
++ * lines 43-93; vm_page_telemetry_init is declared at line 140, the
++ * subcode-taking emit at line 154, the single-argument overload at
++ * lines 157-161 and the zero-wired-pages variant at line 170.
+  */
+ #ifndef XNU13432_OSFMK_VM_VM_PAGE_TELEMETRY_H
+ #define XNU13432_OSFMK_VM_VM_PAGE_TELEMETRY_H
+ 
+-typedef enum {
+-	VMPT_DISABLED = -1,
++#include <stdint.h>
++#include <sys/cdefs.h>
++
++/*
++ * The page telemetry events.  The value is stored in the ring entry and
++ * in the CoreAnalytics event, so it is a full 64-bit value; ~0 marks the
++ * "telemetry disabled" event that is emitted at most once.
++ *
++ * Each enumerator in the reference is preceded by a short description of
++ * what the event reports.  Those comments are not recoverable from the
++ * kernel image; the names and values are.
++ */
++/* vm_page_telemetry.h:43 */
++__enum_decl(vm_page_telemetry_event_t, uint64_t, {
++	VMPT_DISABLED = ~0ULL,
++
++	/* A page was copied out from an object that will be dumped. */
+ 	VMPT_NON_COPYOUT_FROM_WILL_BE_DUMPED = 0,
++
++	/* A page was copied out from an object that is not clean. */
+ 	VMPT_COPYOUT_FROM_NOT_ONLY_DIRTY = 1,
++
++	/* A page was copied out and the object was marked dirty. */
+ 	VMPT_COPYOUT_FROM_SET_DIRTY = 2,
++
++	/* An I/O physical address translation was blocked. */
+ 	VMPT_IOPL_BLOCK_ACCESS = 3,
++
++	/* The object type of a page was queried. */
+ 	VMPT_QUERY_OBJECT_TYPE = 4,
++
++	/* A pagein was aborted and restarted. */
+ 	VMPT_ABORT_RESTART = 5,
++
++	/* A pagein was aborted because the page was unavailable. */
+ 	VMPT_ABORT_UNAVAILABLE = 6,
++
++	/* A single page operation was recorded. */
+ 	VMPT_PAGE_OP = 7,
++
++	/* A range operation was recorded. */
+ 	VMPT_RANGE_OP = 8,
++
++	/* A memory object was prefaulted. */
+ 	VMPT_MEM_OBJECT_PREFAULT = 9,
++
++	/* An I/O protect operation hit a cache mode. */
+ 	VMPT_IO_PROTECT_CACHE_MODE = 10,
++
++	/* A transposition was recorded. */
+ 	VMPT_TRANSPOSE = 11,
++
++	/* An object was terminated during pageout. */
+ 	VMPT_PAGEOUT_OBJECT_TERMINATE = 12,
++
++	/* An I/O protection was cleared from a dirty page. */
+ 	VMPT_IOPL_CLEAR_DIRTY = 13,
+-	VMPT_COPYOUT_FROM_CLEAR_DIRTY = 14
+-} vm_page_telemetry_event_t;
+ 
+-void vm_page_telemetry_emit(vm_page_telemetry_event_t code);
++	/* A page was copied out and its dirty state was cleared. */
++	VMPT_COPYOUT_FROM_CLEAR_DIRTY = 14,
++});
++
++/* vm_page_telemetry.h:140 */
++void vm_page_telemetry_init(void);
++
++/*
++ * Record a page telemetry event.  The subcode carries the event-specific
++ * detail (object, offset, page state, ...).
++ */
++/* vm_page_telemetry.h:154 */
++void vm_page_telemetry_emit(vm_page_telemetry_event_t code, uint64_t subcode);
++
++/*
++ * Convenience form for events that have no subcode.  The single-argument
++ * function is a static inline overload; the reference marks it
++ * __attribute__((overloadable)) so that it can forward to the external
++ * two-argument function of the same name.
++ */
++/* vm_page_telemetry.h:157 */
++static inline void __attribute__((overloadable))
++vm_page_telemetry_emit(vm_page_telemetry_event_t code)
++{
++	vm_page_telemetry_emit(code, 0);
++}
++
++/* vm_page_telemetry.h:170 */
++void vm_page_telemetry_emit_zwp(void);
+ 
+ #endif /* XNU13432_OSFMK_VM_VM_PAGE_TELEMETRY_H */
+-- 
+2.47.3
+

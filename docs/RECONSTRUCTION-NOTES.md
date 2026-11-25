@@ -1895,3 +1895,81 @@ and the read-only context root carries its recovered members
 (`ver`, `exit`, `controls`, `state`, `ich`, `sme_state`, `misc`).
 
 The patch series now has 60 entries; 72 explicit stubs remain.
+
+## 2026-11-25: the page telemetry ring
+
+`osfmk/vm/vm_page_telemetry.c` and its header are new in 13432.  The
+whole translation unit was recovered from the kasan CU (which records
+line and column for every inlined call), the development symbol table
+and the release image.
+
+Types and data.  The event enumeration is a 64-bit
+`__enum_decl(vm_page_telemetry_event_t, uint64_t, ...)` with
+`VMPT_DISABLED = ~0` and fifteen documented events.  The ring entry is
+160 bytes: code at 0, subcode at 8, kext_timestamp at 16, frame_count
+(`unsigned int`) at 24, frames[16] at 32.  The CoreAnalytics events are
+`vm_page_event` and `vm_page_event_internal`, both 660 bytes
+(backtrace[388], kext_ids[256], code, subcode), and
+`vm_zero_wired_pages`, 182 bytes (process_name[17],
+process_signing_id[128], process_uuid[37]).  The format strings read out
+of the image are exactly `com.apple.xnu.vm_page_event`, `...internal`
+and `...vm_zero_wired_pages` followed by the type/field pairs.  The
+statics are the 4096-entry uint32 dedupe table, the disable and
+disable-reported bytes, the lock group and spin lock, the 32-entry ring,
+its size_t read/write/count indices and the drain thread call.  The lock
+group name comes from its startup spec in the image and is
+`vm_page_telemetry`, not `vmpt_lock`.
+
+The drain path.  `vmpt_hash` runs the Jenkins update over the eight
+bytes of code, the eight bytes of subcode and `frame_count * 8` bytes of
+frames, finishes, and forces a non-zero result (`h ?: 1`) because zero
+is the dedupe table's empty marker.  `vmpt_is_duplicate` probes
+`probe & 0xfff` starting at the hash for at most 128 steps and stops at
+the hash (duplicate), at zero (free slot) or at the limit;
+`vmpt_mark_duplicate` repeats the probe and installs the hash with a
+compare-and-swap, returning false only when the limit expires.
+`vmpt_enqueue` takes the lock, rejects the entry when the ring is full,
+admits only one `VMPT_DISABLED` event, appends, and enters the drain
+thread call only once `startup_phase >= STARTUP_SUB_THREAD_CALL` (the
+reference compares `_startup_phase` with 15).  The drain callback
+allocates its call with `THREAD_CALL_PRIORITY_KERNEL` and
+`THREAD_CALL_OPTIONS_ONCE` and panics with the reference message when
+that fails.  It drains the ring in batches taken under the lock,
+formatting and sending with the lock dropped.
+
+Event conversion.  `vmpt_send_ca_event` only resolves kexts while
+`entry->kext_timestamp == gLoadedKextSummariesTimestamp`, collects up to
+four distinct `loadTag`s, joins their names with `,` into the 256-byte
+identifier buffer, then fills code/subcode and sends.  The allocator
+uses `Z_WAITOK_ZERO` (the image passes 4) and, in
+`DEVELOPMENT || DEBUG`, selects the internal event name for codes of
+100 and above; the internal name string is absent from the release
+kernel, which fixes that guard.  `vm_page_telemetry_emit` reports the
+disable event when the latch is set, starts the backtrace from
+`__builtin_frame_address(0)`, stamps the summary generation, drops
+duplicates, enqueues, marks, and latches `vmpt_disable` when the table
+has no room.  `vm_page_telemetry_emit_zwp` reports the current process'
+name, signing identity and executable UUID.
+
+Source shape.  The header declares the two-argument emit at line 154
+and a one-argument `static inline` at 157-161 marked
+`__attribute__((overloadable))`.  Clang accepts that alongside the
+plain two-argument declaration: one-argument calls inline to a forward
+with subcode 0 while the two-argument symbol stays unmangled (verified
+with a local clang experiment).  The panic macro in `kern/panic_call.h`
+appends `" @%s:%d"` with `__FILE_NAME__` and `__LINE__`; the reference
+string has one suffix, so the source passes only the message, and a
+`#line` directive keeps the reference's line 373 in the message.
+Column evidence fixes several spellings: the emit conditions at 444:6,
+465:6, 469:7 and 478:7 (`if (vmpt_disable)`, `if
+(vmpt_is_duplicate(hash))`, `if (!vmpt_enqueue(&entry))`, `if
+(!vmpt_mark_duplicate(hash))`); the kext loop header at 288:39/51 and
+289:46 (`i < entry->frame_count && seen_count < 4`); and the drain loop
+at 342:24 (`while ((drain_count = vmpt_ring_count) != 0)`).
+
+The file compiles with the reference RELEASE flags.  The emitted
+CoreAnalytics format strings, the 160/660/182-byte structures, the panic
+string and the startup-phase check match the reference image, and the
+patch applies to the series with an identical tree hash.
+
+The patch series now has 61 entries; 62 explicit stubs remain.

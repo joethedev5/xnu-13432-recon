@@ -9,7 +9,7 @@ Apply in numeric order from a clean checkout:
 
 ```
 git checkout xnu-12377.121.6
-git am 0001-*.patch ... 0060-*.patch
+git am 0001-*.patch ... 0061-*.patch
 ```
 
 Contents:
@@ -209,6 +209,15 @@ Contents:
     the read-only context root its recovered members, defines
     `ARM_HV_STATE_VER`, declares the file's external inline helpers and
     drops a spurious assert from `hv_get_state_version_major`.
+61. The page telemetry ring in `osfmk/vm/vm_page_telemetry.c`: the
+    ring entry, dedupe table and lock state, the Jenkins hash over
+    code/subcode/frames, the duplicate probes and their
+    compare-and-swap marking, the CoreAnalytics event layout for the
+    public, internal and zero-wired-pages events, the per-kext
+    identifier collection gated on the loaded-summary generation, the
+    one-shot drain thread call and its ring drain loop, and both emit
+    entry points with the single-argument overload.  The header gains
+    the 64-bit event enumeration and the drain-thread prototype.
 
 The patches contain only public xnu text plus original reconstruction;
 no Apple binary, dSYM, SDK payload or extracted proprietary header is
