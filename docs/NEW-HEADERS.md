@@ -26,8 +26,8 @@ small declaration-only APIs recovered from the reference DWARF.
 | `osfmk/arm64/hv/guest_thread_state.h` | 384 |
 | `osfmk/arm64/hv/hv.h` | 33 |
 | `osfmk/arm64/hv/hv_compat_paranested.h` | 60 |
-| `osfmk/arm64/hv/hv_interface.h` | 90 |
-| `osfmk/arm64/hv/hv_internal.h` | 30 |
+| `osfmk/arm64/hv/hv_interface.h` | 108 |
+| `osfmk/arm64/hv/hv_internal.h` | 123 |
 | `osfmk/arm64/hv/hv_kern_types.h` | 32 |
 | `osfmk/arm64/hv/hv_objects.h` | 47 |
 | `osfmk/arm64/hv/hv_vcpu.h` | 35 |
@@ -35,7 +35,7 @@ small declaration-only APIs recovered from the reference DWARF.
 | `osfmk/arm64/ppl/t8020dart.h` | 119 |
 | `osfmk/arm64/ppl/uat.h` | 27 |
 | `osfmk/arm64/uexc.h` | 18 |
-| `osfmk/kern/hv_support_kern.h` | 35 |
+| `osfmk/kern/hv_support_kern.h` | 42 |
 | `osfmk/kern/matchmaker.h` | 11 |
 | `osfmk/kern/task_sanitizer_config.h` | 18 |
 | `osfmk/kern/threadpair.h` | 25 |

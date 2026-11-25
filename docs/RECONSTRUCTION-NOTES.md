@@ -961,3 +961,83 @@ from the release DWARF (`hv_task_target` at 0x618 there, 0x5e0 here;
 to be reconciled separately from these bodies.
 
 The patch series now has 47 entries; 111 explicit stubs remain.
+
+## 2026-11-25: hypervisor VM object policy and lookup helpers
+
+`osfmk/arm64/hv/hv_vm.c` is now fully recovered.  The five out-of-line
+functions are:
+
+- `hv_map_lookup_protection` (line 375): declares the shared find lock
+  context, calls `vm_map_find_entry_sh_locked(find_ctx, &map, addr,
+  VMRL_FIND_SH_NO_MIN_MAX_CHECK)` (the disassembly passes 0x2000, and
+  the 13432 DWARF confirms `VMRL_FIND_SH_NO_MIN_MAX_CHECK` = 8192),
+  returns the error unchanged, otherwise reports
+  `vme_protection(find_ctx->vmlc_vme)` and
+  `find_ctx->vmlc_vme->vme_end`, unlocks with
+  `vm_map_found_entry_sh_unlock` and returns.  The DWARF column
+  annotations (383:8, 383:35, 384:13, 384:35) pin the source text: the
+  function reads the context field directly instead of using
+  `vm_map_found_entry_get_entry()`, and the protection helper is a new
+  `vme_protection()` static inline at `vm_map_internal.h:515`.
+- `hv_trap_vm_destroy` (line 390): `hv_lock()`; `vm = hv_get_vm()`; if
+  NULL, `hv_unlock()` and `HV_NO_DEVICE` (0xfae94006); `hv_vm_lock(vm)`;
+  if `bitmap_first(&vm->vcpu_online_mask[0], HV_VCPU_MAX) >= 0`,
+  unlock both and `HV_BUSY` (0xfae94002); otherwise `hv_set_vm(NULL)`,
+  unlock both and `hv_release_vm(vm)`, returning `HV_SUCCESS`.
+  `HV_VCPU_MAX` is 64: the vCPU-create trap rejects ids above 0x3f.
+- `hv_vm_destroy` (line 424): assert no online vCPU (the release build
+  compiles the assert out; the kasan descriptor text is
+  `bitmap_first(&vm->vcpu_online_mask[0], HV_VCPU_MAX) < 0`), then
+  `os_ref_release_last(&vm->refcnt)` and `_hv_vm_destroy(vm)`.
+- `hv_vm_max_permitted_isa` (line 437): the entitlement ladder is
+  `com.apple.security.hypervisor` -> 1, plus
+  `com.apple.private.hypervisor.vmapple` -> 3, plus
+  `com.apple.private.hypervisor` -> 3 and 4 when
+  `hv_internal_isa_guest_allowed` is set.  The string order was read
+  from both the kasan and release images; the release build inlines the
+  entitlement check through IOKitBSDInit.cpp.
+- `hv_vm_allowed` (line 459): `if (hv_disable || isa ==
+  _HV_VM_ISA_NONE) return false;` then
+  `return isa <= hv_vm_max_permitted_isa();` (the inlined copy in
+  hv_vm_allowed is visible in both images).
+
+The `hv_internal.h` helpers were recovered as static inline functions
+from the inlined call trees: `hv_get_vm` (73), `hv_set_vm` (80),
+`hv_get_vcpu` (86), `hv_set_vcpu` (92), `hv_lock` (102), `hv_unlock`
+(108), `hv_vm_lock` (117), `hv_vm_unlock` (123), `hv_reference_vm`
+(135), `hv_get_lock_and_reference_vm` (141),
+`hv_get_and_reference_vm` (155), `_hv_vm_destroy` (167) and
+`hv_release_vm` (170).  The two reference helpers take hv_mtx, fetch
+the task target, retain the VM, and `hv_get_lock_and_reference_vm`
+additionally takes `vm->mtx` before dropping hv_mtx; their bodies come
+from the call-site DWARF line/column records (144:2, 145:7, 147:3,
+148:3, 150:2 and 158-163 respectively).
+
+`hv_vm_isa_t` is `uint32_t` (declared at `hv_interface.h:208`), not an
+enum.  The values 0/1/3/4 are recovered from the ISA policy; only the
+`_HV_VM_ISA_APPLE` and `_HV_VM_ISA_GENERIC` spellings are attested (by
+the public unit-test mocks), so the remaining macro names are marked
+as inferred in the header.
+
+New `hv_disable` declaration note: the arm64 kernel cannot include
+`kern/hv_support.h` (it `#error`s outside `__x86_64__`), so the extern
+is carried in `hv_support_kern.h` next to the definition; the
+reference declaration site was not recovered.
+
+Struct drift: the release `vm_map_entry` is 64 bytes but its bitfield
+tail has been compacted versus the public tree: the `vme_is_tagged/
+__unused1/__unused2` bits are gone, `behavior` starts at bit 1,
+`protection` is at bit 4, `superpage_size` and the final
+`vme_kernel_object/__unused3` bits are gone, and the object word is
+`vme_kind:2 / vme_value:62` at offset 40.  `vme_protection()` compiles
+against the public layout for now (protection at bit 7), so its
+generated `ubfx` offset differs from the reference until the VM entry
+layout is reconstructed.
+
+Both translation units still compile with their recovered
+`DW_AT_APPLE_flags`; the generated `hv_vm.c` code matches the release
+control flow (error constants, `vm+0x18` bitmap, `vm+0x8` refcount,
+HV_VCPU_MAX bound), and the local harness reproduces the release
+`hv_vm_allowed`/`hv_vm_max_permitted_isa` value ladder.
+
+The patch series now has 48 entries; 106 explicit stubs remain.

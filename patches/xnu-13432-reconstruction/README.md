@@ -9,7 +9,7 @@ Apply in numeric order from a clean checkout:
 
 ```
 git checkout xnu-12377.121.6
-git am 0001-*.patch ... 0047-*.patch
+git am 0001-*.patch ... 0048-*.patch
 ```
 
 Contents:
@@ -103,6 +103,13 @@ Contents:
     destroy callbacks in `osfmk/arm64/hv/hv.c`, plus the hypervisor
     return codes and the new `hv_vm.h`, `hv_vcpu.h` and
     `hv_compat_paranested.h` declarations.
+48. The hypervisor VM object policy and lookup helpers in
+    `osfmk/arm64/hv/hv_vm.c`: the shared-lock protection lookup,
+    `hv_trap_vm_destroy`, `hv_vm_destroy`,
+    `hv_vm_max_permitted_isa` and `hv_vm_allowed`, the static inline
+    `hv_internal.h` accessors and locks, the `hv_vm_isa_t` and
+    `HV_VCPU_MAX` constants, and `vme_protection()` in
+    `vm_map_internal.h`.
 
 The patches contain only public xnu text plus original reconstruction;
 no Apple binary, dSYM, SDK payload or extracted proprietary header is

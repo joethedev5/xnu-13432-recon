@@ -1,0 +1,388 @@
+From a05561c270ad93c4bc43421967a5ae4d75b64642 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 06:19:54 +0000
+Subject: [PATCH] Recover the hypervisor VM object policy and lookup helpers
+
+Reconstruct the five out-of-line functions of osfmk/arm64/hv/hv_vm.c
+from the reference kernel disassembly and full DWARF:
+
+ - hv_map_lookup_protection(): find the entry with a shared find lock
+   (VMRL_FIND_SH_NO_MIN_MAX_CHECK), report entry->protection through
+   vme_protection() and the entry end address, and unlock.
+ - hv_trap_vm_destroy(): take hv_mtx, look up the task's VM, refuse with
+   HV_NO_DEVICE when absent, refuse with HV_BUSY while vCPUs are online,
+   otherwise clear the task target, drop both locks and release the VM.
+ - hv_vm_destroy(): assert no vCPU is online, release the last
+   reference and free the VM.
+ - hv_vm_max_permitted_isa(): map the public hypervisor entitlement to 1,
+   com.apple.private.hypervisor.vmapple to 3, and
+   com.apple.private.hypervisor to 3/4 depending on the boot-time
+   guest-EL2 allowance.
+ - hv_vm_allowed(): reject a disabled/no ISA and ISAs above the
+   permitted maximum.
+
+Turn the hv_internal.h accessors and lock helpers into the static inline
+forms the reference inlines (hv_get_vm/hv_set_vm up to hv_release_vm),
+add the hv_vm_isa_t / HV_VCPU_MAX constants to hv_interface.h, declare
+hv_disable in hv_support_kern.h, and add vme_protection() to
+vm_map_internal.h.
+
+The release kernel's vm_map_entry has already been compacted relative
+to the public tree (vme_kind/vme_value and a smaller bitfield tail), so
+vme_protection() reads a different bit offset locally; the source form
+is the reference one.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ osfmk/arm64/hv/hv_interface.h |  18 +++++
+ osfmk/arm64/hv/hv_internal.h  | 121 ++++++++++++++++++++++++++++++----
+ osfmk/arm64/hv/hv_vm.c        |  95 ++++++++++++++++++++------
+ osfmk/kern/hv_support_kern.h  |   7 ++
+ osfmk/vm/vm_map_internal.h    |   7 ++
+ 5 files changed, 213 insertions(+), 35 deletions(-)
+
+diff --git a/osfmk/arm64/hv/hv_interface.h b/osfmk/arm64/hv/hv_interface.h
+index f8efdddf2..5cda9f38d 100644
+--- a/osfmk/arm64/hv/hv_interface.h
++++ b/osfmk/arm64/hv/hv_interface.h
+@@ -70,7 +70,25 @@ typedef struct {
+ 	void * input;
+ 	void * output;
+ } hv_nested_call_params_t;
++/* hv_interface.h:208 */
+ typedef uint32_t hv_vm_isa_t;
++
++/*
++ * hv_vm_isa_t values.  hv_vm_max_permitted_isa() produces 0 or 1 for the
++ * public com.apple.security.hypervisor entitlement, 3 for the
++ * com.apple.private.hypervisor.vmapple entitlement, and 3 or 4 with
++ * com.apple.private.hypervisor depending on whether guest EL2 is enabled.
++ * Only the _HV_VM_ISA_APPLE and _HV_VM_ISA_GENERIC spellings appear in the
++ * public unit-test mocks; the other names are inferred from those values.
++ */
++#define _HV_VM_ISA_NONE          0
++#define _HV_VM_ISA_APPLE         1
++#define _HV_VM_ISA_GENERIC       3
++#define _HV_VM_ISA_GENERIC_EL2   4
++
++/* Maximum number of vCPUs in a VM; also the width of vcpu_online_mask. */
++#define HV_VCPU_MAX              64
++
+ typedef struct {
+ 	uint64_t min_ipa;
+ 	uint64_t ipa_size;
+diff --git a/osfmk/arm64/hv/hv_internal.h b/osfmk/arm64/hv/hv_internal.h
+index 824cbacfb..aa8d8eb28 100644
+--- a/osfmk/arm64/hv/hv_internal.h
++++ b/osfmk/arm64/hv/hv_internal.h
+@@ -1,30 +1,123 @@
+ /*
+  * Reconstruction of osfmk/arm64/hv/hv_internal.h from the xnu-13432 reference kernel.
+  *
+- * Declarations are derived from the KDK 27.0.1 DWARF.  Include order and
+- * macros used by the original header are not recovered here.
++ * Declarations and inline bodies are derived from the KDK 27.0.1 DWARF and
++ * the disassembly of the reference kernel.  Include order and macros used
++ * by the original header are not fully recovered.
+  */
+ #ifndef XNU13432_OSFMK_ARM64_HV_HV_INTERNAL_H
+ #define XNU13432_OSFMK_ARM64_HV_HV_INTERNAL_H
+ 
+ #include <kern/locks.h>
++#include <kern/hv_support_kern.h>
++#include <os/refcnt.h>
+ #include <arm64/hv/hv_objects.h>
+ 
+ extern lck_grp_t hv_lck_grp;
+ extern lck_mtx_t hv_mtx;
+ 
+-hv_vm_t * hv_get_vm(void);
+-void hv_set_vm(hv_vm_t * vm);
+-hv_vcpu_t * hv_get_vcpu(void);
+-void hv_set_vcpu(hv_vcpu_t * vcpu);
+-void hv_lock(void);
+-void hv_unlock(void);
+-void hv_vm_lock(hv_vm_t * vm);
+-void hv_vm_unlock(hv_vm_t * vm);
+-void hv_reference_vm(hv_vm_t * vm);
+-hv_vm_t * hv_get_lock_and_reference_vm(void);
+-hv_vm_t * hv_get_and_reference_vm(void);
++/* hv_internal.h:73 */
++static inline hv_vm_t *
++hv_get_vm(void)
++{
++	return (hv_vm_t *)hv_get_task_target();
++}
++
++/* hv_internal.h:80 */
++static inline void
++hv_set_vm(hv_vm_t * vm)
++{
++	hv_set_task_target(vm);
++}
++
++/* hv_internal.h:86 */
++static inline hv_vcpu_t *
++hv_get_vcpu(void)
++{
++	return (hv_vcpu_t *)hv_get_thread_target();
++}
++
++/* hv_internal.h:92 */
++static inline void
++hv_set_vcpu(hv_vcpu_t * vcpu)
++{
++	hv_set_thread_target(vcpu);
++}
++
++/* hv_internal.h:102 */
++static inline void
++hv_lock(void)
++{
++	lck_mtx_lock(&hv_mtx);
++}
++
++/* hv_internal.h:108 */
++static inline void
++hv_unlock(void)
++{
++	lck_mtx_unlock(&hv_mtx);
++}
++
++/* hv_internal.h:117 */
++static inline void
++hv_vm_lock(hv_vm_t * vm)
++{
++	lck_mtx_lock(vm->mtx);
++}
++
++/* hv_internal.h:123 */
++static inline void
++hv_vm_unlock(hv_vm_t * vm)
++{
++	lck_mtx_unlock(vm->mtx);
++}
++
++/* hv_internal.h:135 */
++static inline void
++hv_reference_vm(hv_vm_t * vm)
++{
++	os_ref_retain(&vm->refcnt);
++}
++
++/* hv_internal.h:141 */
++static inline hv_vm_t *
++hv_get_lock_and_reference_vm(void)
++{
++	hv_vm_t * vm;
++	hv_lock();
++	vm = hv_get_vm();
++	if (vm != NULL) {
++		hv_reference_vm(vm);
++		hv_vm_lock(vm);
++	}
++	hv_unlock();
++	return vm;
++}
++
++/* hv_internal.h:155 */
++static inline hv_vm_t *
++hv_get_and_reference_vm(void)
++{
++	hv_vm_t * vm;
++	hv_lock();
++	vm = hv_get_vm();
++	if (vm != NULL) {
++		hv_reference_vm(vm);
++	}
++	hv_unlock();
++	return vm;
++}
++
++/* hv_internal.h:167 */
+ void _hv_vm_destroy(hv_vm_t * vm);
+-void hv_release_vm(hv_vm_t * vm);
++
++/* hv_internal.h:170 */
++static inline void
++hv_release_vm(hv_vm_t * vm)
++{
++	if (os_ref_release(&vm->refcnt) == 0) {
++		_hv_vm_destroy(vm);
++	}
++}
+ 
+ #endif /* XNU13432_OSFMK_ARM64_HV_HV_INTERNAL_H */
+diff --git a/osfmk/arm64/hv/hv_vm.c b/osfmk/arm64/hv/hv_vm.c
+index 402bdfd99..612984e66 100644
+--- a/osfmk/arm64/hv/hv_vm.c
++++ b/osfmk/arm64/hv/hv_vm.c
+@@ -1,55 +1,108 @@
+ /*
+  * Reconstruction of osfmk/arm64/hv/hv_vm.c from the xnu-13432 reference kernel.
+  *
+- * Function signatures and ordering are derived from the KDK 27.0.1
+- * DWARF.  Functions marked RECON were moved from the public xnu source
+- * when the reference kernel placed them in this file; bodies marked
+- * "body not recovered" are still stubs.
++ * Function signatures, ordering and bodies are derived from the KDK 27.0.1
++ * DWARF and the disassembly of the reference kernel.
+  */
+-#include <kern/kern_types.h>
++#include <arm64/hv/hv.h>
++#include <arm64/hv/hv_vm.h>
++#include <arm64/hv/hv_internal.h>
++#include <arm64/hv/hv_objects.h>
++#include <IOKit/IOBSD.h>
+ #include <kern/assert.h>
+-#include <kern/debug.h>
+-#include <kern/zalloc.h>
+-#include <sys/systm.h>
+-
+-#define RECON_OSFMK_ARM64_HV_HV_VM_C 1
++#include <kern/bits.h>
++#include <kern/hv_support_kern.h>
++#include <kern/locks.h>
++#include <os/refcnt.h>
++#include <vm/vm_map_internal.h>
++#include <vm/vm_map_lock_internal.h>
+ 
+ /* osfmk/arm64/hv/hv_vm.c:375 */
+ kern_return_t
+-hv_map_lookup_protection(struct _vm_map * map, vm_map_offset_t addr, vm_prot_t * prot, vm_map_offset_t * entry_end)
++hv_map_lookup_protection(vm_map_t map, vm_map_offset_t addr, vm_prot_t * prot, vm_map_offset_t * entry_end)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: hv_map_lookup_protection");
++	VM_MAP_FIND_LOCK_CTX_DECLARE(find_ctx);
++	kern_return_t kr = vm_map_find_entry_sh_locked(find_ctx, &map, addr, VMRL_FIND_SH_NO_MIN_MAX_CHECK);
++
++	if (kr != KERN_SUCCESS) {
++		return kr;
++	}
++	*prot = vme_protection(find_ctx->vmlc_vme);
++	*entry_end = find_ctx->vmlc_vme->vme_end;
++	vm_map_found_entry_sh_unlock(find_ctx, &map);
++	return kr;
+ }
+ 
+ /* osfmk/arm64/hv/hv_vm.c:390 */
+ hv_return_t
+ hv_trap_vm_destroy(uint64_t arg)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: hv_trap_vm_destroy");
++	hv_vm_t * vm;
++
++	hv_lock();
++	vm = hv_get_vm();
++	if (vm == NULL) {
++		hv_unlock();
++		return HV_NO_DEVICE;
++	}
++
++	hv_vm_lock(vm);
++	if (bitmap_first(&vm->vcpu_online_mask[0], HV_VCPU_MAX) >= 0) {
++		/* there are still online vCPUs */
++		hv_vm_unlock(vm);
++		hv_unlock();
++		return HV_BUSY;
++	}
++
++	hv_set_vm(NULL);
++	hv_vm_unlock(vm);
++
++	hv_unlock();
++
++	hv_release_vm(vm);
++	return HV_SUCCESS;
+ }
+ 
+ /* osfmk/arm64/hv/hv_vm.c:424 */
+ void
+ hv_vm_destroy(hv_vm_t * vm)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: hv_vm_destroy");
++	assert(bitmap_first(&vm->vcpu_online_mask[0], HV_VCPU_MAX) < 0);
++
++	os_ref_release_last(&vm->refcnt);
++	_hv_vm_destroy(vm);
+ }
+ 
+ /* osfmk/arm64/hv/hv_vm.c:437 */
+ hv_vm_isa_t
+ hv_vm_max_permitted_isa(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: hv_vm_max_permitted_isa");
++	hv_vm_isa_t permitted_isa = _HV_VM_ISA_NONE;
++
++	if (IOCurrentTaskHasEntitlement("com.apple.security.hypervisor")) {
++		permitted_isa = _HV_VM_ISA_APPLE;
++	}
++	if (IOCurrentTaskHasEntitlement("com.apple.private.hypervisor.vmapple")) {
++		permitted_isa = _HV_VM_ISA_GENERIC;
++	}
++	if (IOCurrentTaskHasEntitlement("com.apple.private.hypervisor")) {
++		permitted_isa = _HV_VM_ISA_GENERIC;
++
++		if (hv_internal_isa_guest_allowed) {
++			permitted_isa = _HV_VM_ISA_GENERIC_EL2;
++		}
++	}
++	return permitted_isa;
+ }
+ 
+ /* osfmk/arm64/hv/hv_vm.c:459 */
+ _Bool
+ hv_vm_allowed(hv_vm_isa_t isa)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: hv_vm_allowed");
++	if (hv_disable || isa == _HV_VM_ISA_NONE) {
++		return false;
++	}
++
++	/* reject any ISA above what the caller is entitled to */
++	return isa <= hv_vm_max_permitted_isa();
+ }
+diff --git a/osfmk/kern/hv_support_kern.h b/osfmk/kern/hv_support_kern.h
+index 6b73d6dbc..d9da30c72 100644
+--- a/osfmk/kern/hv_support_kern.h
++++ b/osfmk/kern/hv_support_kern.h
+@@ -11,6 +11,13 @@
+ 
+ #include <kern/kern_types.h>
+ 
++/*
++ * hv_disable is defined in hv_support_kern.c alongside the support flag.
++ * The reference declaration site for arm64 was not recovered (the exported
++ * kern/hv_support.h only covers the x86_64 kext variant).
++ */
++extern int hv_disable;
++
+ /* hv_support_kern.h:35 */
+ extern int hv_support_available;
+ 
+diff --git a/osfmk/vm/vm_map_internal.h b/osfmk/vm/vm_map_internal.h
+index d798dffee..2453e42be 100644
+--- a/osfmk/vm/vm_map_internal.h
++++ b/osfmk/vm/vm_map_internal.h
+@@ -517,6 +517,13 @@ vmtaglog_matches(vm_tag_t tag)
+ 	}
+ }
+ 
++/* vm_map_internal.h:515 (xnu-13432) */
++static inline vm_prot_t
++vme_protection(const struct vm_map_entry * entry)
++{
++	return entry->protection;
++}
++
+ static inline void
+ vme_btref_consider_and_set(__unused vm_map_entry_t entry, __unused void *fp)
+ {
+-- 
+2.47.3
+
