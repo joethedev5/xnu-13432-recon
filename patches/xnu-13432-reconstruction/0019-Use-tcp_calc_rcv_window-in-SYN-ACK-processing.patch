@@ -1,7 +1,7 @@
 From d9f078b50ef20bbbadcca05056721b62cbd60da7 Mon Sep 17 00:00:00 2001
 From: joethedev5 <deepsbx1@proton.me>
 Date: Wed, 25 Nov 2026 02:34:21 +0000
-Subject: [PATCH 19/25] Use tcp_calc_rcv_window in SYN-ACK processing
+Subject: [PATCH 19/28] Use tcp_calc_rcv_window in SYN-ACK processing
 
 Replace the rLedbat-specific window clamp with the reference's
 tcp_calc_rcv_window(tp, TCP_RECV_BG(so)) call; the helper now selects

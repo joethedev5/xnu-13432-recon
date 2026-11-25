@@ -406,3 +406,24 @@ tcp_seg_sent, seg_link, tcp_seg_cmp)`; the per-function stubs are
 replaced.
 
 The patch series now has 25 entries; 226 explicit stubs remain.
+
+## 2026-11-25: Recovery, RTT and RBBR phase helpers
+
+Four more translation units advanced:
+
+- `tcp_recovery.c`: `tcp_detect_spurious_rxmt`,
+  `tcp_restore_on_spurious_rxmt`,
+  `tcp_recovery_check_spurious_rxmt` and
+  `tcp_recovery_can_early_rxmt` — the public bad-rexmt/TLP/DSACK and
+  early-retransmit paths under their 13432 names.  The decompilation
+  confirms the reference's `EXIT_FASTRECOVERY` expansion (with the
+  advanced-timer PTO removal).
+- `tcp_rtt.c`: `tcp_get_base_rtt`, `tcp_update_curr_rtt`,
+  `tcp_update_base_rtt` and `tcp_compute_rxmit_time` (the renamed
+  `tcp_xmit_timer`).  The reference keeps 4 current-RTT samples and
+  10 route RTT-history slots with the 60 s expiry.
+- `tcp_rbbr.c`: `rbbr_apply_cruise_backoff`,
+  `rbbr_enter_probe_rwnd` and `rbbr_enter_cruise`, including the
+  reference's window rounding and `0xffff << rcv_scale` clamp.
+
+The patch series now has 28 entries; 215 explicit stubs remain.

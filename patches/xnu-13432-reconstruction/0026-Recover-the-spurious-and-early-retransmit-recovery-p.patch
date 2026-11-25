@@ -1,0 +1,285 @@
+From 601574c74f95b571ba84cdf8443a19b9efd19c47 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 03:11:46 +0000
+Subject: [PATCH 26/28] Recover the spurious and early retransmit recovery
+ paths
+
+Relocate the public tcp_input.c recovery logic into the 13432
+tcp_recovery.c names, verified against the reference decompilation:
+
+- tcp_detect_spurious_rxmt: timestamp/RTT-half detection with the
+  ECN-ack escape (uint8_t return in the reference).
+- tcp_restore_on_spurious_rxmt: RFC 4015 restore, cwnd re-init, RACK
+  reordering-window restore and the RTT-recompute marker.
+- tcp_recovery_check_spurious_rxmt: the rxtshift/TLP/DSACK decision
+  tree and PMTU-blackhole revert.
+- tcp_recovery_can_early_rxmt: RFC 5827 early-retransmit threshold
+  adjustment.
+
+The decompilation confirms the reference's EXIT_FASTRECOVERY expansion
+(including the advanced-timer removal) and the DSACK spurious segment
+test on rx_flags bit 0.
+
+Remaining explicit stubs: 222.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ bsd/netinet/tcp_recovery.c | 220 +++++++++++++++++++++++++++++++++++--
+ 1 file changed, 212 insertions(+), 8 deletions(-)
+
+diff --git a/bsd/netinet/tcp_recovery.c b/bsd/netinet/tcp_recovery.c
+index 7413c5a31..68d1e8da3 100644
+--- a/bsd/netinet/tcp_recovery.c
++++ b/bsd/netinet/tcp_recovery.c
+@@ -10,6 +10,8 @@
+ #include <sys/systm.h>
+ #include <sys/kernel.h>
+ #include <netinet/tcp_recovery.h>
++#include <netinet/tcp_var.h>
++#include <netinet/tcp_cc.h>
+ 
+ #define RECON_BSD_NETINET_TCP_RECOVERY_C 1
+ 
+@@ -242,32 +244,234 @@ tcp_rexmt_save_state(struct tcpcb *tp)
+ uint8_t
+ tcp_detect_spurious_rxmt(struct tcpcb * tp, struct tcphdr * th, struct tcpopt * to, u_int32_t rxtime)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_detect_spurious_rxmt");
++	int32_t tdiff, bad_rexmt_win;
++	bad_rexmt_win = (tp->t_srtt >> (TCP_RTT_SHIFT + 1));
++
++	/* If the ack has ECN CE bit, then cwnd has to be adjusted */
++	if ((tp->accurate_ecn_on && tp->t_aecn.t_delta_ce_packets > 0) ||
++	    (TCP_ECN_ENABLED(tp) && (th->th_flags & TH_ECE))) {
++		return 0;
++	}
++	if (TSTMP_SUPPORTED(tp)) {
++		if (rxtime > 0 && (to->to_flags & TOF_TS) && to->to_tsecr != 0 &&
++		    TSTMP_LT(to->to_tsecr, rxtime)) {
++			return 1;
++		}
++	} else {
++		if ((tp->t_rxtshift == 1 || tcp_sent_tlp_retrans(tp)) &&
++		    rxtime > 0) {
++			tdiff = (int32_t)(tcp_now - rxtime);
++			if (tdiff < bad_rexmt_win) {
++				return 1;
++			}
++		}
++	}
++	return 0;
+ }
+ 
+ /* bsd/netinet/tcp_recovery.c:369 */
+ void
+ tcp_restore_on_spurious_rxmt(struct tcpcb * tp, struct tcphdr * th)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_restore_on_spurious_rxmt");
++	if (TSTMP_SUPPORTED(tp)) {
++		u_int32_t fsize, acked;
++		fsize = tp->snd_max - th->th_ack;
++		acked = BYTES_ACKED(th, tp);
++
++		/*
++		 * Implement bad retransmit recovery as
++		 * described in RFC 4015.
++		 */
++		tp->snd_ssthresh = tp->snd_ssthresh_prev;
++
++		/* Initialize cwnd to the initial window */
++		if (CC_ALGO(tp)->cwnd_init != NULL) {
++			CC_ALGO(tp)->cwnd_init(tp);
++		}
++
++		tp->snd_cwnd = fsize + min(acked, tp->snd_cwnd);
++	} else {
++		tp->snd_cwnd = tp->snd_cwnd_prev;
++		tp->snd_ssthresh = tp->snd_ssthresh_prev;
++		if (tp->t_flags & TF_WASFRECOVERY) {
++			ENTER_FASTRECOVERY(tp);
++		}
++
++		/* Do not use the loss flight size in this case */
++		tp->t_lossflightsize = 0;
++	}
++	tp->snd_cwnd = max(tp->snd_cwnd, tcp_initial_cwnd(tp));
++	tp->snd_recover = tp->snd_recover_prev;
++	tp->snd_nxt = tp->snd_max;
++
++	/* Fix send socket buffer to reflect the change in cwnd */
++	tcp_bad_rexmt_fix_sndbuf(tp);
++
++	/* Restore rack related state */
++	if (TCP_RACK_ENABLED(tp)) {
++		tcp_rack_bad_rexmt_restore(tp);
++	}
++
++	/*
++	 * This RTT might reflect the extra delay induced
++	 * by the network. Skip using this sample for RTO
++	 * calculation and mark the connection so we can
++	 * recompute RTT when the next eligible sample is
++	 * found.
++	 */
++	tp->t_flagsext |= TF_RECOMPUTE_RTT;
++	tp->t_badrexmt_time = tcp_now;
++	tp->t_rtttime = 0;
+ }
+ 
+ /* bsd/netinet/tcp_recovery.c:432 */
+ void
+ tcp_recovery_check_spurious_rxmt(struct tcpcb * tp, struct tcphdr * th, struct tcpopt * to)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_recovery_check_spurious_rxmt");
++	if (tp->t_rxtshift > 0 &&
++	    tcp_detect_spurious_rxmt(tp, th, to, tp->t_rxtstart)) {
++		++tcpstat.tcps_sndrexmitbad;
++		tcp_restore_on_spurious_rxmt(tp, th);
++		tcp_ccdbg_trace(tp, th, TCP_CC_BAD_REXMT_RECOVERY);
++	} else if (tcp_sent_tlp_retrans(tp) && tp->t_tlphighrxt > 0 &&
++	    SEQ_GEQ(th->th_ack, tp->t_tlphighrxt) &&
++	    !tcp_detect_spurious_rxmt(tp, th, to, tp->t_tlpstart)) {
++		/*
++		 * The tail loss probe recovered the last packet and
++		 * we need to adjust the congestion window to take
++		 * this loss into account.
++		 * No need to update rack.reo_wnd_persist for a TLP recovery
++		 */
++		++tcpstat.tcps_tlp_recoverlastpkt;
++		if (!IN_FASTRECOVERY(tp)) {
++			tcp_enter_fast_recovery(tp);
++			EXIT_FASTRECOVERY(tp);
++		}
++		tcp_ccdbg_trace(tp, th, TCP_CC_TLP_RECOVER_LASTPACKET);
++	} else if (tcp_rxtseg_detect_bad_rexmt(tp, th->th_ack)) {
++		/*
++		 * All of the retransmitted segments were duplicated, this
++		 * can be an indication of bad fast retransmit.
++		 */
++		tcpstat.tcps_dsack_badrexmt++;
++		tcp_restore_on_spurious_rxmt(tp, th);
++		tcp_ccdbg_trace(tp, th, TCP_CC_DSACK_BAD_REXMT);
++		tcp_rxtseg_clean(tp);
++	}
++	tp->t_flagsext &= ~(TF_SENT_TLPROBE);
++	tp->t_tlphighrxt = 0;
++	tp->t_tlpstart = 0;
++
++	/*
++	 * Check if the latest ack was for a segment sent during PMTU
++	 * blackhole detection. If the timestamp on the ack is before
++	 * PMTU blackhole detection, then revert the size of the max
++	 * segment to previous size.
++	 */
++	if (tp->t_rxtshift > 0 && (tp->t_flags & TF_BLACKHOLE) &&
++	    tp->t_pmtud_start_ts > 0 && TSTMP_SUPPORTED(tp)) {
++		if ((to->to_flags & TOF_TS) && to->to_tsecr != 0 &&
++		    TSTMP_LT(to->to_tsecr, tp->t_pmtud_start_ts)) {
++			tcp_pmtud_revert_segment_size(tp);
++		}
++	}
++	if (tp->t_pmtud_start_ts > 0) {
++		tp->t_pmtud_start_ts = 0;
++	}
++
++	tp->t_pmtud_lastseg_size = 0;
+ }
+ 
+ /* bsd/netinet/tcp_recovery.c:501 */
+ void
+ tcp_recovery_can_early_rxmt(struct tcpcb * tp, struct tcphdr * th)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_recovery_can_early_rxmt");
++	u_int32_t obytes, snd_off;
++	int32_t snd_len;
++	struct socket *so = tp->t_inpcb->inp_socket;
++
++	if ((SACK_ENABLED(tp) || tp->t_early_rexmt_count < TCP_EARLY_REXMT_LIMIT) &&
++	    SEQ_GT(tp->snd_max, tp->snd_una) &&
++	    (tp->t_dupacks == 1 || (SACK_ENABLED(tp) && !TAILQ_EMPTY(&tp->snd_holes)))) {
++		/*
++		 * If there are only a few outstanding
++		 * segments on the connection, we might need
++		 * to lower the retransmit threshold. This
++		 * will allow us to do Early Retransmit as
++		 * described in RFC 5827.
++		 */
++		if (TCP_RACK_ENABLED(tp)) {
++			obytes = tcp_flight_size(tp);
++		} else if (SACK_ENABLED(tp) &&
++		    !TAILQ_EMPTY(&tp->snd_holes)) {
++			obytes = tcp_flight_size(tp);
++		} else {
++			obytes = (tp->snd_max - tp->snd_una);
++		}
++
++		/*
++		 * In order to lower retransmit threshold the
++		 * following two conditions must be met.
++		 * 1. the amount of outstanding data is less
++		 * than 4*SMSS bytes
++		 * 2. there is no unsent data ready for
++		 * transmission or the advertised window
++		 * will limit sending new segments.
++		 */
++		snd_off = tp->snd_max - tp->snd_una;
++		snd_len = min(so->so_snd.sb_cc, tp->snd_wnd) - snd_off;
++		if (obytes < (tp->t_maxseg << 2) &&
++		    snd_len <= 0) {
++			u_int32_t osegs;
++
++			osegs = obytes / tp->t_maxseg;
++			if ((osegs * tp->t_maxseg) < obytes) {
++				osegs++;
++			}
++
++			/*
++			 * By checking for early retransmit after
++			 * receiving some duplicate acks when SACK
++			 * is supported, the connection will
++			 * enter fast recovery even if multiple
++			 * segments are lost in the same window.
++			 */
++			if (osegs < 4) {
++				tp->t_rexmtthresh =
++				    ((osegs - 1) > 1) ? ((uint8_t)osegs - 1) : 1;
++				tp->t_rexmtthresh =
++				    MIN(tp->t_rexmtthresh, tcprexmtthresh);
++				tp->t_rexmtthresh =
++				    MAX(tp->t_rexmtthresh,
++				    tp->t_dupacks > UINT8_MAX ? UINT8_MAX : (uint8_t)tp->t_dupacks);
++
++				if (tp->t_early_rexmt_count == 0) {
++					tp->t_early_rexmt_win = tcp_now;
++				}
++
++				if (tp->t_flagsext & TF_SENT_TLPROBE) {
++					tcpstat.tcps_tlp_recovery++;
++					tcp_ccdbg_trace(tp, th,
++					    TCP_CC_TLP_RECOVERY);
++				} else {
++					tcpstat.tcps_early_rexmt++;
++					tp->t_early_rexmt_count++;
++					tcp_ccdbg_trace(tp, th,
++					    TCP_CC_EARLY_RETRANSMIT);
++				}
++			}
++		}
++	}
++
++	/*
++	 * If we ever sent a TLP probe, the acknowledgement will trigger
++	 * early retransmit because the value of snd_fack will be close
++	 * to snd_max. This will take care of adjustments to the
++	 * congestion window. So we can reset TF_SENT_PROBE flag.
++	 */
++	tp->t_flagsext &= ~(TF_SENT_TLPROBE);
++	tp->t_tlphighrxt = 0;
++	tp->t_tlpstart = 0;
+ }
+ 
+ /* bsd/netinet/tcp_recovery.c:596 */

@@ -9,7 +9,7 @@ Apply in numeric order from a clean checkout:
 
 ```
 git checkout xnu-12377.121.6
-git am 0001-*.patch ... 0025-*.patch
+git am 0001-*.patch ... 0028-*.patch
 ```
 
 Contents:
@@ -36,6 +36,9 @@ Contents:
    the 13432-only `TE_SEND_ECT1` branch.
 24. The TCP Fast Open translation unit and its crypto context.
 25. The `tcp_seg_sent` RB tree generator (`RB_GENERATE`).
+26. The spurious/early retransmit recovery paths in `tcp_recovery.c`.
+27. The RTT helpers and `tcp_compute_rxmit_time` in `tcp_rtt.c`.
+28. The RBBR phase transitions and cruise backoff.
 
 The patches contain only public xnu text plus original reconstruction;
 no Apple binary, dSYM, SDK payload or extracted proprietary header is

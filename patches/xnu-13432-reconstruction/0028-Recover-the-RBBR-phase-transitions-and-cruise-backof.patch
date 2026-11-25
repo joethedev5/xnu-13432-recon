@@ -1,0 +1,185 @@
+From 46deb5a695e6a5e7e253504ec6ac32a81009e5be Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 03:13:45 +0000
+Subject: [PATCH 28/28] Recover the RBBR phase transitions and cruise backoff
+
+Three tcp_rbbr.c bodies from the reference disassembly:
+
+- rbbr_apply_cruise_backoff: shrink rwnd_est by rbbr_cruise_backoff
+  percent, floor it at the probe MSS minimum, recompute the advertised
+  window and count the backoff.
+- rbbr_enter_probe_rwnd: reset the cycle counters and either keep
+  rwnd_est for a reprobe (gain clamped at the minimum) or apply
+  rbbr_probe_rwnd_init_gain before recomputing the window.
+- rbbr_enter_cruise: reset the phase/cycle and sawtooth state,
+  restore the minimum rwnd_est and recompute the window.
+
+All three reproduce the reference's window rounding
+(ceil(rwnd_est/mss)*mss) and the 0xffff << rcv_scale clamp.
+
+Remaining explicit stubs: 215.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ bsd/netinet/tcp_rbbr.c | 135 +++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 129 insertions(+), 6 deletions(-)
+
+diff --git a/bsd/netinet/tcp_rbbr.c b/bsd/netinet/tcp_rbbr.c
+index 7a28361f6..a1ca57252 100644
+--- a/bsd/netinet/tcp_rbbr.c
++++ b/bsd/netinet/tcp_rbbr.c
+@@ -326,8 +326,37 @@ rbbr_sender_utilizing_rwnd(struct tcpcb * tp)
+ void
+ rbbr_apply_cruise_backoff(struct tcpcb * tp)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: rbbr_apply_cruise_backoff");
++	struct tcp_rbbr_state *rbbr = tp->t_rbbr_state;
++
++	if (rbbr->cruise_backoff_count < (uint8_t)rbbr_cruise_backoff_times) {
++		uint32_t old_win = rbbr->win;
++
++		rbbr->rwnd_est = (uint32_t)(((uint64_t)rbbr_cruise_backoff *
++		    rbbr->rwnd_est) / 100);
++		if (rbbr->rwnd_est <
++		    (uint32_t)tp->t_maxseg * rbbr_rtt_probe_rwnd_mss) {
++			rbbr->rwnd_est =
++			    (uint32_t)tp->t_maxseg * rbbr_rtt_probe_rwnd_mss;
++		}
++		rbbr->win = ((rbbr->rwnd_est + (tp->t_maxseg >> 1)) /
++		    tp->t_maxseg) * tp->t_maxseg;
++		if (rbbr->win > (0xffffu << tp->rcv_scale)) {
++			rbbr->win = 0xffffu << tp->rcv_scale;
++		}
++		rbbr->win_change_pending = 1;
++		rbbr->cruise_backoff_count++;
++		rbbr->cruise_backed_off = 1;
++
++		if (tcp_is_log_enabled(tp, TLEF_LOG)) {
++			tcp_log_bbr("rbbr_apply_cruise_backoff", 877, tp,
++			    "rbbr: CRUISE backoff old_win=%u new_win=%u "
++			    "backoff_count=%u median_rtt=%u rtt_mad=%u "
++			    "delay_threshold=%u",
++			    old_win, rbbr->win, rbbr->cruise_backoff_count,
++			    rbbr->median_rtt, rbbr->rtt_mad,
++			    rbbr->delay_threshold);
++		}
++	}
+ }
+ 
+ /* bsd/netinet/tcp_rbbr.c:889 */
+@@ -366,16 +395,110 @@ rbbr_enter_probe_rtt(struct tcpcb * tp, uint32_t now)
+ void
+ rbbr_enter_probe_rwnd(struct tcpcb * tp, uint32_t now, _Bool reprobe)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: rbbr_enter_probe_rwnd");
++	struct tcp_rbbr_state *rbbr = tp->t_rbbr_state;
++	int line;
++
++	rbbr->phase = 1; /* PROBE_RWND */
++	rbbr->phase_start_ts = now;
++	rbbr->cycle_start_ts = now;
++	rbbr->rtt_sample_count = 0;
++	rbbr->rtt_sample_idx = 0;
++	rbbr->rtt_sorted = 0;
++	rbbr->cycle_bytes_rcvd = 0;
++	rbbr->cycle_measure_ts = 0;
++
++	if (reprobe) {
++		uint32_t target;
++
++		rbbr->reprobe_active = 1;
++		rbbr->probe_rwnd_cycle = 1;
++		target = (uint32_t)(((uint64_t)rbbr_reprobe_gain *
++		    rbbr->rwnd_est) / 100);
++		if (target <
++		    (uint32_t)tp->t_maxseg * rbbr_rtt_probe_rwnd_mss) {
++			target =
++			    (uint32_t)tp->t_maxseg * rbbr_rtt_probe_rwnd_mss;
++		}
++		rbbr->win = ((target + (tp->t_maxseg >> 1)) /
++		    tp->t_maxseg) * tp->t_maxseg;
++		if (rbbr->win > (0xffffu << tp->rcv_scale)) {
++			rbbr->win = 0xffffu << tp->rcv_scale;
++		}
++		rbbr->win_change_pending = 1;
++		line = 1123;
++	} else {
++		rbbr->reprobe_active = 0;
++		rbbr->probe_rwnd_cycle = 0;
++		rbbr->rwnd_est = (uint32_t)(((uint64_t)rbbr_probe_rwnd_init_gain *
++		    rbbr->rwnd_est) / 100);
++		if (rbbr->rwnd_est <
++		    (uint32_t)tp->t_maxseg * rbbr_rtt_probe_rwnd_mss) {
++			rbbr->rwnd_est =
++			    (uint32_t)tp->t_maxseg * rbbr_rtt_probe_rwnd_mss;
++		}
++		rbbr->win = ((rbbr->rwnd_est + (tp->t_maxseg >> 1)) /
++		    tp->t_maxseg) * tp->t_maxseg;
++		if (rbbr->win > (0xffffu << tp->rcv_scale)) {
++			rbbr->win = 0xffffu << tp->rcv_scale;
++		}
++		rbbr->win_change_pending = 1;
++		line = 1145;
++	}
++
++	if (tcp_is_log_enabled(tp, TLEF_LOG)) {
++		tcp_log_bbr("rbbr_enter_probe_rwnd", line, tp,
++		    reprobe ?
++		    "rbbr: enter PROBE_RWND reprobe win=%u rwnd_est=%u "
++		    "delay_thresh=%u median_rtt=%u rtt_mad=%u" :
++		    "rbbr: enter PROBE_RWND win=%u rwnd_est=%u "
++		    "delay_thresh=%u median_rtt=%u rtt_mad=%u",
++		    rbbr->win, rbbr->rwnd_est, rbbr->delay_threshold,
++		    rbbr->median_rtt, rbbr->rtt_mad);
++	}
+ }
+ 
+ /* bsd/netinet/tcp_rbbr.c:1161 */
+ void
+ rbbr_enter_cruise(struct tcpcb * tp, uint32_t now)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: rbbr_enter_cruise");
++	struct tcp_rbbr_state *rbbr = tp->t_rbbr_state;
++
++	rbbr->phase = 2; /* CRUISE */
++	rbbr->phase_start_ts = now;
++	rbbr->cycle_start_ts = now;
++	rbbr->rtt_sample_count = 0;
++	rbbr->rtt_sample_idx = 0;
++	rbbr->rtt_sorted = 0;
++	rbbr->cycle_bytes_rcvd = 0;
++	rbbr->cycle_measure_ts = 0;
++	rbbr->prev_cruise_median = 0;
++	rbbr->total_cruise_cycles = 0;
++	rbbr->sawtooth_cycles = 0;
++	rbbr->current_chain_length = 0;
++	rbbr->queue_competition_detected = 0;
++
++	if (rbbr->rwnd_est <
++	    (uint32_t)tp->t_maxseg * rbbr_rtt_probe_rwnd_mss) {
++		rbbr->rwnd_est =
++		    (uint32_t)tp->t_maxseg * rbbr_rtt_probe_rwnd_mss;
++	}
++	rbbr->win = ((rbbr->rwnd_est + (tp->t_maxseg >> 1)) /
++	    tp->t_maxseg) * tp->t_maxseg;
++	if (rbbr->win > (0xffffu << tp->rcv_scale)) {
++		rbbr->win = 0xffffu << tp->rcv_scale;
++	}
++	rbbr->win_change_pending = 1;
++	rbbr->cruise_backed_off = 0;
++	rbbr->cruise_action_count = 0;
++
++	if (tcp_is_log_enabled(tp, TLEF_LOG)) {
++		tcp_log_bbr("rbbr_enter_cruise", 1189, tp,
++		    "rbbr: enter CRUISE win=%u rwnd_est=%u median_rtt=%u "
++		    "rtt_mad=%u delay_thresh=%u backoff_count=%u",
++		    rbbr->win, rbbr->rwnd_est, rbbr->median_rtt,
++		    rbbr->rtt_mad, rbbr->delay_threshold,
++		    rbbr->cruise_backoff_count);
++	}
+ }
+ 
+ /* bsd/netinet/tcp_rbbr.c:1210 */

@@ -1,0 +1,359 @@
+From bd119675c9c051be7c74dd6d55a6dc0fbe1d7a03 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 03:13:03 +0000
+Subject: [PATCH 27/28] Reconstruct the TCP RTT translation unit
+
+Recover the four tcp_rtt.c stubs from the public RTT helpers, verified
+against the reference decompilation:
+
+- tcp_get_base_rtt: route rtt_min lookup.
+- tcp_update_curr_rtt: 4-entry current-RTT history minimum
+  (NCURR_RTT_HIST = 4 in the reference).
+- tcp_update_base_rtt: the per-route 10-entry (NRTT_HIST = 10),
+  60-second RTT history, including the spin-locked expiry path.
+- tcp_compute_rxmit_time: the renamed tcp_xmit_timer, with the
+  RFC 4015 recompute branch, TCPT_RANGESET, pacer update and RTT
+  logging.
+
+The already-recovered tcp_compute_rtt/tcp_compute_rcv_rtt bodies now
+call the 13432 names instead of the public tcp_xmit_timer and
+update_base_rtt.
+
+Remaining explicit stubs: 218.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ bsd/netinet/tcp_rtt.c | 281 ++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 270 insertions(+), 11 deletions(-)
+
+diff --git a/bsd/netinet/tcp_rtt.c b/bsd/netinet/tcp_rtt.c
+index 209e15a13..a54bcebbc 100644
+--- a/bsd/netinet/tcp_rtt.c
++++ b/bsd/netinet/tcp_rtt.c
+@@ -10,6 +10,12 @@
+ #include <sys/systm.h>
+ #include <sys/kernel.h>
+ #include <netinet/tcp_rtt.h>
++#include <net/route.h>
++#include <net/ntstat.h>
++#include <netinet/tcp_var.h>
++#include <netinet/tcp_cc.h>
++#include <netinet/tcp_log.h>
++#include <netinet/tcp_pacing.h>
+ 
+ #define RECON_BSD_NETINET_TCP_RTT_C 1
+ 
+@@ -17,24 +23,114 @@
+ uint32_t
+ tcp_get_base_rtt(struct tcpcb * tp)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_get_base_rtt");
++	struct rtentry *rt = tp->t_inpcb->inp_route.ro_rt;
++	return (rt == NULL) ? 0 : rt->rtt_min;
+ }
+ 
+ /* bsd/netinet/tcp_rtt.c:98 */
+ void
+ tcp_update_curr_rtt(struct tcpcb * tp, uint32_t rtt)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_update_curr_rtt");
++	tp->curr_rtt_index = (tp->curr_rtt_index + 1) % NCURR_RTT_HIST;
++	tp->curr_rtt_hist[tp->curr_rtt_index] = rtt;
++
++	/* forget the old value and update minimum */
++	tp->curr_rtt_min = 0;
++	for (int i = 0; i < NCURR_RTT_HIST; ++i) {
++		if (tp->curr_rtt_hist[i] != 0 && (tp->curr_rtt_min == 0 ||
++		    tp->curr_rtt_hist[i] < tp->curr_rtt_min)) {
++			tp->curr_rtt_min = tp->curr_rtt_hist[i];
++		}
++	}
+ }
+ 
+ /* bsd/netinet/tcp_rtt.c:117 */
+ void
+ tcp_update_base_rtt(struct tcpcb * tp, uint32_t rtt)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_update_base_rtt");
++	u_int32_t base_rtt, i;
++	struct rtentry *rt;
++
++	if ((rt = tp->t_inpcb->inp_route.ro_rt) == NULL) {
++		return;
++	}
++	if (rt->rtt_expire_ts == 0) {
++		RT_LOCK_SPIN(rt);
++		if (rt->rtt_expire_ts != 0) {
++			RT_UNLOCK(rt);
++			goto update;
++		}
++		rt->rtt_expire_ts = tcp_now;
++		rt->rtt_index = 0;
++		rt->rtt_hist[0] = rtt;
++		rt->rtt_min = rtt;
++		RT_UNLOCK(rt);
++
++		tp->curr_rtt_index = 0;
++		tp->curr_rtt_hist[0] = rtt;
++		tp->curr_rtt_min = rtt;
++		return;
++	}
++update:
++#if TRAFFIC_MGT
++	/*
++	 * If the recv side is being throttled, check if the
++	 * current RTT is closer to the base RTT seen in
++	 * first (recent) two slots. If so, unthrottle the stream.
++	 */
++	if ((tp->t_flagsext & TF_RECV_THROTTLE) &&
++	    (int)(tcp_now - tp->t_recv_throttle_ts) >= TCP_RECV_THROTTLE_WIN) {
++		base_rtt = rt->rtt_min;
++		if (tp->t_rttcur <= (base_rtt + target_qdelay)) {
++			tp->t_flagsext &= ~TF_RECV_THROTTLE;
++			tp->t_recv_throttle_ts = 0;
++		}
++	}
++#endif /* TRAFFIC_MGT */
++
++	/* Update the next current RTT sample */
++	tcp_update_curr_rtt(tp, rtt);
++
++	if ((int)(tcp_now - rt->rtt_expire_ts) >=
++	    TCP_RTT_HISTORY_EXPIRE_TIME) {
++		RT_LOCK_SPIN(rt);
++		/* check the condition again to avoid race */
++		if ((int)(tcp_now - rt->rtt_expire_ts) >=
++		    TCP_RTT_HISTORY_EXPIRE_TIME) {
++			/* Set the base rtt to 0 for idle periods */
++			uint32_t times = MIN((tcp_now - rt->rtt_expire_ts) /
++			    TCP_RTT_HISTORY_EXPIRE_TIME, NRTT_HIST + 1);
++
++			for (i = rt->rtt_index + 1; i < rt->rtt_index + times; i++) {
++				rt->rtt_hist[i % NRTT_HIST] = 0;
++			}
++
++			rt->rtt_index = i % NRTT_HIST;
++			rt->rtt_hist[rt->rtt_index] = rtt;
++			rt->rtt_expire_ts = tcp_now;
++		} else {
++			rt->rtt_hist[rt->rtt_index] =
++			    min(rt->rtt_hist[rt->rtt_index], rtt);
++		}
++		/* forget the old value and update minimum */
++		rt->rtt_min = 0;
++		for (i = 0; i < NRTT_HIST; ++i) {
++			if (rt->rtt_hist[i] != 0 &&
++			    (rt->rtt_min == 0 ||
++			    rt->rtt_hist[i] < rt->rtt_min)) {
++				rt->rtt_min = rt->rtt_hist[i];
++			}
++		}
++		RT_UNLOCK(rt);
++	} else {
++		rt->rtt_hist[rt->rtt_index] =
++		    min(rt->rtt_hist[rt->rtt_index], rtt);
++		if (rt->rtt_min == 0) {
++			rt->rtt_min = rtt;
++		} else {
++			rt->rtt_min = min(rt->rtt_min, rtt);
++		}
++	}
+ }
+ 
+ /* bsd/netinet/tcp_rtt.c:201 */
+@@ -76,10 +172,10 @@ tcp_compute_rtt(struct tcpcb *tp, struct tcpopt *to, struct tcphdr *th)
+ 	if (((to->to_flags & TOF_TS) != 0) &&
+ 	    (to->to_tsecr != 0) &&
+ 	    TSTMP_GEQ(tcp_now, to->to_tsecr)) {
+-		tcp_xmit_timer(tp, (tcp_now - to->to_tsecr),
++		tcp_compute_rxmit_time(tp, (tcp_now - to->to_tsecr),
+ 		    to->to_tsecr, th->th_ack);
+ 	} else if (rtt > 0) {
+-		tcp_xmit_timer(tp, rtt, 0, th->th_ack);
++		tcp_compute_rxmit_time(tp, rtt, 0, th->th_ack);
+ 	}
+ }
+ 
+@@ -151,13 +247,176 @@ tcp_compute_rcv_rtt(struct tcpcb *tp, struct tcpopt *to, struct tcphdr *th)
+ 	 * a high RTT due to the receiver.
+ 	 */
+ 	tp->t_rttcur = rtt;
+-	update_base_rtt(tp, rtt);
++	tcp_update_base_rtt(tp, rtt);
+ }
+ 
+ /* bsd/netinet/tcp_rtt.c:320 */
+ void
+ tcp_compute_rxmit_time(struct tcpcb * tp, int rtt, u_int32_t tsecr, tcp_seq th_ack)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_compute_rxmit_time");
++	VERIFY(rtt >= 0);
++	int delta;
++	int old_srtt = tp->t_srtt;
++	int old_rttvar = tp->t_rttvar;
++	bool log_rtt = false;
++
++	if (rtt == 0) {
++		/*
++		 * As rtt has millisecond precision,
++		 * make adjustment for sub ms RTT
++		 */
++		rtt = 1;
++	}
++
++	if (rtt > 4 * TCPTV_MSL) {
++		TCP_LOG(tp, "%s: rtt is %d - maxing it at 4 x MSL\n", __func__, rtt);
++		/*
++		 * We compute RTT either based on the time-to-ACK a packet,
++		 * if TSval is disabled or based on the TSecr value.
++		 * If there is a middlebox messing up the TSecr value, we can
++		 * end up having HUGE rtt values, causing all kinds of problems.
++		 * Let's protect against this by capping RTT to 4*MSL
++		 * (60seconds).
++		 */
++		rtt = 4 * TCPTV_MSL;
++	}
++
++	/*
++	 * On AWDL interface, the initial RTT measurement on SYN
++	 * can be wrong due to peer caching. Avoid the first RTT
++	 * measurement as it might skew up the RTO.
++	 * <rdar://problem/28739046>
++	 */
++	if (tp->t_inpcb->inp_last_outifp != NULL &&
++	    (tp->t_inpcb->inp_last_outifp->if_eflags & IFEF_AWDL) &&
++	    th_ack == tp->iss + 1) {
++		return;
++	}
++
++	if (tp->t_flagsext & TF_RECOMPUTE_RTT) {
++		if (SEQ_GT(th_ack, tp->snd_una) &&
++		    SEQ_LEQ(th_ack, tp->snd_max) &&
++		    (tsecr == 0 ||
++		    TSTMP_GEQ(tsecr, tp->t_badrexmt_time))) {
++			/*
++			 * We received a new ACK after a
++			 * spurious timeout. Adapt retransmission
++			 * timer as described in rfc 4015.
++			 */
++			tp->t_flagsext &= ~(TF_RECOMPUTE_RTT);
++			tp->t_badrexmt_time = 0;
++			tp->t_srtt = max(tp->t_srtt_prev, rtt);
++			tp->t_srtt = tp->t_srtt << TCP_RTT_SHIFT;
++			tp->t_rttvar = max(tp->t_rttvar_prev, (rtt >> 1));
++			tp->t_rttvar = tp->t_rttvar << TCP_RTTVAR_SHIFT;
++
++			if (tp->t_rttbest > (tp->t_srtt + tp->t_rttvar)) {
++				tp->t_rttbest = tp->t_srtt + tp->t_rttvar;
++			}
++
++			goto compute_rto;
++		} else {
++			return;
++		}
++	}
++
++	tcpstat.tcps_rttupdated++;
++	tp->t_rttupdated++;
++
++	tp->t_rttcur = rtt;
++	tcp_update_base_rtt(tp, rtt);
++
++	if (tp->t_srtt != 0) {
++		/*
++		 * srtt is stored as fixed point with 5 bits after the
++		 * binary point (i.e., scaled by 32).  The following magic
++		 * is equivalent to the smoothing algorithm in rfc793 with
++		 * an alpha of .875 (srtt = rtt/8 + srtt*7/8 in fixed
++		 * point).
++		 *
++		 * Freebsd adjusts rtt to origin 0 by subtracting 1
++		 * from the provided rtt value. This was required because
++		 * of the way t_rtttime was initiailised to 1 before.
++		 * Since we changed t_rtttime to be based on
++		 * tcp_now, this extra adjustment is not needed.
++		 */
++		delta = (rtt << TCP_DELTA_SHIFT)
++		    - (tp->t_srtt >> (TCP_RTT_SHIFT - TCP_DELTA_SHIFT));
++
++		if ((tp->t_srtt += delta) <= 0) {
++			tp->t_srtt = 1;
++		}
++
++		/*
++		 * We accumulate a smoothed rtt variance (actually, a
++		 * smoothed mean difference), then set the retransmit
++		 * timer to smoothed rtt + 4 times the smoothed variance.
++		 * rttvar is stored as fixed point with 4 bits after the
++		 * binary point (scaled by 16).  The following is
++		 * equivalent to rfc793 smoothing with an alpha of .75
++		 * (rttvar = rttvar*3/4 + |delta| / 4).  This replaces
++		 * rfc793's wired-in beta.
++		 */
++		if (delta < 0) {
++			delta = -delta;
++		}
++		delta -= tp->t_rttvar >> (TCP_RTTVAR_SHIFT - TCP_DELTA_SHIFT);
++		if ((tp->t_rttvar += delta) <= 0) {
++			tp->t_rttvar = 1;
++		}
++		if (tp->t_rttbest == 0 ||
++		    tp->t_rttbest > (tp->t_srtt + tp->t_rttvar)) {
++			tp->t_rttbest = tp->t_srtt + tp->t_rttvar;
++		}
++	} else {
++		/*
++		 * No rtt measurement yet - use the unsmoothed rtt.
++		 * Set the variance to half the rtt (so our first
++		 * retransmit happens at 3*rtt).
++		 */
++		tp->t_srtt = rtt << TCP_RTT_SHIFT;
++		tp->t_rttvar = rtt << (TCP_RTTVAR_SHIFT - 1);
++		tp->t_rttbest = tp->t_srtt + tp->t_rttvar;
++
++		/* Initialize the receive SRTT */
++		if (tp->rcv_srtt == 0) {
++			tp->rcv_srtt = tp->t_srtt;
++		}
++	}
++
++compute_rto:
++	nstat_route_rtt(tp->t_inpcb->inp_route.ro_rt, tp->t_srtt,
++	    tp->t_rttvar);
++
++	/*
++	 * the retransmit should happen at rtt + 4 * rttvar.
++	 * Because of the way we do the smoothing, srtt and rttvar
++	 * will each average +1/2 tick of bias.  When we compute
++	 * the retransmit timer, we want 1/2 tick of rounding and
++	 * 1 extra tick because of +-1/2 tick uncertainty in the
++	 * firing of the timer.  The bias will give us exactly the
++	 * 1.5 tick we need.  But, because the bias is
++	 * statistical, we have to test that we don't drop below
++	 * the minimum feasible timer (which is 2 ticks).
++	 */
++	TCPT_RANGESET(tp->t_rxtcur, TCP_REXMTVAL(tp),
++	    max(tp->t_rttmin, rtt + 2), TCPTV_REXMTMAX,
++	    TCP_ADD_REXMTSLOP(tp));
++
++	/*
++	 * We received an ack for a packet that wasn't retransmitted;
++	 * it is probably safe to discard any error indications we've
++	 * received recently.  This isn't quite right, but close enough
++	 * for now (a route might have failed after we sent a segment,
++	 * and the return path might not be symmetrical).
++	 */
++	tp->t_softerror = 0;
++
++	if (log_rtt) {
++		TCP_LOG_RTT_INFO(tp);
++	}
++
++	tcp_update_pacer_state(tp);
++
++	TCP_LOG_RTT_CHANGE(tp, old_srtt, old_rttvar);
+ }
