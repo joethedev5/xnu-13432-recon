@@ -520,3 +520,39 @@ to `prr.out` in tcp_output; those two existing-file edits still need
 their exact source positions pinned down.
 
 The patch series now has 33 entries; 183 explicit stubs remain.
+
+## 2026-11-25: TCP reassembly, options relocation and TFO linkage
+
+`tcp_reassembly.c` is a new translation unit in the reference; all seven
+of its functions are `DW_AT_external`, and three of them had no recovered
+body.  `tcp_reass_create_qent` (line 451) allocates through
+`tcp_reass_qent_alloc`, bumps `t_reassqlen` and the atomic
+`tcp_reass_total_qlen`, accounts the mbuf chain through
+`m_chain_capacity`/`tcp_memacct_add`, and stores `tqe_th`, `tqe_m` and
+`tqe_len`.  `tcp_reass_destroy_qent` (line 477) mirrors that accounting,
+decrements the queue counters (the reference emits one 2-lane vector
+subtract for `t_reassqlen`/`t_reassq_mbcnt`), releases the zone entry and
+returns the mbuf chain.  `tcp_reassq_free` (line 494) walks
+`LIST_FIRST(&tp->t_segq)`, removes each entry, destroys it and frees the
+chain.  The old public names `tcp_create_reass_qent`,
+`tcp_destroy_reass_qent` and `tcp_free_reassq` do not exist in 13432, so
+the tcp_subr.c wrappers were deleted and `tcp_close` now calls
+`tcp_reassq_free` directly (reference tcp_subr.c:1689).
+
+The public `tcp_dooptions` is the reference `tcp_process_options` at
+tcp_options.c:79 (1056 bytes); `tcp_finalize_options` (line 218) and
+`tcp_addoptions` (line 268) share that unit.  All three are external in
+the DWARF, so the tcp_input.c static copy and prototypes were removed,
+tcp_input.c and tcp_handshake.c now call `tcp_process_options`, and
+tcp_var.h declares the three functions.
+
+All fourteen functions of tcp_fastopen.c are external in the reference;
+the public copies still present in tcp_output.c (`tcp_tfo_check`,
+`tcp_tfo_write_cookie_rep`, `tcp_tfo_write_cookie`), tcp_subr.c
+(`tcp_tfo_init` and the TFO crypto context) and the static qualifiers in
+tcp_fastopen.c were removed, and `tcp_fastopen.h` now declares the TFO
+entry points.  `tcp_tfo_check`/`tcp_tfo_write_cookie*` and
+`tcp_tfo_init` were the last duplicate function definitions in the TCP
+subsystem.
+
+The patch series now has 35 entries; 175 explicit stubs remain.

@@ -1,7 +1,7 @@
 From 41c0afc957274a0c9db8f193dc6ec9172fdb9aaa Mon Sep 17 00:00:00 2001
 From: joethedev5 <deepsbx1@proton.me>
 Date: Wed, 25 Nov 2026 03:48:04 +0000
-Subject: [PATCH 33/33] Reconstruct the TCP PRR translation unit
+Subject: [PATCH 33/35] Reconstruct the TCP PRR translation unit
 
 Add the missing struct tcp_prr to tcpcb at offset 1384 (delivered,
 out, recover_fs, sack_bytes_prev, dupacks), restoring the reference's

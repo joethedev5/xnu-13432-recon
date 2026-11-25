@@ -1,0 +1,1061 @@
+From b3cd14afd42aa95f19874e3ae63c5ee95f5a3e01 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 04:00:15 +0000
+Subject: [PATCH 35/35] Reconstruct the TCP reassembly helpers and finish the
+ options relocation
+
+Recover tcp_reass_create_qent, tcp_reass_destroy_qent, and
+tcp_reassq_free from the reference image: the zone allocation and
+mem_acct accounting, the atomic queue-length counter, the tcpcb queue
+counters, and the m_chain_capacity bookkeeping.  All tcp_reassembly.c
+functions are external in the reference DWARF, so drop the remaining
+static qualifiers, declare tcp_reass in tcp_var.h, and replace the
+public tcp_subr.c wrappers with the reference tcp_reassq_free call in
+tcp_close.
+
+The reference's tcp_process_options is the public tcp_dooptions body
+relocated to tcp_options.c.  Route the tcp_input.c and tcp_handshake.c
+callers to it, drop the static tcp_input.c copy, and make
+tcp_finalize_options and tcp_addoptions external like their DWARF
+entries.
+
+The TFO helpers are external functions of tcp_fastopen.c in the
+reference.  Remove the duplicate static definitions left in
+tcp_output.c and tcp_subr.c, drop the unused tcp_subr.c TFO crypto
+context, and declare the TFO entry points in tcp_fastopen.h.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ bsd/netinet/tcp_fastopen.c   |  14 +--
+ bsd/netinet/tcp_fastopen.h   |  29 ++++++
+ bsd/netinet/tcp_handshake.c  |   8 +-
+ bsd/netinet/tcp_includes.h   |   1 +
+ bsd/netinet/tcp_input.c      | 151 +------------------------------
+ bsd/netinet/tcp_options.c    | 143 +++++++++++++++++++++++++++++-
+ bsd/netinet/tcp_output.c     | 167 -----------------------------------
+ bsd/netinet/tcp_reassembly.c |  87 ++++++++++++++----
+ bsd/netinet/tcp_subr.c       |  70 +--------------
+ bsd/netinet/tcp_var.h        |  14 ++-
+ 10 files changed, 265 insertions(+), 419 deletions(-)
+
+diff --git a/bsd/netinet/tcp_fastopen.c b/bsd/netinet/tcp_fastopen.c
+index 5751ec602..d2210a92a 100644
+--- a/bsd/netinet/tcp_fastopen.c
++++ b/bsd/netinet/tcp_fastopen.c
+@@ -23,7 +23,7 @@
+ static aes_encrypt_ctx tfo_ctx; /* Crypto-context for TFO */
+ 
+ /* bsd/netinet/tcp_fastopen.c:103 */
+-static void
++void
+ tcp_tfo_gen_cookie(struct inpcb *inp, u_char *out __sized_by(blk_size), size_t blk_size)
+ {
+ 	u_char in[CCAES_BLOCK_SIZE];
+@@ -101,7 +101,7 @@ tcp_tfo_process_synack(struct tcpcb * tp, struct tcpopt * to)
+ 
+ 		/*
+ 		 * If this happens, things have gone terribly wrong. len should
+-		 * have been checked in tcp_dooptions.
++		 * have been checked in tcp_process_options.
+ 		 */
+ 		VERIFY(len <= TFO_COOKIE_LEN_MAX);
+ 
+@@ -177,7 +177,7 @@ tcp_tfo_process_last_ack(struct tcpcb * tp, uint8_t * isconnected)
+ }
+ 
+ /* bsd/netinet/tcp_fastopen.c:252 */
+-static void
++void
+ tcp_tfo_rcv_probe(struct tcpcb *tp, int tlen)
+ {
+ 	if (tlen != 0) {
+@@ -194,7 +194,7 @@ tcp_tfo_rcv_probe(struct tcpcb *tp, int tlen)
+ }
+ 
+ /* bsd/netinet/tcp_fastopen.c:268 */
+-static void
++void
+ tcp_tfo_rcv_data(struct tcpcb *tp)
+ {
+ 	/* Transition from PROBING to NONE as data has been received */
+@@ -204,7 +204,7 @@ tcp_tfo_rcv_data(struct tcpcb *tp)
+ }
+ 
+ /* bsd/netinet/tcp_fastopen.c:277 */
+-static void
++void
+ tcp_tfo_rcv_ack(struct tcpcb *tp, struct tcphdr *th)
+ {
+ 	if (tp->t_tfo_probe_state == TFO_PROBE_PROBING &&
+@@ -391,14 +391,14 @@ tcp_tfo_init(void)
+ }
+ 
+ /* bsd/netinet/tcp_fastopen.c:467 */
+-static void
++void
+ tcp_disable_tfo(struct tcpcb *tp)
+ {
+ 	tp->t_flagsext &= ~TF_FASTOPEN;
+ }
+ 
+ /* bsd/netinet/tcp_fastopen.c:473 */
+-static __private_extern__ int
++__private_extern__ int
+ tcp_sysctl_fastopenkey(__unused struct sysctl_oid *oidp, __unused void *arg1,
+     __unused int arg2, struct sysctl_req *req)
+ {
+diff --git a/bsd/netinet/tcp_fastopen.h b/bsd/netinet/tcp_fastopen.h
+index 099fcf592..4d9e80e1a 100644
+--- a/bsd/netinet/tcp_fastopen.h
++++ b/bsd/netinet/tcp_fastopen.h
+@@ -7,5 +7,34 @@
+ #ifndef XNU13432_BSD_NETINET_TCP_FASTOPEN_H
+ #define XNU13432_BSD_NETINET_TCP_FASTOPEN_H
+ 
++#include <sys/types.h>
++
++struct inpcb;
++struct socket;
++struct sysctl_oid;
++struct sysctl_req;
++struct tcpcb;
++struct tcphdr;
++struct tcpopt;
++
++void tcp_tfo_gen_cookie(struct inpcb *inp,
++    u_char *out __sized_by(blk_size), size_t blk_size);
++boolean_t tcp_tfo_process_syn(struct tcpcb *tp, struct tcpopt *to);
++void tcp_tfo_process_synack(struct tcpcb *tp, struct tcpopt *to);
++void tcp_tfo_synack_faulty_middlebox(struct tcpcb *tp, struct socket *so,
++    struct tcphdr *th);
++void tcp_tfo_process_last_ack(struct tcpcb *tp, uint8_t *isconnected);
++void tcp_tfo_rcv_probe(struct tcpcb *tp, int tlen);
++void tcp_tfo_rcv_data(struct tcpcb *tp);
++void tcp_tfo_rcv_ack(struct tcpcb *tp, struct tcphdr *th);
++int32_t tcp_tfo_check(struct tcpcb *tp, int32_t len);
++unsigned int tcp_tfo_write_cookie_rep(struct tcpcb *tp, unsigned int optlen,
++    u_char *opt __counted_by(optlen + 2 + 8));
++unsigned int tcp_tfo_write_cookie(struct tcpcb *tp, unsigned int optlen,
++    int32_t len, u_char *opt __counted_by(40));
++void tcp_tfo_init(void);
++void tcp_disable_tfo(struct tcpcb *tp);
++__private_extern__ int tcp_sysctl_fastopenkey(struct sysctl_oid *oidp,
++    void *arg1, int arg2, struct sysctl_req *req);
+ 
+ #endif /* XNU13432_BSD_NETINET_TCP_FASTOPEN_H */
+diff --git a/bsd/netinet/tcp_handshake.c b/bsd/netinet/tcp_handshake.c
+index 23d33de6f..f881b9121 100644
+--- a/bsd/netinet/tcp_handshake.c
++++ b/bsd/netinet/tcp_handshake.c
+@@ -9,6 +9,8 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/kernel.h>
++#include <netinet/tcp_fastopen.h>
++#include <netinet/tcp_var.h>
+ 
+ #define RECON_BSD_NETINET_TCP_HANDSHAKE_C 1
+ 
+@@ -305,7 +307,7 @@ tcp_create_server_socket(struct tcp_inp *tpi, struct socket **so2,
+ 		if (tcp_can_send_syncookie(so, otp, th->th_flags)) {
+ 			ASSERT(tpi->to != NULL);
+ 
+-			tcp_dooptions(otp, tpi->optp, tpi->optlen, th, tpi->to);
++			tcp_process_options(otp, tpi->optp, tpi->optlen, th, tpi->to);
+ 			tcp_syncookie_syn(tpi, SA(&to2), SA(&from));
+ 			if (syn_cookie_sent) {
+ 				*syn_cookie_sent = true;
+@@ -329,7 +331,7 @@ tcp_create_server_socket(struct tcp_inp *tpi, struct socket **so2,
+ 			} else {
+ 				if (tcp_can_send_syncookie(so, otp, th->th_flags)) {
+ 					ASSERT(tpi->to != NULL);
+-					tcp_dooptions(otp, tpi->optp, tpi->optlen, th, tpi->to);
++					tcp_process_options(otp, tpi->optp, tpi->optlen, th, tpi->to);
+ 					tcp_syncookie_syn(tpi, SA(&to2), SA(&from));
+ 					if (syn_cookie_sent) {
+ 						*syn_cookie_sent = true;
+@@ -644,7 +646,7 @@ pcbconnect_done:
+ 	 * OR last ACK, when SYN cookies are enabled
+ 	 */
+ 	if (tpi->optp != NULL) {
+-		tcp_dooptions(tp, tpi->optp, tpi->optlen, tpi->th, tpi->to);
++		tcp_process_options(tp, tpi->optp, tpi->optlen, tpi->th, tpi->to);
+ 	}
+ 	tcp_finalize_options(tp, tpi->to, tpi->ifscope);
+ 
+diff --git a/bsd/netinet/tcp_includes.h b/bsd/netinet/tcp_includes.h
+index d801931af..4d87b33bd 100644
+--- a/bsd/netinet/tcp_includes.h
++++ b/bsd/netinet/tcp_includes.h
+@@ -30,6 +30,7 @@
+ #define _NETINET_TCP_INCLUDES_H_
+ 
+ #include <netinet/tcp_cc.h>
++#include <netinet/tcp_fastopen.h>
+ #include <netinet/tcp_fsm.h>
+ #include <netinet/tcp_log.h>
+ #include <netinet/tcp_pacing.h>
+diff --git a/bsd/netinet/tcp_input.c b/bsd/netinet/tcp_input.c
+index 6bc329c5a..25f699b16 100644
+--- a/bsd/netinet/tcp_input.c
++++ b/bsd/netinet/tcp_input.c
+@@ -254,9 +254,6 @@ struct inpcbhead tcb;
+ #define tcb6    tcb  /* for KAME src sync over BSD*'s */
+ struct inpcbinfo tcbinfo;
+ 
+-static void tcp_dooptions(struct tcpcb *, u_char *cp0 __counted_by(cnt0), int cnt0, struct tcphdr *,
+-    struct tcpopt *);
+-static void tcp_finalize_options(struct tcpcb *, struct tcpopt *, unsigned int);
+ static void tcp_pulloutofband(struct socket *,
+     struct tcphdr *, struct mbuf *, int);
+ static void tcp_xmit_timer(struct tcpcb *, int, u_int32_t, tcp_seq);
+@@ -970,7 +967,7 @@ tcp_tfo_synack(struct tcpcb *tp, struct tcpopt *to)
+ 
+ 		/*
+ 		 * If this happens, things have gone terribly wrong. len should
+-		 * have been checked in tcp_dooptions.
++		 * have been checked in tcp_process_options.
+ 		 */
+ 		VERIFY(len <= TFO_COOKIE_LEN_MAX);
+ 
+@@ -1561,7 +1558,7 @@ tcp_input(struct mbuf *m, int off0)
+ 		 * prediction?").  If timestamp is the only option and it's
+ 		 * formatted as recommended in RFC 1323 appendix A, we
+ 		 * quickly get the values now and not bother calling
+-		 * tcp_dooptions(), etc.
++		 * tcp_process_options(), etc.
+ 		 */
+ 		if ((optlen == TCPOLEN_TSTAMP_APPA ||
+ 		    (optlen > TCPOLEN_TSTAMP_APPA &&
+@@ -2246,7 +2243,7 @@ syn_cookie_valid:
+ 	 * else do it below (after getting remote address).
+ 	 */
+ 	if (tp->t_state != TCPS_LISTEN && optp) {
+-		tcp_dooptions(tp, optp, optlen, th, &to);
++		tcp_process_options(tp, optp, optlen, th, &to);
+ 	}
+ #if MPTCP
+ 	if (tp->t_state != TCPS_LISTEN && (so->so_flags & SOF_MP_SUBFLOW)) {
+@@ -4896,148 +4893,6 @@ drop:
+ 	return;
+ }
+ 
+-/*
+- * Parse TCP options and place in tcpopt.
+- */
+-static void
+-tcp_dooptions(struct tcpcb *tp, u_char *cp0 __counted_by(cnt0), int cnt0, struct tcphdr *th,
+-    struct tcpopt *to)
+-{
+-	u_short mss = 0;
+-	uint8_t opt, optlen;
+-	u_char *cp = cp0;
+-	u_char * const cpend = cp0 + cnt0;
+-	int cnt = cnt0;
+-
+-	for (; cnt > 0; cnt -= optlen, cp += optlen) {
+-		opt = cp[0];
+-		if (opt == TCPOPT_EOL) {
+-			break;
+-		}
+-		if (opt == TCPOPT_NOP) {
+-			optlen = 1;
+-		} else {
+-			if (cnt < 2) {
+-				break;
+-			}
+-			optlen = cp[1];
+-			if (optlen < 2 || optlen > cnt) {
+-				break;
+-			}
+-		}
+-		switch (opt) {
+-		default:
+-			continue;
+-
+-		case TCPOPT_MAXSEG:
+-			if (optlen != TCPOLEN_MAXSEG) {
+-				continue;
+-			}
+-			if (!(th->th_flags & TH_SYN)) {
+-				continue;
+-			}
+-			bcopy((char *) cp + 2, (char *) &mss, sizeof(mss));
+-			NTOHS(mss);
+-			to->to_mss = mss;
+-			to->to_flags |= TOF_MSS;
+-			break;
+-
+-		case TCPOPT_WINDOW:
+-			if (optlen != TCPOLEN_WINDOW) {
+-				continue;
+-			}
+-			if (!(th->th_flags & TH_SYN)) {
+-				continue;
+-			}
+-			to->to_flags |= TOF_SCALE;
+-			to->to_wscale = MIN(cp[2], TCP_MAX_WINSHIFT);
+-			break;
+-
+-		case TCPOPT_TIMESTAMP:
+-			if (optlen != TCPOLEN_TIMESTAMP) {
+-				continue;
+-			}
+-			to->to_flags |= TOF_TS;
+-			bcopy((char *)cp + 2,
+-			    (char *)&to->to_tsval, sizeof(to->to_tsval));
+-			NTOHL(to->to_tsval);
+-			bcopy((char *)cp + 6,
+-			    (char *)&to->to_tsecr, sizeof(to->to_tsecr));
+-			NTOHL(to->to_tsecr);
+-			to->to_tsecr -= tp->t_ts_offset;
+-			/* Re-enable sending Timestamps if we received them */
+-			if (!(tp->t_flags & TF_REQ_TSTMP) && tcp_do_timestamps) {
+-				tp->t_flags |= TF_REQ_TSTMP;
+-			}
+-			break;
+-		case TCPOPT_SACK_PERMITTED:
+-			if (optlen != TCPOLEN_SACK_PERMITTED) {
+-				continue;
+-			}
+-			if (th->th_flags & TH_SYN) {
+-				to->to_flags |= TOF_SACKPERM;
+-			}
+-			break;
+-		case TCPOPT_SACK:
+-			if (optlen <= 2 || (optlen - 2) % TCPOLEN_SACK != 0) {
+-				continue;
+-			}
+-			to->to_flags |= TOF_SACK;
+-			to->to_nsacks = (optlen - 2) / TCPOLEN_SACK;
+-			to->to_sacks_size = optlen - 2;
+-			to->to_sacks = cp + 2;
+-			tcpstat.tcps_sack_rcv_blocks++;
+-
+-			break;
+-		case TCPOPT_FASTOPEN:
+-			if (optlen == TCPOLEN_FASTOPEN_REQ) {
+-				if (tp->t_state != TCPS_LISTEN) {
+-					continue;
+-				}
+-
+-				to->to_flags |= TOF_TFOREQ;
+-			} else {
+-				if (optlen < TCPOLEN_FASTOPEN_REQ ||
+-				    (optlen - TCPOLEN_FASTOPEN_REQ) > TFO_COOKIE_LEN_MAX ||
+-				    (optlen - TCPOLEN_FASTOPEN_REQ) < TFO_COOKIE_LEN_MIN) {
+-					continue;
+-				}
+-				if (tp->t_state != TCPS_LISTEN &&
+-				    tp->t_state != TCPS_SYN_SENT) {
+-					continue;
+-				}
+-
+-				to->to_flags |= TOF_TFO;
+-				to->to_tfo = cp + 1;
+-				to->to_tfo_size = optlen - 1;
+-			}
+-
+-			break;
+-		case TCPOPT_ACCECN0:
+-		case TCPOPT_ACCECN1:
+-			if (optlen < (TCPOLEN_ACCECN_EMPTY + 1 * TCPOLEN_ACCECN_COUNTER) ||
+-			    (optlen - 2) % TCPOLEN_ACCECN_COUNTER != 0) {
+-				continue;
+-			}
+-			to->to_num_accecn = (optlen - 2) / TCPOLEN_ACCECN_COUNTER;
+-			to->to_accecn = cp + 2;
+-			to->to_accecn_size = optlen - 2;
+-			if (opt == TCPOPT_ACCECN0) {
+-				to->to_accecn_order = 0;
+-			} else if (opt == TCPOPT_ACCECN1) {
+-				to->to_accecn_order = 1;
+-			}
+-			break;
+-
+-#if MPTCP
+-		case TCPOPT_MULTIPATH:
+-			tcp_do_mptcp_options(tp, cp, cpend, th, to, optlen);
+-			break;
+-#endif /* MPTCP */
+-		}
+-	}
+-}
+-
+ /*
+  * Pull out of band byte out of a segment so
+  * it doesn't appear in the user's data queue.
+diff --git a/bsd/netinet/tcp_options.c b/bsd/netinet/tcp_options.c
+index 8179a6254..f56b952c3 100644
+--- a/bsd/netinet/tcp_options.c
++++ b/bsd/netinet/tcp_options.c
+@@ -9,6 +9,11 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/kernel.h>
++#include <netinet/in.h>
++#include <netinet/in_systm.h>
++#include <netinet/ip.h>
++#include <netinet/tcp.h>
++#include <netinet/tcp_var.h>
+ 
+ #define RECON_BSD_NETINET_TCP_OPTIONS_C 1
+ 
+@@ -16,12 +21,142 @@
+ void
+ tcp_process_options(struct tcpcb * tp, u_char *cp0 __counted_by(cnt0), int cnt0, struct tcphdr * th, struct tcpopt * to)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_process_options");
++	u_short mss = 0;
++	uint8_t opt, optlen;
++	u_char *cp = cp0;
++	u_char * const cpend = cp0 + cnt0;
++	int cnt = cnt0;
++
++	for (; cnt > 0; cnt -= optlen, cp += optlen) {
++		opt = cp[0];
++		if (opt == TCPOPT_EOL) {
++			break;
++		}
++		if (opt == TCPOPT_NOP) {
++			optlen = 1;
++		} else {
++			if (cnt < 2) {
++				break;
++			}
++			optlen = cp[1];
++			if (optlen < 2 || optlen > cnt) {
++				break;
++			}
++		}
++		switch (opt) {
++		default:
++			continue;
++
++		case TCPOPT_MAXSEG:
++			if (optlen != TCPOLEN_MAXSEG) {
++				continue;
++			}
++			if (!(th->th_flags & TH_SYN)) {
++				continue;
++			}
++			bcopy((char *) cp + 2, (char *) &mss, sizeof(mss));
++			NTOHS(mss);
++			to->to_mss = mss;
++			to->to_flags |= TOF_MSS;
++			break;
++
++		case TCPOPT_WINDOW:
++			if (optlen != TCPOLEN_WINDOW) {
++				continue;
++			}
++			if (!(th->th_flags & TH_SYN)) {
++				continue;
++			}
++			to->to_flags |= TOF_SCALE;
++			to->to_wscale = MIN(cp[2], TCP_MAX_WINSHIFT);
++			break;
++
++		case TCPOPT_TIMESTAMP:
++			if (optlen != TCPOLEN_TIMESTAMP) {
++				continue;
++			}
++			to->to_flags |= TOF_TS;
++			bcopy((char *)cp + 2,
++			    (char *)&to->to_tsval, sizeof(to->to_tsval));
++			NTOHL(to->to_tsval);
++			bcopy((char *)cp + 6,
++			    (char *)&to->to_tsecr, sizeof(to->to_tsecr));
++			NTOHL(to->to_tsecr);
++			to->to_tsecr -= tp->t_ts_offset;
++			/* Re-enable sending Timestamps if we received them */
++			if (!(tp->t_flags & TF_REQ_TSTMP) && tcp_do_timestamps) {
++				tp->t_flags |= TF_REQ_TSTMP;
++			}
++			break;
++		case TCPOPT_SACK_PERMITTED:
++			if (optlen != TCPOLEN_SACK_PERMITTED) {
++				continue;
++			}
++			if (th->th_flags & TH_SYN) {
++				to->to_flags |= TOF_SACKPERM;
++			}
++			break;
++		case TCPOPT_SACK:
++			if (optlen <= 2 || (optlen - 2) % TCPOLEN_SACK != 0) {
++				continue;
++			}
++			to->to_flags |= TOF_SACK;
++			to->to_nsacks = (optlen - 2) / TCPOLEN_SACK;
++			to->to_sacks_size = optlen - 2;
++			to->to_sacks = cp + 2;
++			tcpstat.tcps_sack_rcv_blocks++;
++			break;
++		case TCPOPT_FASTOPEN:
++			if (optlen == TCPOLEN_FASTOPEN_REQ) {
++				if (tp->t_state != TCPS_LISTEN) {
++					continue;
++				}
++
++				to->to_flags |= TOF_TFOREQ;
++			} else {
++				if (optlen < TCPOLEN_FASTOPEN_REQ ||
++				    (optlen - TCPOLEN_FASTOPEN_REQ) > TFO_COOKIE_LEN_MAX ||
++				    (optlen - TCPOLEN_FASTOPEN_REQ) < TFO_COOKIE_LEN_MIN) {
++					continue;
++				}
++				if (tp->t_state != TCPS_LISTEN &&
++				    tp->t_state != TCPS_SYN_SENT) {
++					continue;
++				}
++
++				to->to_flags |= TOF_TFO;
++				to->to_tfo = cp + 1;
++				to->to_tfo_size = optlen - 1;
++			}
++
++			break;
++		case TCPOPT_ACCECN0:
++		case TCPOPT_ACCECN1:
++			if (optlen < (TCPOLEN_ACCECN_EMPTY + 1 * TCPOLEN_ACCECN_COUNTER) ||
++			    (optlen - 2) % TCPOLEN_ACCECN_COUNTER != 0) {
++				continue;
++			}
++			to->to_num_accecn = (optlen - 2) / TCPOLEN_ACCECN_COUNTER;
++			to->to_accecn = cp + 2;
++			to->to_accecn_size = optlen - 2;
++			if (opt == TCPOPT_ACCECN0) {
++				to->to_accecn_order = 0;
++			} else if (opt == TCPOPT_ACCECN1) {
++				to->to_accecn_order = 1;
++			}
++			break;
++
++#if MPTCP
++		case TCPOPT_MULTIPATH:
++			tcp_do_mptcp_options(tp, cp, cpend, th, to, optlen);
++			break;
++#endif /* MPTCP */
++		}
++	}
+ }
+ 
+ /* bsd/netinet/tcp_options.c:218 */
+-static void
++void
+ tcp_finalize_options(struct tcpcb *tp, struct tcpopt *to, unsigned int ifscope)
+ {
+ 	if (to->to_flags & TOF_TS) {
+@@ -51,7 +186,7 @@ tcp_finalize_options(struct tcpcb *tp, struct tcpopt *to, unsigned int ifscope)
+ }
+ 
+ /* bsd/netinet/tcp_options.c:268 */
+-static uint8_t
++uint8_t
+ tcp_addoptions(struct tcpopt *to, u_char * __ended_by(optend) optp, u_char * optend)
+ {
+ 	uint32_t mask;
+diff --git a/bsd/netinet/tcp_output.c b/bsd/netinet/tcp_output.c
+index 50f486383..c9d21fcf2 100644
+--- a/bsd/netinet/tcp_output.c
++++ b/bsd/netinet/tcp_output.c
+@@ -271,173 +271,6 @@ static int tcp_ip_output(struct socket *, struct tcpcb *, struct mbuf *,
+     int, struct mbuf *, int, int, boolean_t);
+ static int tcp_recv_throttle(struct tcpcb *tp);
+ 
+-__attribute__((noinline))
+-static int32_t
+-tcp_tfo_check(struct tcpcb *tp, int32_t len)
+-{
+-	struct socket *__single so = tp->t_inpcb->inp_socket;
+-	unsigned int optlen = 0;
+-	unsigned int cookie_len;
+-
+-	if (tp->t_flags & TF_NOOPT) {
+-		goto fallback;
+-	}
+-
+-	if (!(tp->t_flagsext & TF_FASTOPEN_FORCE_ENABLE) &&
+-	    !tcp_heuristic_do_tfo(tp)) {
+-		tp->t_tfo_stats |= TFO_S_HEURISTICS_DISABLE;
+-		tcpstat.tcps_tfo_heuristics_disable++;
+-		goto fallback;
+-	}
+-
+-	if (so->so_flags1 & SOF1_DATA_AUTHENTICATED) {
+-		return len;
+-	}
+-
+-	optlen += TCPOLEN_MAXSEG;
+-
+-	if (tp->t_flags & TF_REQ_SCALE) {
+-		optlen += 4;
+-	}
+-
+-#if MPTCP
+-	if ((so->so_flags & SOF_MP_SUBFLOW) && mptcp_enable &&
+-	    (tp->t_rxtshift <= mptcp_mpcap_retries ||
+-	    (tptomptp(tp)->mpt_mpte->mpte_flags & MPTE_FORCE_ENABLE))) {
+-		optlen += sizeof(struct mptcp_mpcapable_opt_common) + sizeof(mptcp_key_t);
+-	}
+-#endif /* MPTCP */
+-
+-	if (tp->t_flags & TF_REQ_TSTMP) {
+-		optlen += TCPOLEN_TSTAMP_APPA;
+-	}
+-
+-	if (SACK_ENABLED(tp)) {
+-		optlen += TCPOLEN_SACK_PERMITTED;
+-	}
+-
+-	/* Now, decide whether to use TFO or not */
+-
+-	/* Don't even bother trying if there is no space at all... */
+-	if (MAX_TCPOPTLEN - optlen < TCPOLEN_FASTOPEN_REQ) {
+-		goto fallback;
+-	}
+-
+-	cookie_len = tcp_cache_get_cookie_len(tp);
+-	if (cookie_len == 0) {
+-		/* No cookie, so we request one */
+-		return 0;
+-	}
+-
+-	/* There is not enough space for the cookie, so we cannot do TFO */
+-	if (MAX_TCPOPTLEN - optlen < cookie_len) {
+-		goto fallback;
+-	}
+-
+-	/* Do not send SYN+data if there is more in the queue than MSS */
+-	if (so->so_snd.sb_cc > (tp->t_maxopd - MAX_TCPOPTLEN)) {
+-		goto fallback;
+-	}
+-
+-	/* Ok, everything looks good. We can go on and do TFO */
+-	return len;
+-
+-fallback:
+-	tcp_disable_tfo(tp);
+-	return 0;
+-}
+-
+-/* Returns the number of bytes written to the TCP option-space */
+-__attribute__((noinline))
+-static unsigned int
+-tcp_tfo_write_cookie_rep(struct tcpcb *tp, unsigned int optlen,
+-    u_char *__counted_by(optlen + 2 + TFO_COOKIE_LEN_DEFAULT) opt)
+-{
+-	u_char out[CCAES_BLOCK_SIZE];
+-	unsigned ret = 0;
+-	u_char *bp;
+-
+-	if (MAX_TCPOPTLEN - optlen <
+-	    TCPOLEN_FASTOPEN_REQ + TFO_COOKIE_LEN_DEFAULT) {
+-		return ret;
+-	}
+-
+-	tcp_tfo_gen_cookie(tp->t_inpcb, out, sizeof(out));
+-
+-	bp = opt + optlen;
+-
+-	*bp++ = TCPOPT_FASTOPEN;
+-	*bp++ = 2 + TFO_COOKIE_LEN_DEFAULT;
+-	memcpy(bp, out, TFO_COOKIE_LEN_DEFAULT);
+-	ret += 2 + TFO_COOKIE_LEN_DEFAULT;
+-
+-	tp->t_tfo_stats |= TFO_S_COOKIE_SENT;
+-	tcpstat.tcps_tfo_cookie_sent++;
+-
+-	return ret;
+-}
+-
+-__attribute__((noinline))
+-static unsigned int
+-tcp_tfo_write_cookie(struct tcpcb *tp, unsigned int optlen, int32_t len,
+-    u_char *__counted_by(TCP_MAXOLEN) opt)
+-{
+-	uint8_t tfo_len;
+-	struct socket *__single so = tp->t_inpcb->inp_socket;
+-	unsigned ret = 0;
+-	int res;
+-	u_char *bp;
+-
+-	if (TCPOLEN_FASTOPEN_REQ > MAX_TCPOPTLEN - optlen) {
+-		return 0;
+-	}
+-	tfo_len = (uint8_t)(MAX_TCPOPTLEN - optlen - TCPOLEN_FASTOPEN_REQ);
+-
+-	if (so->so_flags1 & SOF1_DATA_AUTHENTICATED) {
+-		/* If there is some data, let's track it */
+-		if (len > 0) {
+-			tp->t_tfo_stats |= TFO_S_SYN_DATA_SENT;
+-			tcpstat.tcps_tfo_syn_data_sent++;
+-		}
+-
+-		return 0;
+-	}
+-
+-	bp = opt + optlen;
+-
+-	/*
+-	 * The cookie will be copied in the appropriate place within the
+-	 * TCP-option space. That way we avoid the need for an intermediate
+-	 * variable.
+-	 */
+-	res = tcp_cache_get_cookie(tp, bp + TCPOLEN_FASTOPEN_REQ, tfo_len, &tfo_len);
+-	if (res == 0) {
+-		*bp++ = TCPOPT_FASTOPEN;
+-		*bp++ = TCPOLEN_FASTOPEN_REQ;
+-		ret += TCPOLEN_FASTOPEN_REQ;
+-
+-		tp->t_tfo_flags |= TFO_F_COOKIE_REQ;
+-
+-		tp->t_tfo_stats |= TFO_S_COOKIE_REQ;
+-		tcpstat.tcps_tfo_cookie_req++;
+-	} else {
+-		*bp++ = TCPOPT_FASTOPEN;
+-		*bp++ = TCPOLEN_FASTOPEN_REQ + tfo_len;
+-
+-		ret += TCPOLEN_FASTOPEN_REQ + tfo_len;
+-
+-		tp->t_tfo_flags |= TFO_F_COOKIE_SENT;
+-
+-		/* If there is some data, let's track it */
+-		if (len > 0) {
+-			tp->t_tfo_stats |= TFO_S_SYN_DATA_SENT;
+-			tcpstat.tcps_tfo_syn_data_sent++;
+-		}
+-	}
+-
+-	return ret;
+-}
+-
+ static inline bool
+ tcp_send_ecn_flags_on_syn(struct tcpcb *tp)
+ {
+diff --git a/bsd/netinet/tcp_reassembly.c b/bsd/netinet/tcp_reassembly.c
+index 993d36638..5a1d01332 100644
+--- a/bsd/netinet/tcp_reassembly.c
++++ b/bsd/netinet/tcp_reassembly.c
+@@ -9,11 +9,27 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/kernel.h>
++#include <sys/mbuf.h>
++#include <sys/protosw.h>
++#include <sys/socket.h>
++#include <sys/socketvar.h>
++#include <libkern/OSAtomic.h>
++#include <net/if.h>
++#include <net/droptap.h>
++#include <net/ntstat.h>
++#include <netinet/in.h>
++#include <netinet/in_pcb.h>
++#include <netinet/ip.h>
++#include <netinet/tcp.h>
++#include <netinet/tcp_seq.h>
++#include <netinet/tcp_timer.h>
++#include <netinet/tcp_utils.h>
++#include <netinet/tcp_var.h>
+ 
+ #define RECON_BSD_NETINET_TCP_REASSEMBLY_C 1
+ 
+ /* bsd/netinet/tcp_reassembly.c:91 */
+-static uint32_t
++uint32_t
+ tcp_reass_qlen_space(struct socket *so)
+ {
+ 	uint32_t space = 0;
+@@ -30,7 +46,7 @@ tcp_reass_qlen_space(struct socket *so)
+ }
+ 
+ /* bsd/netinet/tcp_reassembly.c:107 */
+-static int
++int
+ tcp_reass(struct tcpcb *tp, struct tcphdr *th, int *tlenp, struct mbuf *m,
+     struct ifnet *ifp, int *dowakeup)
+ {
+@@ -101,7 +117,7 @@ tcp_reass(struct tcpcb *tp, struct tcphdr *th, int *tlenp, struct mbuf *m,
+ 	}
+ 
+ 	/* Create a new queue entry. If we can't, just drop the pkt. */
+-	te = tcp_create_reass_qent(tp, m, th, *tlenp);
++	te = tcp_reass_create_qent(tp, m, th, *tlenp);
+ 	if (te == NULL) {
+ 		m_drop_list(m, NULL,
+ 		    DROPTAP_FLAG_DIR_IN | DROPTAP_FLAG_L2_MISSING,
+@@ -132,7 +148,7 @@ tcp_reass(struct tcpcb *tp, struct tcphdr *th, int *tlenp, struct mbuf *m,
+ 				 * Found a FIN at a different sequence number.
+ 				 * Drop the incoming segment.
+ 				 */
+-				tcp_destroy_reass_qent(tp, te);
++				tcp_reass_destroy_qent(tp, te);
+ 				m_drop(m, DROPTAP_FLAG_DIR_IN | DROPTAP_FLAG_L2_MISSING, DROP_REASON_TCP_REASS_DUP_FIN, NULL, 0);
+ 				*tlenp = 0;
+ 				return 0;
+@@ -144,7 +160,7 @@ tcp_reass(struct tcpcb *tp, struct tcphdr *th, int *tlenp, struct mbuf *m,
+ 				 * Incoming segment has data after an existing
+ 				 * FIN segment. Drop it.
+ 				 */
+-				tcp_destroy_reass_qent(tp, te);
++				tcp_reass_destroy_qent(tp, te);
+ 				m_drop(m, DROPTAP_FLAG_DIR_IN | DROPTAP_FLAG_L2_MISSING, DROP_REASON_TCP_REASS_DATA_AFTER_FIN, NULL, 0);
+ 				*tlenp = 0;
+ 				return 0;
+@@ -193,7 +209,7 @@ tcp_reass(struct tcpcb *tp, struct tcphdr *th, int *tlenp, struct mbuf *m,
+ 					INP_ADD_RXSTAT(inp, ifnet_count_type, 1, *tlenp);
+ 					tp->t_stat.rxduplicatebytes += *tlenp;
+ 				}
+-				tmp = tcp_destroy_reass_qent(tp, te);
++				tmp = tcp_reass_destroy_qent(tp, te);
+ 				m_freem(tmp);
+ 				te = NULL;
+ 				/*
+@@ -270,7 +286,7 @@ tcp_reass(struct tcpcb *tp, struct tcphdr *th, int *tlenp, struct mbuf *m,
+ 
+ 		LIST_REMOVE(q, tqe_q);
+ 
+-		tmp = tcp_destroy_reass_qent(tp, q);
++		tmp = tcp_reass_destroy_qent(tp, q);
+ 
+ 		m_freem(tmp);
+ 		q = nq;
+@@ -318,7 +334,7 @@ present:
+ 
+ 		LIST_REMOVE(q, tqe_q);
+ 
+-		tmp = tcp_destroy_reass_qent(tp, q);
++		tmp = tcp_reass_destroy_qent(tp, q);
+ 
+ 		if (so->so_state & SS_CANTRCVMORE) {
+ 			m_freem(tmp);
+@@ -356,7 +372,7 @@ present:
+ }
+ 
+ /* bsd/netinet/tcp_reassembly.c:426 */
+-static struct tseg_qent *
++struct tseg_qent *
+ tcp_reass_qent_alloc(struct protosw *proto)
+ {
+ 	struct tseg_qent *reass;
+@@ -375,7 +391,7 @@ tcp_reass_qent_alloc(struct protosw *proto)
+ }
+ 
+ /* bsd/netinet/tcp_reassembly.c:444 */
+-static void
++void
+ tcp_reass_qent_free(struct protosw *proto, struct tseg_qent *te)
+ {
+ 	proto_memacct_sub(proto, kalloc_type_size(tcp_reass_zone));
+@@ -384,24 +400,61 @@ tcp_reass_qent_free(struct protosw *proto, struct tseg_qent *te)
+ 
+ /* bsd/netinet/tcp_reassembly.c:451 */
+ struct tseg_qent *
+-tcp_reass_create_qent(struct tcpcb * tp, struct mbuf * m, struct tcphdr * th, int len)
++tcp_reass_create_qent(struct tcpcb * tp, struct mbuf * m,
++    struct tcphdr * th, int len)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_reass_create_qent");
++	struct tseg_qent *te;
++	int size;
++
++	te = tcp_reass_qent_alloc(tp->t_inpcb->inp_socket->so_proto);
++	if (te == NULL) {
++		return NULL;
++	}
++
++	tp->t_reassqlen++;
++	OSIncrementAtomic(&tcp_reass_total_qlen);
++
++	size = m_chain_capacity(m);
++	tcp_memacct_add(size);
++	tp->t_reassq_mbcnt += size;
++
++	te->tqe_th = th;
++	te->tqe_m = m;
++	te->tqe_len = len;
++
++	return te;
+ }
+ 
+ /* bsd/netinet/tcp_reassembly.c:477 */
+ struct mbuf *
+ tcp_reass_destroy_qent(struct tcpcb * tp, struct tseg_qent * q)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_reass_destroy_qent");
++	struct mbuf *m = q->tqe_m;
++	int size;
++
++	size = m_chain_capacity(m);
++	tcp_memacct_sub(size);
++	tp->t_reassqlen--;
++	OSDecrementAtomic(&tcp_reass_total_qlen);
++	tp->t_reassq_mbcnt -= size;
++
++	tcp_reass_qent_free(tp->t_inpcb->inp_socket->so_proto, q);
++
++	return m;
+ }
+ 
+ /* bsd/netinet/tcp_reassembly.c:494 */
+ void
+ tcp_reassq_free(struct tcpcb * tp)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_reassq_free");
++	struct tseg_qent *q;
++
++	while ((q = LIST_FIRST(&tp->t_segq)) != NULL) {
++		struct mbuf *m;
++
++		LIST_REMOVE(q, tqe_q);
++		m = tcp_reass_destroy_qent(tp, q);
++
++		m_freem(m);
++	}
+ }
+diff --git a/bsd/netinet/tcp_subr.c b/bsd/netinet/tcp_subr.c
+index 2cfa0febb..bfe4b647d 100644
+--- a/bsd/netinet/tcp_subr.c
++++ b/bsd/netinet/tcp_subr.c
+@@ -326,8 +326,6 @@ static void tcp_flow_lim_stats(struct ifnet_stats_per_flow *ifs,
+ static void tcp_flow_ecn_perf_stats(struct ifnet_stats_per_flow *ifs,
+     struct if_tcp_ecn_perf_stat *stat);
+ 
+-static aes_encrypt_ctx tfo_ctx; /* Crypto-context for TFO */
+-
+ /* TCP RST duplicate suppression */
+ static LCK_ATTR_DECLARE(tcp_rst_rlc_attr, 0, 0);
+ static LCK_GRP_DECLARE(tcp_rst_rlc_mtx_grp, "rst_rlc");
+@@ -442,15 +440,6 @@ static int scale_to_powerof2(int size);
+  * Eg. for a base of 64, 65 will become 128,
+  * 2896 will become 2944.
+  */
+-static void
+-tcp_tfo_init(void)
+-{
+-	u_char key[TCP_FASTOPEN_KEYLEN];
+-
+-	read_frandom(key, sizeof(key));
+-	aes_encrypt_key128(key, &tfo_ctx);
+-}
+-
+ static u_char isn_secret[32];
+ 
+ /*
+@@ -1535,63 +1524,6 @@ tcp_flow_lim_stats(struct ifnet_stats_per_flow *ifs,
+ 	stat->lim_bk_txpkts += ifs->bk_txpackets;
+ }
+ 
+-static void
+-tcp_free_reassq(struct tcpcb *tp)
+-{
+-	struct tseg_qent *q;
+-
+-	while ((q = LIST_FIRST(&tp->t_segq)) != NULL) {
+-		struct mbuf *m;
+-
+-		LIST_REMOVE(q, tqe_q);
+-		m = tcp_destroy_reass_qent(tp, q);
+-		m_freem(m);
+-	}
+-}
+-
+-struct tseg_qent *
+-tcp_create_reass_qent(struct tcpcb *tp, struct mbuf *m,
+-    struct tcphdr *th, int len)
+-{
+-	struct tseg_qent *te;
+-	int size;
+-
+-	te = tcp_reass_qent_alloc(tp->t_inpcb->inp_socket->so_proto);
+-	if (te == NULL) {
+-		return NULL;
+-	}
+-
+-	tp->t_reassqlen++;
+-	OSIncrementAtomic(&tcp_reass_total_qlen);
+-
+-	size = m_chain_capacity(m);
+-	tcp_memacct_add(size);
+-	tp->t_reassq_mbcnt += size;
+-
+-	te->tqe_m = m;
+-	te->tqe_th = th;
+-	te->tqe_len = len;
+-
+-	return te;
+-}
+-
+-struct mbuf *
+-tcp_destroy_reass_qent(struct tcpcb *tp, struct tseg_qent *q)
+-{
+-	struct mbuf *m = q->tqe_m;
+-	int size;
+-
+-	size = m_chain_capacity(m);
+-	tcp_memacct_sub(size);
+-	tp->t_reassq_mbcnt -= size;
+-
+-	tp->t_reassqlen--;
+-	OSDecrementAtomic(&tcp_reass_total_qlen);
+-	tcp_reass_qent_free(tp->t_inpcb->inp_socket->so_proto, q);
+-
+-	return m;
+-}
+-
+ /*
+  * Close a TCP control block:
+  *	discard all space held by the tcp
+@@ -1779,7 +1711,7 @@ no_valid_rt:
+ 	}
+ 
+ 	/* free the reassembly queue, if any */
+-	tcp_free_reassq(tp);
++	tcp_reassq_free(tp);
+ 
+ 	/* performance stats per interface */
+ 	tcp_create_ifnet_stats_per_flow(tp, &ifs);
+diff --git a/bsd/netinet/tcp_var.h b/bsd/netinet/tcp_var.h
+index cd39b142a..9d0cd2ad9 100644
+--- a/bsd/netinet/tcp_var.h
++++ b/bsd/netinet/tcp_var.h
+@@ -1059,7 +1059,7 @@ typedef enum {
+  * Structure to hold TCP options that are only used during segment
+  * processing (in tcp_input), but not held in the tcpcb.
+  * It's basically used to reduce the number of parameters
+- * to tcp_dooptions.
++ * to tcp_process_options.
+  */
+ struct tcpopt {
+ 	uint32_t        to_flags;   /* which options are present */
+@@ -1804,10 +1804,13 @@ extern int32_t tcp_link_heuristics_rto_min;
+  */
+ #define TCP_ACK_COMPRESSION_DUMMY 1
+ 
+-extern struct tseg_qent *tcp_create_reass_qent(struct tcpcb *tp, struct mbuf *m,
+-    struct tcphdr *th, int len);
+-extern struct mbuf *tcp_destroy_reass_qent(struct tcpcb *tp,
++extern int tcp_reass(struct tcpcb *tp, struct tcphdr *th, int *tlenp,
++    struct mbuf *m, struct ifnet *ifp, int *dowakeup);
++extern struct tseg_qent *tcp_reass_create_qent(struct tcpcb *tp,
++    struct mbuf *m, struct tcphdr *th, int len);
++extern struct mbuf *tcp_reass_destroy_qent(struct tcpcb *tp,
+     struct tseg_qent *q);
++extern void tcp_reassq_free(struct tcpcb *tp);
+ KALLOC_TYPE_DECLARE(tcp_reass_zone);
+ extern struct tseg_qent *tcp_reass_qent_alloc(struct protosw *proto);
+ extern void tcp_reass_qent_free(struct protosw *proto, struct tseg_qent *te);
+@@ -1836,6 +1839,9 @@ struct tcp_respond_args {
+ };
+ 
+ void     tcp_canceltimers(struct tcpcb *);
++void     tcp_process_options(struct tcpcb *, u_char *cp0 __counted_by(cnt0), int cnt0,
++    struct tcphdr *, struct tcpopt *);
++void     tcp_finalize_options(struct tcpcb *, struct tcpopt *, unsigned int);
+ uint8_t tcp_addoptions(struct tcpopt *to, u_char * __ended_by(optend) optp, u_char * optend);
+ struct tcpcb *
+ tcp_close(struct tcpcb *);

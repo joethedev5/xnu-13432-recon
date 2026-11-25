@@ -1,0 +1,102 @@
+From 908fbaae8739b2a6c5f334c6e9f9a94287c33726 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 03:50:13 +0000
+Subject: [PATCH 34/35] Recover the TCP window scale helpers
+
+tcp_set_window_scale and tcp_window_scale are the reference's
+extraction of the two SYN-ACK and SYN_RECEIVED scaling blocks:
+snd_scale = requested_s_scale, rcv_scale = request_r_scale, and for
+the server side also snd_wnd/max_sndwnd scaled from the segment
+window.  tcp_input calls them and takes tiwin back from snd_wnd.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ bsd/netinet/tcp_input.c  | 14 +++-----------
+ bsd/netinet/tcp_var.h    |  2 ++
+ bsd/netinet/tcp_window.c | 15 +++++++++++----
+ 3 files changed, 16 insertions(+), 15 deletions(-)
+
+diff --git a/bsd/netinet/tcp_input.c b/bsd/netinet/tcp_input.c
+index 48a031ba2..6bc329c5a 100644
+--- a/bsd/netinet/tcp_input.c
++++ b/bsd/netinet/tcp_input.c
+@@ -2785,10 +2785,7 @@ syn_cookie_valid:
+ 			    (uint32_t)tlen, (uint32_t)segment_count);
+ 
+ 			/* Do window scaling on this connection? */
+-			if (TCP_WINDOW_SCALE_ENABLED(tp)) {
+-				tp->snd_scale = tp->requested_s_scale;
+-				tp->rcv_scale = tp->request_r_scale;
+-			}
++			tcp_set_window_scale(tp);
+ 
+ 			uint32_t recwin = tcp_calc_rcv_window(tp, TCP_RECV_BG(so));
+ 			tp->rcv_adv += recwin;
+@@ -3498,13 +3495,8 @@ close:
+ 		tcpstat.tcps_connects++;
+ 
+ 		/* Do window scaling? */
+-		if (TCP_WINDOW_SCALE_ENABLED(tp)) {
+-			tp->snd_scale = tp->requested_s_scale;
+-			tp->rcv_scale = tp->request_r_scale;
+-			tp->snd_wnd = th->th_win << tp->snd_scale;
+-			tp->max_sndwnd = tp->snd_wnd;
+-			tiwin = tp->snd_wnd;
+-		}
++		tcp_window_scale(tp, th->th_win);
++		tiwin = tp->snd_wnd;
+ 		/*
+ 		 * Make transitions:
+ 		 *      SYN-RECEIVED  -> ESTABLISHED
+diff --git a/bsd/netinet/tcp_var.h b/bsd/netinet/tcp_var.h
+index de27d9c11..cd39b142a 100644
+--- a/bsd/netinet/tcp_var.h
++++ b/bsd/netinet/tcp_var.h
+@@ -1909,6 +1909,8 @@ extern void tcp_get_ports_used(ifnet_t ifp, int, u_int32_t, bitstr_t *__counted_
+ uint32_t tcp_count_opportunistic(unsigned int ifindex, u_int32_t flags);
+ uint32_t tcp_find_anypcb_byaddr(struct ifaddr *ifa);
+ uint8_t tcp_get_max_rwinscale(struct tcpcb *tp, struct socket *so);
++void tcp_set_window_scale(struct tcpcb *tp);
++void tcp_window_scale(struct tcpcb *tp, uint16_t adv_win);
+ struct bwmeas* tcp_bwmeas_alloc(struct tcpcb *tp);
+ void tcp_bwmeas_free(struct tcpcb *tp);
+ extern int32_t timer_diff(uint32_t t1, uint32_t toff1, uint32_t t2, uint32_t toff2);
+diff --git a/bsd/netinet/tcp_window.c b/bsd/netinet/tcp_window.c
+index 2f01955fd..5aea5b2ef 100644
+--- a/bsd/netinet/tcp_window.c
++++ b/bsd/netinet/tcp_window.c
+@@ -10,6 +10,7 @@
+ #include <sys/systm.h>
+ #include <sys/kernel.h>
+ #include <netinet/tcp_cc.h>
++#include <netinet/tcp_var.h>
+ 
+ #define RECON_BSD_NETINET_TCP_WINDOW_C 1
+ 
+@@ -42,16 +43,22 @@ tcp_get_max_rwinscale(struct tcpcb *tp, struct socket *so)
+ void
+ tcp_set_window_scale(struct tcpcb * tp)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_set_window_scale");
++	if (TCP_WINDOW_SCALE_ENABLED(tp)) {
++		tp->snd_scale = tp->requested_s_scale;
++		tp->rcv_scale = tp->request_r_scale;
++	}
+ }
+ 
+ /* bsd/netinet/tcp_window.c:119 */
+ void
+ tcp_window_scale(struct tcpcb * tp, uint16_t adv_win)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_window_scale");
++	if (TCP_WINDOW_SCALE_ENABLED(tp)) {
++		tp->snd_scale = tp->requested_s_scale;
++		tp->rcv_scale = tp->request_r_scale;
++		tp->snd_wnd = adv_win << tp->snd_scale;
++		tp->max_sndwnd = tp->snd_wnd;
++	}
+ }
+ 
+ /* bsd/netinet/tcp_window.c:133 */

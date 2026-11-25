@@ -9,7 +9,7 @@ Apply in numeric order from a clean checkout:
 
 ```
 git checkout xnu-12377.121.6
-git am 0001-*.patch ... 0033-*.patch
+git am 0001-*.patch ... 0035-*.patch
 ```
 
 Contents:
@@ -53,6 +53,13 @@ Contents:
     path and the `PSPA_VIRTUAL_ENV` port action.
 33. The TCP proportional-rate-reduction unit and the missing
     `tcpcb.prr` state at offset 1384.
+34. The TCP window scale helpers `tcp_set_window_scale` and
+    `tcp_window_scale`, and their use from the SYN and SYN-ACK
+    receive paths.
+35. The TCP reassembly helpers (`tcp_reass_create_qent`,
+    `tcp_reass_destroy_qent`, `tcp_reassq_free`), the external
+    linkage of the moved reassembly, option-parsing and TFO
+    functions, and the removal of the public duplicate bodies.
 
 The patches contain only public xnu text plus original reconstruction;
 no Apple binary, dSYM, SDK payload or extracted proprietary header is

@@ -1,7 +1,7 @@
 From 62471825bf61b4ee04fcb9582c363e23ec3d4de3 Mon Sep 17 00:00:00 2001
 From: joethedev5 <deepsbx1@proton.me>
 Date: Wed, 25 Nov 2026 02:18:06 +0000
-Subject: [PATCH 03/33] Recover 64 stub bodies from the reference kernel image
+Subject: [PATCH 03/35] Recover 64 stub bodies from the reference kernel image
 
 Disassembly-driven reconstruction of the smallest recovered functions:
 
