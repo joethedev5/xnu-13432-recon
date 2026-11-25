@@ -9,7 +9,7 @@ Apply in numeric order from a clean checkout:
 
 ```
 git checkout xnu-12377.121.6
-git am 0001-*.patch ... 0061-*.patch
+git am 0001-*.patch ... 0062-*.patch
 ```
 
 Contents:
@@ -218,6 +218,19 @@ Contents:
     one-shot drain thread call and its ring drain loop, and both emit
     entry points with the single-argument overload.  The header gains
     the 64-bit event enumeration and the drain-thread prototype.
+62. The COW-defeatured guard counters in
+    `osfmk/vm/vm_cow_defeatured_telemetry.c`: the per-process counter
+    list (proc_name_t name, per-guard-code uint8_t counts), the
+    `vm_cow_defeated_get_or_insert_entry` lookup and zeroed allocation,
+    `vm_cow_defeated_get_responsible_map_info` (current task's map and
+    best name), and `vm_cow_defeated_soft_mode_report`, which checks the
+    guard code, accounts under `vm_cow_defeated_telemetry_lock` and
+    calls `vm_map_guard_exception` outside the lock while the
+    `vm_cow_defeated_soft_report_limit` tunable (default 10) allows.
+    Adds the new `vm_cow_defeatured_telemetry.h` prototype at reference
+    line 44 and the three kGUARD_EXC_COW_DEFEATURED_* guard codes (13-15)
+    in `osfmk/mach/vm_statistics.h`, moving
+    kGUARD_EXC_LARGE_ALLOCATION_TELEMETRY to 16.
 
 The patches contain only public xnu text plus original reconstruction;
 no Apple binary, dSYM, SDK payload or extracted proprietary header is

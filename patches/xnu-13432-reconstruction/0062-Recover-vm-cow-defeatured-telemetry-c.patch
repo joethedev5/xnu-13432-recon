@@ -1,0 +1,349 @@
+From feef0d971b2214b4b589317f67f2119ceb2af903 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 21:15:22 +0000
+Subject: [PATCH] Recover vm_cow_defeatured_telemetry.c
+
+Recover the three functions in vm_cow_defeatured_telemetry.c from the
+KDK 27.0.1 DWARF and the RELEASE/DEVELOPMENT vmapple kernels:
+
+  - vm_cow_defeatured_get_or_insert_entry() walks guard_count_head and
+    compares process names with strncmp; a miss allocates a zeroed
+    vm_cow_defeatured_guard_count_s (48 bytes) with kalloc_type and
+    pushes it on the list.  The structure holds next, the proc_name_t
+    name and the per-guard-code uint8_t counters.
+
+  - vm_cow_defeatured_get_responsible_map_info() takes the current
+    task's map and copies task_best_name() into the caller's buffer,
+    returning false when there is no current task.
+
+  - vm_cow_defeated_soft_mode_report() validates the guard code against
+    VM_COW_DEFEATURED_GUARD_COUNT, accounts the violation under
+    vm_cow_defeated_telemetry_lock and raises vm_map_guard_exception()
+    outside the lock while the per-process report budget lasts.
+
+The report is limited by the vm_cow_defeatured_soft_report_limit
+tunable (default 10).  The reference line table pins the tunable at
+line 69, the lock group and mutex at lines 74 and 76, the list head at
+line 80 and the three function signatures at lines 88, 120 and 145.
+The report's prototype is added in vm_cow_defeatured_telemetry.h at
+reference line 44, the line vm_map.c sees it at.
+
+Add the three kGUARD_EXC_COW_DEFEATURED_* guard codes to
+vm_statistics.h (13-15), move kGUARD_EXC_LARGE_ALLOCATION_TELEMETRY to
+16 as the reference does, and derive VM_COW_DEFEATURED_GUARD_COUNT from
+the FIRST/LAST enumerators.
+
+The reference build performs the report-limit comparison in the
+uint8_t domain (it compares the counter against the low byte of
+limit - 1); the reconstruction keeps the recoverable source form.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ osfmk/mach/vm_statistics.h             |  15 +-
+ osfmk/vm/vm_cow_defeatured_telemetry.c | 187 ++++++++++++++++++++++---
+ osfmk/vm/vm_cow_defeatured_telemetry.h |  50 +++++++
+ 3 files changed, 230 insertions(+), 22 deletions(-)
+ create mode 100644 osfmk/vm/vm_cow_defeatured_telemetry.h
+
+diff --git a/osfmk/mach/vm_statistics.h b/osfmk/mach/vm_statistics.h
+index d72e25f7d..ac0597109 100644
+--- a/osfmk/mach/vm_statistics.h
++++ b/osfmk/mach/vm_statistics.h
+@@ -456,7 +456,12 @@ __enum_decl(virtual_memory_guard_exception_code_t, uint32_t, {
+ 	kGUARD_EXC_SEC_IOPL_ON_EXEC_PAGE = 10,
+ 	kGUARD_EXC_SEC_EXEC_ON_IOPL_PAGE = 11,
+ 	kGUARD_EXC_SEC_UPL_WRITE_ON_EXEC_REGION = 12,
+-	kGUARD_EXC_LARGE_ALLOCATION_TELEMETRY = 13,
++	kGUARD_EXC_COW_DEFEATURED_COPY_DENIED = 13,
++	kGUARD_EXC_COW_DEFEATURED_EXTRACT_DENIED = 14,
++	kGUARD_EXC_COW_DEFEATURED_SHARE_MAP_AS_COPY_DENIED = 15,
++	kGUARD_EXC_COW_DEFEATURED_FIRST = kGUARD_EXC_COW_DEFEATURED_COPY_DENIED,
++	kGUARD_EXC_COW_DEFEATURED_LAST = kGUARD_EXC_COW_DEFEATURED_SHARE_MAP_AS_COPY_DENIED,
++	kGUARD_EXC_LARGE_ALLOCATION_TELEMETRY = 16,
+ 	/*
+ 	 * rdar://151450801 (Remove spurious kGUARD_EXC_SEC_ACCESS_FAULT and kGUARD_EXC_SEC_ASYNC_ACCESS_FAULT once CrashReporter is aligned)
+ 	 */
+@@ -478,6 +483,14 @@ __enum_decl(virtual_memory_guard_exception_code_t, uint32_t, {
+ 
+ #ifdef XNU_KERNEL_PRIVATE
+ 
++/*
++ * Number of distinct COW-defeatured guard codes.  The per-process
++ * counters in vm_cow_defeatured_telemetry.c are indexed by the guard
++ * code offset from kGUARD_EXC_COW_DEFEATURED_FIRST.
++ */
++#define VM_COW_DEFEATURED_GUARD_COUNT \
++	(kGUARD_EXC_COW_DEFEATURED_LAST - kGUARD_EXC_COW_DEFEATURED_FIRST + 1)
++
+ #if HAS_MTE
+ static inline bool
+ vm_guard_is_mte_policy(uint32_t flavor)
+diff --git a/osfmk/vm/vm_cow_defeatured_telemetry.c b/osfmk/vm/vm_cow_defeatured_telemetry.c
+index e86ddb9d0..d0451fc87 100644
+--- a/osfmk/vm/vm_cow_defeatured_telemetry.c
++++ b/osfmk/vm/vm_cow_defeatured_telemetry.c
+@@ -1,39 +1,184 @@
+ /*
+- * Reconstruction of osfmk/vm/vm_cow_defeatured_telemetry.c from the xnu-13432 reference kernel.
++ * Reconstruction of osfmk/vm/vm_cow_defeatured_telemetry.c from the
++ * xnu-13432 reference kernel.
+  *
+- * Function signatures and ordering are derived from the KDK 27.0.1
+- * DWARF.  Functions marked RECON were moved from the public xnu source
+- * when the reference kernel placed them in this file; bodies marked
+- * "body not recovered" are still stubs.
++ * The three functions were recovered from the KDK 27.0.1 DWARF
++ * (kernel.kasan.vmapple and the RELEASE_ARM64_VMAPPLE build in
++ * kernel.release.vmapple.dwarf.elf) and cross-checked against the
++ * RELEASE and DEVELOPMENT vmapple kernels.  Reference source lines
++ * are given for each definition and statement recovered from the
++ * line tables.
++ *
++ * The file keeps one counter block per process name.  A guard
++ * violation is attributed to the map of the task running at the
++ * time; the process name is looked up under
++ * vm_cow_defeatured_telemetry_lock, the entry is created on first
++ * use, and the per-code counter limits how many soft-mode reports
++ * are sent for each process.  The report itself,
++ * vm_map_guard_exception, is raised outside the lock.
+  */
+-#include <kern/kern_types.h>
++
++#include <mach/resource_monitors.h>
++#include <mach/vm_statistics.h>
+ #include <kern/assert.h>
+-#include <kern/debug.h>
++#include <kern/kern_types.h>
++#include <kern/locks.h>
++#include <kern/startup.h>
++#include <kern/task.h>
+ #include <kern/zalloc.h>
+-#include <sys/systm.h>
++#include <string.h>
++#include <vm/vm_map_internal.h>
+ 
+ #define RECON_OSFMK_VM_VM_COW_DEFEATURED_TELEMETRY_C 1
+ 
+-/* osfmk/vm/vm_cow_defeatured_telemetry.c:88 */
+-vm_cow_defeatured_guard_count_s *
++/*
++ * Guard counts are kept per process name.  The structure is private
++ * to this file.  The name is the task's best name, truncated to
++ * proc_name_t, so processes that share a name share one counter
++ * block.
++ *
++ * event_counts is indexed by the guard code offset from
++ * kGUARD_EXC_COW_DEFEATURED_FIRST.
++ */
++
++/* One process's COW-defeatured guard counters. */
++
++typedef struct vm_cow_defeatured_guard_count vm_cow_defeatured_guard_count_s;
++struct vm_cow_defeatured_guard_count {
++	/* Next entry in the global list. */
++	struct vm_cow_defeatured_guard_count * next;
++
++	/* Name of the process responsible for the violations. */
++	proc_name_t name;
++
++	/*
++	 * Number of soft-mode reports already sent for each guard code.
++	 * The array is indexed by guard code minus
++	 * kGUARD_EXC_COW_DEFEATURED_FIRST and the tunable below bounds
++	 * the number of reports sent for each process and code.
++	 */
++	uint8_t event_counts[VM_COW_DEFEATURED_GUARD_COUNT];
++};
++
++/*
++ * Maximum number of soft-mode reports sent to a process for one
++ * guard code.  The tunable can be set with the
++ * "vm_cow_defeatured_soft_report_limit" boot argument.
++ */
++
++static TUNABLE(uint8_t, vm_cow_defeatured_soft_report_limit,
++    "vm_cow_defeatured_soft_report_limit", 10);
++
++/* Serializes the counter list and the counters themselves. */
++
++static LCK_GRP_DECLARE(vm_cow_defeatured_telemetry_lock_grp,
++    "vm_cow_defeatured_telemetry_lock");
++static LCK_MTX_DECLARE(vm_cow_defeatured_telemetry_lock,
++    &vm_cow_defeatured_telemetry_lock_grp);
++
++/* Head of the per-process guard counter list. */
++static vm_cow_defeatured_guard_count_s * guard_count_head;
++
++/*
++ * Return the counter block for the process name, allocating and
++ * linking a new one when the name is not present.  The caller must
++ * hold vm_cow_defeatured_telemetry_lock.
++ */
++static inline vm_cow_defeatured_guard_count_s *
+ vm_cow_defeatured_get_or_insert_entry(char * name)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: vm_cow_defeatured_get_or_insert_entry");
++	vm_cow_defeatured_guard_count_s * entry;
++
++	/*
++	 * Walk the list looking for the name.  The list stays short: it
++	 * only contains processes that tripped a COW-defeatured guard,
++	 * and entries are never removed.
++	 */
++
++	for (entry = guard_count_head; entry != NULL; entry = entry->next) {
++		if (strncmp(name, entry->name, sizeof(entry->name)) == 0) {
++			return entry;
++		}
++	}
++
++	/*
++	 * First violation for this name: allocate a zeroed entry and
++	 * publish it at the head of the list.
++	 */
++
++	entry = kalloc_type(vm_cow_defeatured_guard_count_s, Z_WAITOK_ZERO);
++	strlcpy(entry->name, name, sizeof(entry->name));
++
++	/* Publish the new entry. */
++	entry->next = guard_count_head;
++	guard_count_head = entry;
++
++	return entry;
+ }
+ 
+-/* osfmk/vm/vm_cow_defeatured_telemetry.c:120 */
+-_Bool
+-vm_cow_defeatured_get_responsible_map_info(vm_map_t * map_out, char * proc_name, size_t proc_name_size)
++static inline bool
++vm_cow_defeatured_get_responsible_map_info(
++	vm_map_t * map_out,
++	char * proc_name,
++	size_t proc_name_size)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: vm_cow_defeatured_get_responsible_map_info");
++	task_t task;
++
++	/*
++	 * Attribute the violation to the map of the task running at the
++	 * time and remember its name.
++	 */
++	task = current_task();
++	if (task == NULL) {
++		return false;
++	}
++
++	*map_out = get_task_map(task);
++
++	/* The name is truncated to the size of the caller's buffer. */
++	strlcpy(proc_name, task_best_name(task), proc_name_size);
++
++	return true;
+ }
+ 
+-/* osfmk/vm/vm_cow_defeatured_telemetry.c:145 */
+ void
+-vm_cow_defeatured_soft_mode_report(virtual_memory_guard_exception_code_t guard_code, uint64_t fail_info)
++vm_cow_defeatured_soft_mode_report(
++	virtual_memory_guard_exception_code_t guard_code,
++	uint64_t fail_info)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: vm_cow_defeatured_soft_mode_report");
++	vm_map_t map;
++	proc_name_t proc_name = {};
++	vm_cow_defeatured_guard_count_s * entry;
++	bool send_guard;
++	uint32_t event_idx;
++	uint8_t event_old_count;
++
++	event_idx = guard_code - kGUARD_EXC_COW_DEFEATURED_FIRST;
++	assert(event_idx < VM_COW_DEFEATURED_GUARD_COUNT);
++
++	if (!vm_cow_defeatured_get_responsible_map_info(&map, proc_name,
++	    sizeof(proc_name))) {
++		return;
++	}
++
++	/*
++	 * Account for the violation under the telemetry lock.
++	 */
++	lck_mtx_lock(&vm_cow_defeatured_telemetry_lock);
++
++	entry = vm_cow_defeatured_get_or_insert_entry(proc_name);
++	event_old_count = entry->event_counts[event_idx];
++
++	send_guard = event_old_count <= vm_cow_defeatured_soft_report_limit - 1;
++
++	/* Bump the counter while the entry is still locked. */
++	if (send_guard) {
++		entry->event_counts[event_idx] = event_old_count + 1;
++	}
++	lck_mtx_unlock(&vm_cow_defeatured_telemetry_lock);
++
++	/* Report outside the lock, unless the limit has been reached. */
++	if (send_guard) {
++		vm_map_guard_exception(map, fail_info, guard_code);
++	}
+ }
+diff --git a/osfmk/vm/vm_cow_defeatured_telemetry.h b/osfmk/vm/vm_cow_defeatured_telemetry.h
+new file mode 100644
+index 000000000..1e4bdbc26
+--- /dev/null
++++ b/osfmk/vm/vm_cow_defeatured_telemetry.h
+@@ -0,0 +1,50 @@
++/*
++ * Reconstruction of osfmk/vm/vm_cow_defeatured_telemetry.h from the
++ * xnu-13432 reference kernel.
++ *
++ * The header only declares the soft-mode reporting entry point.  The
++ * guard counters are private to vm_cow_defeatured_telemetry.c; callers
++ * only report a violation and the file decides whether a report is
++ * sent for the responsible process.
++ *
++ * The declaration line is derived from the KDK 27.0.1 DWARF:
++ * vm_map.c sees vm_cow_defeatured_soft_mode_report declared at
++ * reference line 44.
++ */
++
++#ifndef XNU13432_OSFMK_VM_VM_COW_DEFEATURED_TELEMETRY_H
++#define XNU13432_OSFMK_VM_VM_COW_DEFEATURED_TELEMETRY_H
++
++#include <mach/vm_statistics.h>
++#include <stdint.h>
++#include <sys/cdefs.h>
++
++__BEGIN_DECLS
++
++/*
++ * Report a COW-defeatured guard violation in soft mode.
++ *
++ * The caller passes the guard code and the fault info that the
++ * hardware reported.  The report is attributed to the map of the
++ * task that is running at the time of the call, and the process
++ * name is used to find the per-process counter block.
++ * The first violation for a process is always reported.  Later
++ * violations are counted and reported until the process reaches
++ * vm_cow_defeatured_soft_report_limit reports for the same guard
++ * code; after that the violations are only counted.  The limit is a
++ * boot-arg tunable (vm_cow_defeatured_soft_report_limit) and defaults
++ * to 10.
++ *
++ * The report is delivered as a guard exception on the responsible
++ * map, so it is only meaningful when vm_map_cow_defeatured_enforce is
++ * off and the exception is handled in soft mode.
++ */
++
++extern void
++vm_cow_defeatured_soft_mode_report(
++	virtual_memory_guard_exception_code_t guard_code,
++	uint64_t fail_info);
++
++__END_DECLS
++
++#endif /* XNU13432_OSFMK_VM_VM_COW_DEFEATURED_TELEMETRY_H */
+-- 
+2.47.3
+

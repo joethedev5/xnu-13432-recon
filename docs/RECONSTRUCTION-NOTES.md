@@ -1972,4 +1972,72 @@ CoreAnalytics format strings, the 160/660/182-byte structures, the panic
 string and the startup-phase check match the reference image, and the
 patch applies to the series with an identical tree hash.
 
-The patch series now has 61 entries; 62 explicit stubs remain.
+## 2026-11-25: the COW-defeatured guard counters
+
+`osfmk/vm/vm_cow_defeatured_telemetry.c` is recovered in patch 62.  Its
+CU names the file `vm_cow_defeatured_telemetry.c` and declares the
+private type `vm_cow_defeated_guard_count` (struct) /
+`vm_cow_defeated_guard_count_s` (typedef): `next` at offset 0,
+`proc_name_t name` at 8 and `uint8_t event_counts[3]` at 41, 48 bytes
+total.  The initializer at 109 allocates it with
+`kalloc_type(..., Z_WAITOK_ZERO)` (the view symbol is
+`_vm_cow_defeated_get_or_insert_entry.kalloc_type_view_109`, the size
+field 48), copies the name with `strlcpy` and pushes the entry on
+`guard_count_head`.
+
+The statics fix the file's shape: the TUNABLE at line 69 is
+`vm_cow_defeated_soft_report_limit`, the startup spec name string is
+`"vm_cow_defeated_soft_report_limit"`, the length is 1 and the initial
+byte in the reference image is 10; the auto-startup entry symbols are
+suffixed 70, 75 and 77, which pins the two-line invocations.  The lock
+group is `vm_cow_defeated_telemetry_lock_grp` with name
+`"vm_cow_defeated_telemetry_lock"` (read from the `lck_grp_spec` in
+`__BOOTDATA,__init`), and the mutex is `LCK_MTX_DECLARE`d against it.
+`guard_count_head` is at line 80.
+
+The three signatures are at reference lines 88 (static inline
+`vm_cow_defeated_get_or_insert_entry(char * name)`), 120 (static inline
+`vm_cow_defeated_get_responsible_map_info(vm_map_t *, char *, size_t)`)
+and 145 (global `vm_cow_defeated_soft_mode_report(
+virtual_memory_guard_exception_code_t, uint64_t)`).  The kasan build
+keeps `current_task`, `get_task_map`, `task_best_name` and the
+`lck_mtx` calls out of line, so the bodies call exactly those helpers.
+The report checks `event_idx = guard_code -
+kGUARD_EXC_COW_DEFEATURED_FIRST` with the descriptor string
+`event_idx < VM_COW_DEFEATURED_GUARD_COUNT` (line 157), takes the
+responsible map and name, locks, inserts, reads the old counter, bumps
+it while `send_guard` holds, unlocks and only then calls
+`vm_map_guard_exception(map, fail_info, guard_code)` (line 182).
+
+`vm_map.c` sees the report declared in
+`vm_cow_defeated_telemetry.h` at line 44; the only caller is
+`vm_map_policy_handle_cow_defeated_fail`, whose direct `bl` to the
+report is at fffffe00078e6b98 in the kasan image.  The patch adds that
+header at the recovered line.
+
+The guard enumeration in the reference `vm_statistics.h` is extended:
+`kGUARD_EXC_COW_DEFEATURED_COPY_DENIED` = 13, `..._EXTRACT_DENIED` =
+14 and `..._SHARE_MAP_AS_COPY_DENIED` = 15, with `..._FIRST`/`..._LAST`
+aliases; `kGUARD_EXC_LARGE_ALLOCATION_TELEMETRY` moves from 13 to 16,
+and `VM_COW_DEFEATURED_GUARD_COUNT` is derived from the FIRST/LAST
+aliases.
+
+One codegen detail could not be reproduced in the reconstructed source:
+the reference compares the old counter against the *low byte* of
+`limit - 1` (`sub w10,w10,#1; cmp w9,w10,uxtb; b.ls`), while the line
+table places the limit token at column 33 and the subtraction at
+column 69, which matches the plain text
+`event_old_count < vm_cow_defeated_soft_report_limit - 1` after the
+correct 35-character identifier.  The recovered source therefore keeps
+`event_old_count <= vm_cow_defeated_soft_report_limit - 1`; it behaves
+identically for every limit except 0, where the reference's uint8_t
+truncation keeps reporting.  The reference RELEASE kernel also keeps
+the line-157 `assert()` active; the current reconstructed release
+headers (and the local assert shim used by `kcc.py`) elide it, so a
+future `assert.h` reconciliation is needed before the local build
+reproduces the trap.
+
+The patch compiles with the reference RELEASE flags and applies to the
+series with tree hash 6d99fbd77c731e79b95443ce66a1e515ae5de959.
+
+The patch series now has 62 entries; 59 explicit stubs remain.
