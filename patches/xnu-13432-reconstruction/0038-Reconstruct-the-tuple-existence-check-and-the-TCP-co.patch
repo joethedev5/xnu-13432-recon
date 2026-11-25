@@ -1,7 +1,7 @@
 From 17d74b32d2af2f63e226c9060fc0da3053165efa Mon Sep 17 00:00:00 2001
 From: joethedev5 <deepsbx1@proton.me>
 Date: Wed, 25 Nov 2026 04:08:38 +0000
-Subject: [PATCH 38/41] Reconstruct the tuple-existence check and the TCP
+Subject: [PATCH 38/42] Reconstruct the tuple-existence check and the TCP
  context
 
 Add the reference's 128-byte struct tcp_context to tcp_var.h (mbuf,

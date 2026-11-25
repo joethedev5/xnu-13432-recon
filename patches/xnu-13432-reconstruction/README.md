@@ -9,7 +9,7 @@ Apply in numeric order from a clean checkout:
 
 ```
 git checkout xnu-12377.121.6
-git am 0001-*.patch ... 0041-*.patch
+git am 0001-*.patch ... 0042-*.patch
 ```
 
 Contents:
@@ -76,6 +76,11 @@ Contents:
 41. The remainder of the PRR integration: the duplicate-ACK
     `tcp_prr_update` call and the `tp->prr.out` transmit accounting in
     `tcp_output`.
+42. The RBBR phase machine: the PROBE_RTT round analysis, the
+    PROBE_RWND growth/hold/exit paths, the CRUISE sawtooth and
+    backoff accounting, RTT sampling and the data-received gate,
+    plus the helper-based enter/backoff refactors and the
+    `cycle_measure_ts` duration measurement.
 
 The patches contain only public xnu text plus original reconstruction;
 no Apple binary, dSYM, SDK payload or extracted proprietary header is

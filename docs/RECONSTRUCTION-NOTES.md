@@ -674,3 +674,97 @@ connection is in fast recovery (`tp->prr.out += len`, reference lines
 2769-2770) before the `sendalot` loop check.
 
 The patch series now has 41 entries; 166 explicit stubs remain.
+
+## 2026-11-25: RBBR phase machine and RTT sampling
+
+`bsd/netinet/tcp_rbbr.c` had 13 bodies left; all are now reconstructed
+from the release kernel.  The reference keeps every phase helper in this
+unit (plus `rbbr_log_phase_end`, whose own log line is 483).
+
+`rbbr_update_phase` switches on `rbbr->phase` (0 PROBE_RTT, 1
+PROBE_RWND, 2 CRUISE) after computing `time_until_probe` once.
+
+PROBE_RTT computes `elapsed`, `min_dur = MAX(srtt_ms,
+rtt_probe_min_duration)` and `max_dur = MAX(rtt_probe_max_duration,
+min_dur)`.  When `rbbr_action_elapsed` fires with
+`MAX(rtt_probe_cycle_rtts, 1)`, a round with samples logs the median
+(line 1277), updates `probe_rtt_min`/`probe_rtt_flat_rounds` against
+`MAX(rtt_probe_plateau_rounds, 1)` and sets `conclude = elapsed >=
+min_dur && (plateaued || elapsed >= max_dur)`; a sample-less round
+concludes only at `max_dur`.  When the action has not elapsed, only
+`elapsed >= max_dur` proceeds.  A non-concluding analyzed round starts
+a new round and returns.  On conclusion `compute_jitter_stats_and_reset`
+runs, then `time_until_probe < 3 * action_ms` selects CRUISE, otherwise
+PROBE_RWND (`reprobe = false`).
+
+The jitter reset computes the median, replaces the samples with their
+absolute deviations, and sets `delay_threshold = median_rtt +
+delay_thresh_mad_mult * rtt_mad + target_delay_ms`; with no samples it
+only defaults a zero threshold to 100 and leaves the cycle counters
+alone.
+
+`rbbr_process_probe_rwnd_cycle` returns whether the cycle was
+acceptable.  With no samples it is acceptable and logs "NO SAMPLES";
+otherwise it computes the median and utilization and, when the median
+exceeds the delay threshold, marks `delay_exceeded_seen` and logs the
+delay exit.  In the acceptable branch it adopts `win` as `rwnd_est`
+when a cycle has completed and the sender utilized the window, then
+logs the cycle statistics.
+
+PROBE_RWND computes `action_ms` from `rbbr_current_rtts`; a
+`time_until_probe < 2 * action_ms` exit and the delay-ceiling and
+max-cycle exits all log the phase end and enter CRUISE.  The max-cycle
+test casts `rbbr_probe_rwnd_max_cycles` to `uint8_t`.  A completed,
+acceptable action starts a round; an unutilized window sets
+`win_change_pending` and logs "hold", while a utilized window picks
+`reprobe_gain`, `probe_rwnd_main_gain` or `startup_gain` (reprobe
+active, delay seen, otherwise), increments `probe_rwnd_cycle` and
+applies `rbbr_update_win(tp, rbbr_pct(rwnd_est, gain))` before the
+"grow" log.  The grow path leaves `rwnd_est` itself untouched.
+
+CRUISE finalizes sawtooth detection and re-enters PROBE_RTT when the
+scheduled probe is due.  Otherwise an elapsed action with samples
+logs the cycle median, runs the chain detector only while
+`cruise_backoff_count` is non-zero, applies a cruise backoff on delay,
+starts the next round and, with `cruise_cycles >= 1`, increments
+`cruise_action_count`; when the count reaches `(uint8_t)cruise_cycles`
+and the next probe is at least `3 * action_ms` away it logs
+CRUISE -> PROBE_RWND and enters PROBE_RWND with `reprobe = true`.  A
+sample-less elapsed action just starts a new round.
+
+Sawtooth detection keeps `prev_cruise_median`, a noise margin
+(`noise_base_ms + rtt_mad * noise_mad_mult`) and a drop threshold.
+Rising medians extend `current_chain_length`; a drop larger than
+`prev_median * drop_pct / 100` with at least `queue_detect_increases`
+chained rounds credits `sawtooth_cycles` and clears the chain.  The
+finalizer converts the ratio to a percentage and, at or above
+`queue_detect_fraction_pct`, sets `queue_competition_detected` and
+`skip_rwnd_restrict = 2`.
+
+PROBE_RTT entry sets the phase, schedules the next probe, resets
+`probe_rtt_min`/`probe_rtt_flat_rounds`, starts a round, decrements
+`skip_rwnd_restrict` (logging when it reaches zero), sets the window
+to the minimum and clears the cruise-backoff state.
+
+`tcp_rbbr_data_rcvd` gates sampling on `win_converged` plus
+`!win_change_pending` and on the timestamp echo being recent
+(`SEQ_GEQ` against `rwnd_change_ts`).  Accepted samples land in the
+64-entry ring, and both log sites are rate-limited by per-site
+`_last_ts` statics compared against `net_uptime()`.  The cycle byte
+count and first measurement timestamp update on every accepted
+segment, then the phase machine runs.
+
+`rbbr_enter_probe_rwnd`, `rbbr_enter_cruise` and
+`rbbr_apply_cruise_backoff` now call `rbbr_pct`, `rbbr_min_win`,
+`rbbr_update_win`, `rbbr_start_round` and
+`rbbr_reset_sawtooth_detection` exactly where the reference does.
+`rbbr_action_elapsed` measures its duration branch from
+`cycle_measure_ts` (not the round start); the fallback still uses the
+passed start timestamp.
+
+`tcp_utils.c`'s `scale_to_powerof2`, `tcp_ceil`, `tcp_round_to`,
+`tcp_round_up` and `ntoh24` are external in the reference DWARF, so the
+reconstruction no longer marks them static and `tcp_subr.c` uses an
+extern declaration.
+
+The patch series now has 42 entries; 143 explicit stubs remain.

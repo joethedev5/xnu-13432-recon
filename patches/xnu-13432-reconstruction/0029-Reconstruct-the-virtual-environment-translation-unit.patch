@@ -1,7 +1,7 @@
 From c5e4e549c03b2ce098c9d80fb7f0f9ef030c212d Mon Sep 17 00:00:00 2001
 From: joethedev5 <deepsbx1@proton.me>
 Date: Wed, 25 Nov 2026 03:25:52 +0000
-Subject: [PATCH 29/41] Reconstruct the virtual environment translation unit
+Subject: [PATCH 29/42] Reconstruct the virtual environment translation unit
 
 Recover all twenty bodies of osfmk/kern/virtual_env.c from the
 xnu-13432 reference kernel: the availability and object-count policy,

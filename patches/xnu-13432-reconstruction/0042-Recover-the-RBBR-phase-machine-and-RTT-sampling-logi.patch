@@ -1,0 +1,1015 @@
+From 10d664a08d5f886c000025d718132639af8ae712 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 05:01:42 +0000
+Subject: [PATCH 42/42] Recover the RBBR phase machine and RTT sampling logic
+
+Reconstruct the remaining tcp_rbbr.c bodies from the 13432 reference.
+
+- Decode the complete rbbr_update_phase state machine: the PROBE_RTT
+  round analysis (median, plateau detection, jitter reset, conclude
+  decision), the PROBE_RWND per-cycle growth/hold/exit paths, and the
+  CRUISE sawtooth and backoff action accounting.
+- Add the RTT sample ring buffer, median-of-deviations jitter
+  estimator, sawtooth queue-competition detection and PROBE_RTT
+  entry.
+- Implement tcp_rbbr_data_rcvd, including the win-converged gating of
+  samples and the two per-site rate-limited net_uptime() logs.
+- Rebuild enter_probe_rwnd, enter_cruise and apply_cruise_backoff on
+  the rbbr_update_win/rbbr_pct/rbbr_min_win helpers, matching the
+  reference call structure.
+- Measure the rbbr_action_elapsed duration branch from
+  cycle_measure_ts as the reference does.
+- Give the tcp_utils.c helpers external linkage and pull in tcp_seq.h
+  for the sequence comparison macros.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ bsd/netinet/tcp_rbbr.c  | 726 ++++++++++++++++++++++++++++++++--------
+ bsd/netinet/tcp_subr.c  |   2 +-
+ bsd/netinet/tcp_utils.c |  10 +-
+ 3 files changed, 588 insertions(+), 150 deletions(-)
+
+diff --git a/bsd/netinet/tcp_rbbr.c b/bsd/netinet/tcp_rbbr.c
+index a1ca57252..2efb6e5a3 100644
+--- a/bsd/netinet/tcp_rbbr.c
++++ b/bsd/netinet/tcp_rbbr.c
+@@ -11,13 +11,17 @@
+ #include <sys/kernel.h>
+ #include <netinet/tcp_rbbr.h>
+ #include <netinet/tcp_var.h>
++#include <netinet/tcp_seq.h>
+ #include <netinet/tcp_cc.h>
+ #include <kern/kalloc.h>
++#include <kern/uipc_domain.h>
+ #include <os/atomic_private.h>
+ #include <netinet/tcp_log.h>
+ 
+ #define RECON_BSD_NETINET_TCP_RBBR_C 1
+ 
++_Bool rbbr_sender_utilizing_rwnd(struct tcpcb *tp);
++
+ void tcp_rbbr_init(struct tcpcb *tp);
+ void tcp_rbbr_cleanup(struct tcpcb *tp);
+ void tcp_rbbr_rwnd_init(struct tcpcb *tp);
+@@ -76,8 +80,7 @@ struct tcp_rcv_cc_algo tcp_cc_rbbr = {
+ uint32_t
+ rbbr_pct(uint32_t val, uint32_t pct)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: rbbr_pct");
++	return (uint32_t)(((uint64_t)val * pct) / 100);
+ }
+ 
+ /* bsd/netinet/tcp_rbbr.c:254 */
+@@ -91,72 +94,111 @@ rbbr_clear_state(struct tcpcb * tp)
+ uint32_t
+ rbbr_min_win(struct tcpcb * tp)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: rbbr_min_win");
++	return tp->t_maxseg * rbbr_rtt_probe_rwnd_mss;
+ }
+ 
+ /* bsd/netinet/tcp_rbbr.c:273 */
+ void
+ rbbr_update_win(struct tcpcb * tp, uint32_t win)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: rbbr_update_win");
++	struct tcp_rbbr_state *rbbr = tp->t_rbbr_state;
++
++	win = MAX(win, rbbr_min_win(tp));
++	win = tcp_round_to(win, tp->t_maxseg);
++	win = MIN(win, (uint32_t)(TCP_MAXWIN << tp->rcv_scale));
++
++	rbbr->win = win;
++	rbbr->win_change_pending = true;
+ }
+ 
+ /* bsd/netinet/tcp_rbbr.c:291 */
+ uint32_t
+ rbbr_compute_next_probe_ts(uint32_t now)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: rbbr_compute_next_probe_ts");
++	uint32_t period_ms = MAX(rbbr_rtt_probe_period, 1) * 1000;
++	uint32_t ms_in_period = now % period_ms;
++
++	return now - ms_in_period + period_ms;
+ }
+ 
+ /* bsd/netinet/tcp_rbbr.c:315 */
+ uint32_t
+ rbbr_time_until_rtt_probe(struct tcp_rbbr_state * rbbr, uint32_t now)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: rbbr_time_until_rtt_probe");
++	return (int32_t)(rbbr->next_probe_rtt_ts - now) > 0 ?
++	    rbbr->next_probe_rtt_ts - now : 0;
+ }
+ 
+ /* bsd/netinet/tcp_rbbr.c:352 */
+ uint32_t
+ rbbr_current_rtts(struct tcp_rbbr_state * rbbr)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: rbbr_current_rtts");
++	int rtts = rbbr->delay_exceeded_seen ?
++	    rbbr_cycle_rtts : rbbr_startup_cycle_rtts;
++
++	return MAX(rtts, 1);
+ }
+ 
+ /* bsd/netinet/tcp_rbbr.c:365 */
+ uint32_t
+ rbbr_rcv_srtt_ms(struct tcpcb * tp)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: rbbr_rcv_srtt_ms");
++	return tp->t_srtt >> 5;
+ }
+ 
+ /* bsd/netinet/tcp_rbbr.c:387 */
+ uint32_t
+ rbbr_action_duration_ms(struct tcpcb * tp, uint32_t rtts)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: rbbr_action_duration_ms");
++	struct tcp_rbbr_state *rbbr = tp->t_rbbr_state;
++	uint32_t srtt, round_ms;
++
++	if ((tp->t_flags & (TF_REQ_TSTMP | TF_RCVD_TSTMP)) !=
++	    (TF_REQ_TSTMP | TF_RCVD_TSTMP)) {
++		return rbbr_probe_cycle_duration;
++	}
++
++	srtt = rbbr_rcv_srtt_ms(tp);
++	if (srtt == 0) {
++		return rbbr_probe_cycle_duration;
++	}
++	round_ms = MAX(srtt, (uint32_t)rbbr_round_min_ms);
++
++	round_ms += 2 * rbbr->rtt_mad;
++
++	return 2 * rtts * round_ms;
+ }
+ 
+ /* bsd/netinet/tcp_rbbr.c:414 */
+ uint64_t
+ rbbr_action_bytes(struct tcpcb * tp, uint32_t rtts)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: rbbr_action_bytes");
++	struct tcp_rbbr_state *rbbr = tp->t_rbbr_state;
++
++	return (uint64_t)rbbr->win * rtts;
+ }
+ 
+ /* bsd/netinet/tcp_rbbr.c:443 */
+ _Bool
+ rbbr_action_elapsed(struct tcpcb * tp, uint32_t start_ts, uint32_t now, uint32_t rtts)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: rbbr_action_elapsed");
++	struct tcp_rbbr_state *rbbr = tp->t_rbbr_state;
++
++	/*
++	 * The byte target applies only when timestamps let us measure RTTs;
++	 * otherwise fall through to the time-based target.
++	 */
++	if ((tp->t_flags & (TF_REQ_TSTMP | TF_RCVD_TSTMP)) ==
++	    (TF_REQ_TSTMP | TF_RCVD_TSTMP) &&
++	    rbbr->cycle_bytes_rcvd >= rbbr_action_bytes(tp, rtts)) {
++		return true;
++	}
++
++	if (rbbr->cycle_measure_ts != 0) {
++		return (now - rbbr->cycle_measure_ts) >=
++		    rbbr_action_duration_ms(tp, rtts);
++	}
++	return (now - start_ts) >= (uint32_t)rbbr_probe_cycle_duration;
+ }
+ 
+ /* bsd/netinet/tcp_rbbr.c:467 */
+@@ -237,48 +279,130 @@ rbbr_get_rtt_median(struct tcp_rbbr_state * rbbr)
+ uint32_t
+ rbbr_median_of_deviations(uint32_t *deviations __counted_by(n), uint16_t n)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: rbbr_median_of_deviations");
++	rbbr_insertion_sort(deviations, n);
++	return rbbr_sorted_median(deviations, n);
+ }
+ 
+ /* bsd/netinet/tcp_rbbr.c:569 */
+ void
+ rbbr_add_rtt_sample(struct tcpcb * tp, uint32_t rtt)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: rbbr_add_rtt_sample");
++	struct tcp_rbbr_state *rbbr = tp->t_rbbr_state;
++
++	rbbr->rtt_samples[rbbr->rtt_sample_idx] = rtt;
++	rbbr->rtt_sample_idx = (rbbr->rtt_sample_idx + 1) & 63;
++	rbbr->rtt_sorted = false;
++	if (rbbr->rtt_sample_count < 64) {
++		rbbr->rtt_sample_count++;
++	}
+ }
+ 
+ /* bsd/netinet/tcp_rbbr.c:593 */
+ void
+ rbbr_reset_rtt_samples(struct tcpcb * tp)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: rbbr_reset_rtt_samples");
++	tp->t_rbbr_state->rtt_sample_count = 0;
++	tp->t_rbbr_state->rtt_sample_idx = 0;
++	tp->t_rbbr_state->rtt_sorted = 0;
++	tp->t_rbbr_state->cycle_bytes_rcvd = 0;
++	tp->t_rbbr_state->cycle_measure_ts = 0;
+ }
+ 
+ /* bsd/netinet/tcp_rbbr.c:607 */
+ void
+ rbbr_start_round(struct tcpcb * tp, uint32_t now)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: rbbr_start_round");
++	tp->t_rbbr_state->cycle_start_ts = now;
++	rbbr_reset_rtt_samples(tp);
+ }
+ 
+ /* bsd/netinet/tcp_rbbr.c:625 */
+ void
+ rbbr_compute_jitter_stats_and_reset(struct tcpcb * tp)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: rbbr_compute_jitter_stats_and_reset");
++	struct tcp_rbbr_state *rbbr = tp->t_rbbr_state;
++	uint16_t n = rbbr->rtt_sample_count;
++
++	if (n == 0) {
++		if (rbbr->delay_threshold == 0) {
++			rbbr->delay_threshold = 100;
++		}
++		return;
++	}
++
++	rbbr->median_rtt = rbbr_get_rtt_median(rbbr);
++
++	for (uint16_t i = 0; i < n; i++) {
++		int32_t diff = (int32_t)(rbbr->rtt_samples[i] -
++		    rbbr->median_rtt);
++		rbbr->rtt_samples[i] = (uint32_t)abs(diff);
++	}
++
++	rbbr->rtt_sorted = false;
++	rbbr->rtt_mad = rbbr_median_of_deviations(rbbr->rtt_samples, n);
++	rbbr->delay_threshold = rbbr->median_rtt +
++	    rbbr_delay_thresh_mad_mult * rbbr->rtt_mad +
++	    rbbr_target_delay_ms;
++
++	rbbr_reset_rtt_samples(tp);
+ }
+ 
+ /* bsd/netinet/tcp_rbbr.c:679 */
+ _Bool
+ rbbr_process_probe_rwnd_cycle(struct tcpcb * tp, _Bool * utilized_out)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: rbbr_process_probe_rwnd_cycle");
++	struct tcp_rbbr_state *rbbr = tp->t_rbbr_state;
++	uint16_t n = rbbr->rtt_sample_count;
++	uint32_t median_delay;
++	bool acceptable;
++	bool utilized;
++
++	if (n == 0) {
++		acceptable = true;
++		utilized = rbbr_sender_utilizing_rwnd(tp);
++		if (tcp_is_log_enabled(tp, TLEF_LOG)) {
++			tcp_log_bbr("rbbr_process_probe_rwnd_cycle", 697, tp,
++			    "rbbr: PROBE_RWND cycle=%u NO SAMPLES win=%u "
++			    "rwnd_est=%u cycle_bytes=%llu",
++			    rbbr->probe_rwnd_cycle, rbbr->win,
++			    rbbr->rwnd_est, rbbr->cycle_bytes_rcvd);
++		}
++	} else {
++		median_delay = rbbr_get_rtt_median(rbbr);
++		utilized = rbbr_sender_utilizing_rwnd(tp);
++		acceptable = median_delay <= rbbr->delay_threshold;
++		if (acceptable) {
++			if (rbbr->probe_rwnd_cycle != 0 && utilized) {
++				rbbr->rwnd_est = rbbr->win;
++			}
++
++			if (tcp_is_log_enabled(tp, TLEF_LOG)) {
++				tcp_log_bbr("rbbr_process_probe_rwnd_cycle", 729, tp,
++				    "rbbr: PROBE_RWND ok cycle=%u median_delay=%u "
++				    "delay_thresh=%u win=%u rwnd_est=%u "
++				    "cycle_bytes=%llu utilized=%d n=%u",
++				    rbbr->probe_rwnd_cycle, median_delay,
++				    rbbr->delay_threshold, rbbr->win,
++				    rbbr->rwnd_est, rbbr->cycle_bytes_rcvd,
++				    utilized, n);
++			}
++		} else {
++			rbbr->delay_exceeded_seen = true;
++
++			if (tcp_is_log_enabled(tp, TLEF_LOG)) {
++				tcp_log_bbr("rbbr_process_probe_rwnd_cycle", 740, tp,
++				    "rbbr: PROBE_RWND delay exceeded cycle=%u "
++				    "median_delay=%u delay_threshold=%u win=%u "
++				    "rwnd_est=%u",
++				    rbbr->probe_rwnd_cycle, median_delay,
++				    rbbr->delay_threshold, rbbr->win,
++				    rbbr->rwnd_est);
++			}
++		}
++	}
++
++	*utilized_out = utilized;
++	return acceptable;
+ }
+ 
+ /* bsd/netinet/tcp_rbbr.c:768 */
+@@ -328,34 +452,27 @@ rbbr_apply_cruise_backoff(struct tcpcb * tp)
+ {
+ 	struct tcp_rbbr_state *rbbr = tp->t_rbbr_state;
+ 
+-	if (rbbr->cruise_backoff_count < (uint8_t)rbbr_cruise_backoff_times) {
+-		uint32_t old_win = rbbr->win;
++	if (rbbr->cruise_backoff_count >=
++	    (uint8_t)rbbr_cruise_backoff_times) {
++		return;
++	}
+ 
+-		rbbr->rwnd_est = (uint32_t)(((uint64_t)rbbr_cruise_backoff *
+-		    rbbr->rwnd_est) / 100);
+-		if (rbbr->rwnd_est <
+-		    (uint32_t)tp->t_maxseg * rbbr_rtt_probe_rwnd_mss) {
+-			rbbr->rwnd_est =
+-			    (uint32_t)tp->t_maxseg * rbbr_rtt_probe_rwnd_mss;
+-		}
+-		rbbr->win = ((rbbr->rwnd_est + (tp->t_maxseg >> 1)) /
+-		    tp->t_maxseg) * tp->t_maxseg;
+-		if (rbbr->win > (0xffffu << tp->rcv_scale)) {
+-			rbbr->win = 0xffffu << tp->rcv_scale;
+-		}
+-		rbbr->win_change_pending = 1;
+-		rbbr->cruise_backoff_count++;
+-		rbbr->cruise_backed_off = 1;
++	uint32_t old_win = rbbr->win;
+ 
+-		if (tcp_is_log_enabled(tp, TLEF_LOG)) {
+-			tcp_log_bbr("rbbr_apply_cruise_backoff", 877, tp,
+-			    "rbbr: CRUISE backoff old_win=%u new_win=%u "
+-			    "backoff_count=%u median_rtt=%u rtt_mad=%u "
+-			    "delay_threshold=%u",
+-			    old_win, rbbr->win, rbbr->cruise_backoff_count,
+-			    rbbr->median_rtt, rbbr->rtt_mad,
+-			    rbbr->delay_threshold);
+-		}
++	rbbr->rwnd_est = rbbr_pct(rbbr->rwnd_est, rbbr_cruise_backoff);
++	rbbr->rwnd_est = MAX(rbbr->rwnd_est, rbbr_min_win(tp));
++	rbbr_update_win(tp, rbbr->rwnd_est);
++	rbbr->cruise_backoff_count++;
++	rbbr->cruise_backed_off = true;
++
++	if (tcp_is_log_enabled(tp, TLEF_LOG)) {
++		tcp_log_bbr("rbbr_apply_cruise_backoff", 877, tp,
++		    "rbbr: CRUISE backoff old_win=%u new_win=%u "
++		    "backoff_count=%u median_rtt=%u rtt_mad=%u "
++		    "delay_threshold=%u",
++		    old_win, rbbr->win, rbbr->cruise_backoff_count,
++		    rbbr->median_rtt, rbbr->rtt_mad,
++		    rbbr->delay_threshold);
+ 	}
+ }
+ 
+@@ -363,32 +480,110 @@ rbbr_apply_cruise_backoff(struct tcpcb * tp)
+ void
+ rbbr_reset_sawtooth_detection(struct tcp_rbbr_state * rbbr)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: rbbr_reset_sawtooth_detection");
++	rbbr->prev_cruise_median = 0;
++	rbbr->total_cruise_cycles = 0;
++	rbbr->sawtooth_cycles = 0;
++	rbbr->current_chain_length = 0;
++	rbbr->queue_competition_detected = 0;
+ }
+ 
+ /* bsd/netinet/tcp_rbbr.c:912 */
+ void
+ rbbr_update_sawtooth_detection(struct tcpcb * tp, uint32_t current_median)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: rbbr_update_sawtooth_detection");
++	struct tcp_rbbr_state *rbbr = tp->t_rbbr_state;
++	uint32_t prev_median = rbbr->prev_cruise_median;
++	uint32_t noise_margin;
++	uint32_t drop_threshold;
++
++	rbbr->total_cruise_cycles++;
++	noise_margin = prev_median + rbbr_queue_detect_noise_base_ms;
++	drop_threshold = noise_margin +
++	    rbbr->rtt_mad * rbbr_queue_detect_noise_mad_mult;
++
++	if (prev_median != 0) {
++		if (current_median > drop_threshold) {
++			rbbr->current_chain_length++;
++		} else if (prev_median > current_median &&
++		    (prev_median - current_median) >
++		    prev_median * rbbr_queue_detect_drop_pct / 100) {
++			if (rbbr->current_chain_length >=
++			    (uint16_t)rbbr_queue_detect_increases) {
++				rbbr->sawtooth_cycles +=
++				    rbbr->current_chain_length;
++			}
++			rbbr->current_chain_length = 0;
++		}
++	}
++
++	rbbr->prev_cruise_median = current_median;
+ }
+ 
+ /* bsd/netinet/tcp_rbbr.c:975 */
+ void
+ rbbr_finalize_sawtooth_detection(struct tcpcb * tp)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: rbbr_finalize_sawtooth_detection");
++	struct tcp_rbbr_state *rbbr = tp->t_rbbr_state;
++	uint32_t fraction_pct;
++
++	if (rbbr->total_cruise_cycles == 0) {
++		rbbr->queue_competition_detected = false;
++		return;
++	}
++
++	fraction_pct = rbbr->sawtooth_cycles * 100 /
++	    rbbr->total_cruise_cycles;
++	if (fraction_pct >= (uint32_t)rbbr_queue_detect_fraction_pct) {
++		rbbr->queue_competition_detected = true;
++		rbbr->skip_rwnd_restrict = 2;
++		if (tcp_is_log_enabled(tp, TLEF_LOG)) {
++			tcp_log_bbr("rbbr_finalize_sawtooth_detection", 1004, tp,
++			    "rbbr: queue competition detected, skipping RWND "
++			    "restrict sawtooth_cycles=%u total_cycles=%u "
++			    "fraction=%u%% threshold=%u%%",
++			    rbbr->sawtooth_cycles, rbbr->total_cruise_cycles,
++			    fraction_pct, rbbr_queue_detect_fraction_pct);
++		}
++	} else {
++		rbbr->queue_competition_detected = false;
++	}
+ }
+ 
+ /* bsd/netinet/tcp_rbbr.c:1026 */
+ void
+ rbbr_enter_probe_rtt(struct tcpcb * tp, uint32_t now)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: rbbr_enter_probe_rtt");
++	struct tcp_rbbr_state *rbbr = tp->t_rbbr_state;
++
++	rbbr->phase = 0; /* PROBE_RTT */
++	rbbr->phase_start_ts = now;
++	rbbr->next_probe_rtt_ts = rbbr_compute_next_probe_ts(now);
++	rbbr->probe_rtt_min = 0;
++	rbbr->probe_rtt_flat_rounds = 0;
++	rbbr_start_round(tp, now);
++
++	if (rbbr->skip_rwnd_restrict != 0) {
++		rbbr->skip_rwnd_restrict--;
++		if (rbbr->skip_rwnd_restrict == 0) {
++			if (tcp_is_log_enabled(tp, TLEF_LOG)) {
++				tcp_log_bbr("rbbr_enter_probe_rtt", 1060, tp,
++				    "rbbr: resuming RWND restriction");
++			}
++		}
++	}
++
++	rbbr_update_win(tp, rbbr_min_win(tp));
++
++	rbbr->cruise_backoff_count = 0;
++	rbbr->cruise_backed_off = false;
++
++	if (tcp_is_log_enabled(tp, TLEF_LOG)) {
++		tcp_log_bbr("rbbr_enter_probe_rtt", 1075, tp,
++		    "rbbr: enter PROBE_RTT win=%u rwnd_est=%u "
++		    "skip_restrict=%u next_probe=%u",
++		    rbbr->win, rbbr->rwnd_est, rbbr->skip_rwnd_restrict,
++		    rbbr->next_probe_rtt_ts);
++	}
+ }
+ 
+ /* bsd/netinet/tcp_rbbr.c:1098 */
+@@ -396,64 +591,42 @@ void
+ rbbr_enter_probe_rwnd(struct tcpcb * tp, uint32_t now, _Bool reprobe)
+ {
+ 	struct tcp_rbbr_state *rbbr = tp->t_rbbr_state;
+-	int line;
+ 
+ 	rbbr->phase = 1; /* PROBE_RWND */
+ 	rbbr->phase_start_ts = now;
+-	rbbr->cycle_start_ts = now;
+-	rbbr->rtt_sample_count = 0;
+-	rbbr->rtt_sample_idx = 0;
+-	rbbr->rtt_sorted = 0;
+-	rbbr->cycle_bytes_rcvd = 0;
+-	rbbr->cycle_measure_ts = 0;
++	rbbr_start_round(tp, now);
+ 
+ 	if (reprobe) {
+-		uint32_t target;
+-
+-		rbbr->reprobe_active = 1;
++		rbbr->reprobe_active = true;
+ 		rbbr->probe_rwnd_cycle = 1;
+-		target = (uint32_t)(((uint64_t)rbbr_reprobe_gain *
+-		    rbbr->rwnd_est) / 100);
+-		if (target <
+-		    (uint32_t)tp->t_maxseg * rbbr_rtt_probe_rwnd_mss) {
+-			target =
+-			    (uint32_t)tp->t_maxseg * rbbr_rtt_probe_rwnd_mss;
+-		}
+-		rbbr->win = ((target + (tp->t_maxseg >> 1)) /
+-		    tp->t_maxseg) * tp->t_maxseg;
+-		if (rbbr->win > (0xffffu << tp->rcv_scale)) {
+-			rbbr->win = 0xffffu << tp->rcv_scale;
++		rbbr_update_win(tp,
++		    rbbr_pct(rbbr->rwnd_est, rbbr_reprobe_gain));
++
++		if (tcp_is_log_enabled(tp, TLEF_LOG)) {
++			tcp_log_bbr("rbbr_enter_probe_rwnd", 1123, tp,
++			    "rbbr: enter PROBE_RWND reprobe win=%u "
++			    "rwnd_est=%u delay_thresh=%u median_rtt=%u "
++			    "rtt_mad=%u",
++			    rbbr->win, rbbr->rwnd_est,
++			    rbbr->delay_threshold, rbbr->median_rtt,
++			    rbbr->rtt_mad);
+ 		}
+-		rbbr->win_change_pending = 1;
+-		line = 1123;
+ 	} else {
+-		rbbr->reprobe_active = 0;
++		rbbr->reprobe_active = false;
+ 		rbbr->probe_rwnd_cycle = 0;
+-		rbbr->rwnd_est = (uint32_t)(((uint64_t)rbbr_probe_rwnd_init_gain *
+-		    rbbr->rwnd_est) / 100);
+-		if (rbbr->rwnd_est <
+-		    (uint32_t)tp->t_maxseg * rbbr_rtt_probe_rwnd_mss) {
+-			rbbr->rwnd_est =
+-			    (uint32_t)tp->t_maxseg * rbbr_rtt_probe_rwnd_mss;
+-		}
+-		rbbr->win = ((rbbr->rwnd_est + (tp->t_maxseg >> 1)) /
+-		    tp->t_maxseg) * tp->t_maxseg;
+-		if (rbbr->win > (0xffffu << tp->rcv_scale)) {
+-			rbbr->win = 0xffffu << tp->rcv_scale;
+-		}
+-		rbbr->win_change_pending = 1;
+-		line = 1145;
+-	}
++		rbbr->rwnd_est = rbbr_pct(rbbr->rwnd_est,
++		    rbbr_probe_rwnd_init_gain);
++		rbbr->rwnd_est = MAX(rbbr->rwnd_est, rbbr_min_win(tp));
++		rbbr_update_win(tp, rbbr->rwnd_est);
+ 
+-	if (tcp_is_log_enabled(tp, TLEF_LOG)) {
+-		tcp_log_bbr("rbbr_enter_probe_rwnd", line, tp,
+-		    reprobe ?
+-		    "rbbr: enter PROBE_RWND reprobe win=%u rwnd_est=%u "
+-		    "delay_thresh=%u median_rtt=%u rtt_mad=%u" :
+-		    "rbbr: enter PROBE_RWND win=%u rwnd_est=%u "
+-		    "delay_thresh=%u median_rtt=%u rtt_mad=%u",
+-		    rbbr->win, rbbr->rwnd_est, rbbr->delay_threshold,
+-		    rbbr->median_rtt, rbbr->rtt_mad);
++		if (tcp_is_log_enabled(tp, TLEF_LOG)) {
++			tcp_log_bbr("rbbr_enter_probe_rwnd", 1145, tp,
++			    "rbbr: enter PROBE_RWND win=%u rwnd_est=%u "
++			    "delay_thresh=%u median_rtt=%u rtt_mad=%u",
++			    rbbr->win, rbbr->rwnd_est,
++			    rbbr->delay_threshold, rbbr->median_rtt,
++			    rbbr->rtt_mad);
++		}
+ 	}
+ }
+ 
+@@ -465,31 +638,11 @@ rbbr_enter_cruise(struct tcpcb * tp, uint32_t now)
+ 
+ 	rbbr->phase = 2; /* CRUISE */
+ 	rbbr->phase_start_ts = now;
+-	rbbr->cycle_start_ts = now;
+-	rbbr->rtt_sample_count = 0;
+-	rbbr->rtt_sample_idx = 0;
+-	rbbr->rtt_sorted = 0;
+-	rbbr->cycle_bytes_rcvd = 0;
+-	rbbr->cycle_measure_ts = 0;
+-	rbbr->prev_cruise_median = 0;
+-	rbbr->total_cruise_cycles = 0;
+-	rbbr->sawtooth_cycles = 0;
+-	rbbr->current_chain_length = 0;
+-	rbbr->queue_competition_detected = 0;
+-
+-	if (rbbr->rwnd_est <
+-	    (uint32_t)tp->t_maxseg * rbbr_rtt_probe_rwnd_mss) {
+-		rbbr->rwnd_est =
+-		    (uint32_t)tp->t_maxseg * rbbr_rtt_probe_rwnd_mss;
+-	}
+-	rbbr->win = ((rbbr->rwnd_est + (tp->t_maxseg >> 1)) /
+-	    tp->t_maxseg) * tp->t_maxseg;
+-	if (rbbr->win > (0xffffu << tp->rcv_scale)) {
+-		rbbr->win = 0xffffu << tp->rcv_scale;
+-	}
+-	rbbr->win_change_pending = 1;
+-	rbbr->cruise_backed_off = 0;
++	rbbr_start_round(tp, now);
++	rbbr_reset_sawtooth_detection(rbbr);
++	rbbr_update_win(tp, rbbr->rwnd_est);
+ 	rbbr->cruise_action_count = 0;
++	rbbr->cruise_backed_off = false;
+ 
+ 	if (tcp_is_log_enabled(tp, TLEF_LOG)) {
+ 		tcp_log_bbr("rbbr_enter_cruise", 1189, tp,
+@@ -505,16 +658,246 @@ rbbr_enter_cruise(struct tcpcb * tp, uint32_t now)
+ _Bool
+ rbbr_win_converged(struct tcpcb * tp, uint32_t * adv_win_out)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: rbbr_win_converged");
++	struct tcp_rbbr_state *rbbr = tp->t_rbbr_state;
++	uint32_t adv_win = SEQ_MAX(tp->rcv_adv - tp->rcv_nxt, 0);
++	uint32_t adv_target;
++
++	adv_target = tcp_round_up(rbbr->win, 1u << tp->rcv_scale) +
++	    tp->t_maxseg;
++
++	*adv_win_out = adv_win;
++	return adv_win <= adv_target;
+ }
+ 
+ /* bsd/netinet/tcp_rbbr.c:1229 */
+ void
+ rbbr_update_phase(struct tcpcb * tp, uint32_t now)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: rbbr_update_phase");
++	struct tcp_rbbr_state *rbbr = tp->t_rbbr_state;
++	uint32_t time_until_probe = rbbr_time_until_rtt_probe(rbbr, now);
++
++	switch (rbbr->phase) {
++	case 0: { /* PROBE_RTT */
++		uint32_t elapsed = now - rbbr->phase_start_ts;
++		uint32_t min_dur = MAX(rbbr_rcv_srtt_ms(tp),
++		    rbbr_rtt_probe_min_duration);
++		uint32_t max_dur = MAX(rbbr_rtt_probe_max_duration, min_dur);
++		bool conclude = false;
++		uint32_t action_ms;
++
++		if (rbbr_action_elapsed(tp, rbbr->cycle_start_ts, now,
++		    MAX(rbbr_rtt_probe_cycle_rtts, 1))) {
++			if (rbbr->rtt_sample_count != 0) {
++				uint32_t dbg_adv_win;
++				uint32_t round_median;
++				uint32_t plateau_thresh;
++				bool plateaued;
++
++				round_median = rbbr_get_rtt_median(rbbr);
++				(void)rbbr_win_converged(tp, &dbg_adv_win);
++				if (tcp_is_log_enabled(tp, TLEF_LOG)) {
++					tcp_log_bbr("rbbr_update_phase", 1277, tp,
++					    "rbbr: PROBE_RTT round median=%u "
++					    "min=%u flat=%u n=%u elapsed=%u "
++					    "adv_win=%u win=%u",
++					    round_median, rbbr->probe_rtt_min,
++					    rbbr->probe_rtt_flat_rounds,
++					    rbbr->rtt_sample_count, elapsed,
++					    dbg_adv_win, rbbr->win);
++				}
++
++				plateau_thresh = MAX(
++				    rbbr_rtt_probe_plateau_rounds, 1);
++				if (round_median < rbbr->probe_rtt_min) {
++					rbbr->probe_rtt_min = round_median;
++					rbbr->probe_rtt_flat_rounds = 0;
++				} else if (rbbr->probe_rtt_flat_rounds <
++				    (uint8_t)plateau_thresh) {
++					rbbr->probe_rtt_flat_rounds++;
++				}
++
++				plateaued = rbbr->probe_rtt_flat_rounds >=
++				    (uint8_t)plateau_thresh;
++				conclude = elapsed >= min_dur &&
++				    (plateaued || elapsed >= max_dur);
++				if (!conclude) {
++					rbbr_start_round(tp, now);
++					return;
++				}
++			} else if (elapsed < max_dur) {
++				return;
++			}
++		} else if (elapsed < max_dur) {
++			return;
++		}
++
++		rbbr_compute_jitter_stats_and_reset(tp);
++
++		action_ms = rbbr_action_duration_ms(tp,
++		    rbbr_current_rtts(rbbr));
++		if (time_until_probe < 3 * action_ms) {
++			rbbr_log_phase_end(tp, "PROBE_RTT", "CRUISE");
++			rbbr_enter_cruise(tp, now);
++		} else {
++			rbbr_log_phase_end(tp, "PROBE_RTT", "PROBE_RWND");
++			rbbr_enter_probe_rwnd(tp, now, false);
++		}
++		break;
++	}
++	case 1: { /* PROBE_RWND */
++		uint32_t action_ms = rbbr_action_duration_ms(tp,
++		    rbbr_current_rtts(rbbr));
++		bool utilized;
++		bool acceptable;
++		uint32_t win_before;
++		uint32_t probe_gain;
++
++		if (time_until_probe < 2 * action_ms) {
++			rbbr_log_phase_end(tp, "PROBE_RWND", "CRUISE");
++			rbbr_enter_cruise(tp, now);
++			return;
++		}
++
++		if (rbbr_action_elapsed(tp, rbbr->cycle_start_ts, now,
++		    rbbr_current_rtts(rbbr))) {
++			acceptable = rbbr_process_probe_rwnd_cycle(tp,
++			    &utilized);
++			if (!acceptable) {
++				if (tcp_is_log_enabled(tp, TLEF_LOG)) {
++					tcp_log_bbr("rbbr_update_phase", 1366, tp,
++					    "rbbr: PROBE_RWND exit reason="
++					    "delay_ceiling cycle=%u",
++					    rbbr->probe_rwnd_cycle);
++				}
++				rbbr_log_phase_end(tp, "PROBE_RWND", "CRUISE");
++				rbbr_enter_cruise(tp, now);
++				return;
++			}
++
++			if (rbbr->probe_rwnd_cycle >=
++			    (uint8_t)rbbr_probe_rwnd_max_cycles) {
++				if (tcp_is_log_enabled(tp, TLEF_LOG)) {
++					tcp_log_bbr("rbbr_update_phase", 1374, tp,
++					    "rbbr: PROBE_RWND exit reason="
++					    "max_cycles cycle=%u max=%u",
++					    rbbr->probe_rwnd_cycle,
++					    rbbr_probe_rwnd_max_cycles);
++				}
++				rbbr_log_phase_end(tp, "PROBE_RWND", "CRUISE");
++				rbbr_enter_cruise(tp, now);
++				return;
++			}
++
++			win_before = rbbr->win;
++			rbbr_start_round(tp, now);
++
++			if (!utilized) {
++				rbbr->win_change_pending = true;
++				if (tcp_is_log_enabled(tp, TLEF_LOG)) {
++					tcp_log_bbr("rbbr_update_phase", 1421, tp,
++					    "rbbr: PROBE_RWND hold cycle=%u "
++					    "win=%u rwnd_est=%u",
++					    rbbr->probe_rwnd_cycle, rbbr->win,
++					    rbbr->rwnd_est);
++				}
++				return;
++			}
++
++			if (rbbr->reprobe_active) {
++				probe_gain = rbbr_reprobe_gain;
++			} else {
++				probe_gain = rbbr->delay_exceeded_seen ?
++				    rbbr_probe_rwnd_main_gain :
++				    rbbr_startup_gain;
++			}
++
++			rbbr->probe_rwnd_cycle++;
++			rbbr_update_win(tp,
++			    rbbr_pct(rbbr->rwnd_est, probe_gain));
++
++			if (tcp_is_log_enabled(tp, TLEF_LOG)) {
++				tcp_log_bbr("rbbr_update_phase", 1408, tp,
++				    "rbbr: PROBE_RWND grow cycle=%u %s "
++				    "gain=%u win %u -> %u rwnd_est=%u",
++				    rbbr->probe_rwnd_cycle,
++				    rbbr->reprobe_active ? "REPROBE" :
++				    (rbbr->delay_exceeded_seen ? "MAIN" :
++				    "STARTUP"),
++				    probe_gain, win_before, rbbr->win,
++				    rbbr->rwnd_est);
++			}
++		}
++		break;
++	}
++	case 2: { /* CRUISE */
++		uint32_t rtts = rbbr_current_rtts(rbbr);
++
++		if (time_until_probe == 0) {
++			rbbr_finalize_sawtooth_detection(tp);
++			rbbr_log_phase_end(tp, "CRUISE", "PROBE_RTT");
++			rbbr_enter_probe_rtt(tp, now);
++			return;
++		}
++
++		if (rbbr_action_elapsed(tp, rbbr->cycle_start_ts, now, rtts)) {
++			uint32_t cycle_median;
++			uint32_t action_ms;
++
++			if (rbbr->rtt_sample_count == 0) {
++				rbbr_start_round(tp, now);
++				return;
++			}
++
++			cycle_median = rbbr_get_rtt_median(rbbr);
++			if (tcp_is_log_enabled(tp, TLEF_LOG)) {
++				tcp_log_bbr("rbbr_update_phase", 1472, tp,
++				    "rbbr: CRUISE cycle median_delay=%u "
++				    "delay_threshold=%u win=%u rwnd_est=%u "
++				    "samples=%u",
++				    cycle_median, rbbr->delay_threshold,
++				    rbbr->win, rbbr->rwnd_est,
++				    rbbr->rtt_sample_count);
++			}
++
++			if (rbbr->cruise_backoff_count != 0) {
++				rbbr_update_sawtooth_detection(tp,
++				    cycle_median);
++			}
++
++			if (cycle_median > rbbr->delay_threshold) {
++				rbbr->delay_exceeded_seen = true;
++				if (tcp_is_log_enabled(tp, TLEF_LOG)) {
++					tcp_log_bbr("rbbr_update_phase", 1492, tp,
++					    "rbbr: CRUISE delay exceeded "
++					    "median_delay=%u "
++					    "delay_threshold=%u win=%u "
++					    "rwnd_est=%u",
++					    cycle_median,
++					    rbbr->delay_threshold, rbbr->win,
++					    rbbr->rwnd_est);
++				}
++				rbbr_apply_cruise_backoff(tp);
++			}
++
++			rbbr_start_round(tp, now);
++
++			action_ms = rbbr_action_duration_ms(tp, rtts);
++			if (rbbr_cruise_cycles >= 1) {
++				rbbr->cruise_action_count++;
++				if (rbbr->cruise_action_count >=
++				    (uint8_t)rbbr_cruise_cycles &&
++				    time_until_probe >= 3 * action_ms) {
++					rbbr_log_phase_end(tp, "CRUISE",
++					    "PROBE_RWND");
++					rbbr_enter_probe_rwnd(tp, now, true);
++				}
++			}
++		}
++		break;
++	}
++	default:
++		return;
++	}
+ }
+ 
+ /* bsd/netinet/tcp_rbbr.c:1528 */
+@@ -588,8 +971,63 @@ tcp_rbbr_rwnd_init(struct tcpcb * tp)
+ void
+ tcp_rbbr_data_rcvd(struct tcpcb * tp, struct tcphdr * th, struct tcpopt * to, uint32_t segment_len)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_rbbr_data_rcvd");
++	struct tcp_rbbr_state *rbbr = tp->t_rbbr_state;
++	struct tcp_globals *globals = tcp_get_globals(tp);
++	uint32_t now = tcp_globals_now(globals);
++	uint32_t adv_win;
++	bool win_ready;
++	bool ts_ok;
++
++	if (rbbr == NULL) {
++		return;
++	}
++
++	win_ready = rbbr_win_converged(tp, &adv_win) &&
++	    !rbbr->win_change_pending;
++	ts_ok = (to->to_flags & TOF_TS) != 0 && to->to_tsecr != 0 &&
++	    SEQ_GEQ(to->to_tsecr, rbbr->rwnd_change_ts);
++	if (ts_ok && win_ready) {
++		uint32_t rtt = now - to->to_tsecr;
++
++		if (rtt != 0) {
++			rbbr_add_rtt_sample(tp, rtt);
++
++			if (tcp_is_log_enabled(tp, TLEF_LOG)) {
++				static uint64_t _last_ts;
++				uint64_t now64 = net_uptime();
++
++				if (now64 > _last_ts) {
++					_last_ts = now64;
++					tcp_log_bbr("tcp_rbbr_data_rcvd", 1628, tp,
++					    "rbbr: sample rtt=%u adv_win=%u "
++					    "win=%u phase=%u",
++					    rtt, adv_win, rbbr->win,
++					    rbbr->phase);
++				}
++			}
++		}
++
++		rbbr->cycle_bytes_rcvd += segment_len;
++		if (rbbr->cycle_measure_ts == 0) {
++			rbbr->cycle_measure_ts = now;
++		}
++	} else if (ts_ok && !win_ready) {
++		if (tcp_is_log_enabled(tp, TLEF_LOG)) {
++			static uint64_t _last_ts;
++			uint64_t now64 = net_uptime();
++
++			if (now64 > _last_ts) {
++				_last_ts = now64;
++				tcp_log_bbr("tcp_rbbr_data_rcvd", 1642, tp,
++				    "rbbr: skip sample, win not converged "
++				    "adv_win=%u win=%u pending=%u",
++				    adv_win, rbbr->win,
++				    rbbr->win_change_pending);
++			}
++		}
++	}
++
++	rbbr_update_phase(tp, now);
+ }
+ 
+ /* bsd/netinet/tcp_rbbr.c:1661 */
+diff --git a/bsd/netinet/tcp_subr.c b/bsd/netinet/tcp_subr.c
+index 795f7fe6c..6ec9a745e 100644
+--- a/bsd/netinet/tcp_subr.c
++++ b/bsd/netinet/tcp_subr.c
+@@ -418,7 +418,7 @@ tcp_rst_rlc_compress(void *ipgen __sized_by(ipgen_size), size_t ipgen_size __unu
+ 	return should_throttle;
+ }
+ 
+-static int scale_to_powerof2(int size);
++extern int scale_to_powerof2(int size);
+ 
+ /*
+  * This helper routine returns one of the following scaled value of size:
+diff --git a/bsd/netinet/tcp_utils.c b/bsd/netinet/tcp_utils.c
+index 4c27606b7..bdd94a2ef 100644
+--- a/bsd/netinet/tcp_utils.c
++++ b/bsd/netinet/tcp_utils.c
+@@ -13,7 +13,7 @@
+ #define RECON_BSD_NETINET_TCP_UTILS_C 1
+ 
+ /* bsd/netinet/tcp_utils.c:44 */
+-static int
++int
+ scale_to_powerof2(int size)
+ {
+ 	/* Handle special case of size = 0 */
+@@ -42,7 +42,7 @@ scale_to_powerof2(int size)
+ }
+ 
+ /* bsd/netinet/tcp_utils.c:76 */
+-static uint32_t
++uint32_t
+ tcp_ceil(double a)
+ {
+ 	double res = (uint32_t) a;
+@@ -50,7 +50,7 @@ tcp_ceil(double a)
+ }
+ 
+ /* bsd/netinet/tcp_utils.c:83 */
+-static uint32_t
++uint32_t
+ tcp_round_to(uint32_t val, uint32_t round)
+ {
+ 	/*
+@@ -61,7 +61,7 @@ tcp_round_to(uint32_t val, uint32_t round)
+ }
+ 
+ /* bsd/netinet/tcp_utils.c:98 */
+-static uint32_t
++uint32_t
+ tcp_round_up(uint32_t val, uint32_t base)
+ {
+ 	if (base == 1 || val % base == 0) {
+@@ -72,7 +72,7 @@ tcp_round_up(uint32_t val, uint32_t base)
+ }
+ 
+ /* bsd/netinet/tcp_utils.c:108 */
+-static uint32_t
++uint32_t
+ ntoh24(u_char *p __sized_by(3))
+ {
+ 	uint32_t v;

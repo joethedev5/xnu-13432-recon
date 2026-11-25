@@ -1,7 +1,7 @@
 From 5c9ef532e9af4220de54425f08bee103fdf838da Mon Sep 17 00:00:00 2001
 From: joethedev5 <deepsbx1@proton.me>
 Date: Wed, 25 Nov 2026 04:27:39 +0000
-Subject: [PATCH 41/41] Complete the PRR integration in the duplicate-ACK and
+Subject: [PATCH 41/42] Complete the PRR integration in the duplicate-ACK and
  output paths
 
 The reference calls tcp_prr_update from the already-in-fast-recovery
