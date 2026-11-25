@@ -1,0 +1,40 @@
+From e40bc5c9c6702df4607e9d3f02d9f54290457730 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 02:33:44 +0000
+Subject: [PATCH 18/18] Recover tcp_ecn_check_data_rst_heur
+
+Require negotiated ECN (or accurate ECN) and a first data segment
+(snd_una == iss + 1 with data outstanding) before running the ECN
+data-RST heuristic.
+
+Remaining explicit stubs: 289.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ bsd/netinet/tcp_ecn.c | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/bsd/netinet/tcp_ecn.c b/bsd/netinet/tcp_ecn.c
+index 3885743b6..f2becc8dd 100644
+--- a/bsd/netinet/tcp_ecn.c
++++ b/bsd/netinet/tcp_ecn.c
+@@ -339,8 +339,17 @@ tcp_ecn_check_ece_heur(struct tcpcb * tp, uint32_t pkts_acked)
+ void
+ tcp_ecn_check_data_rst_heur(struct tcpcb * tp)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_ecn_check_data_rst_heur");
++	if ((tp->ecn_flags & TE_ECN_ON) != TE_ECN_ON &&
++	    !tp->accurate_ecn_on) {
++		return;
++	}
++	if (tp->snd_una != tp->iss + 1) {
++		return;
++	}
++	if ((int32_t)(tp->snd_max - tp->snd_una) < 1) {
++		return;
++	}
++	tcp_heuristic_ecn_droprst(tp);
+ }
+ 
+ /* bsd/netinet/tcp_ecn.c:1235 */

@@ -297,3 +297,16 @@ window scale, and when timestamps are negotiated uses the selected
 receive-CC algorithm's `get_rlwin`; `tcpcb.t_recv_cc_algo` was added
 (1 = RBBR, 2 = rLedbat). The patch series now has 16 entries and still
 applies cleanly to xnu-12377.121.6. Remaining explicit stubs: 292.
+
+## 2026-11-25: AccECN acknowledgement and ECN heuristics
+
+- `tcp_accecn_do_ack`: unacked-CE accounting and ACKNOW decisions,
+  including the 2-segment/last_ack_sent boundary.
+- `tcp_ecn_check_ce_heur`: latch `TE_ECEHEURI_SET`, count CE packets
+  after 20 received packets, run `tcp_heuristic_ecn_aggressive` at the
+  19-packet boundary, and update the reference's 0x04000000 AccECN
+  flag (not named in the public header).
+- `tcp_ecn_check_data_rst_heur`: require negotiated ECN or accurate ECN
+  and a first data segment before invoking `tcp_heuristic_ecn_droprst`.
+
+The patch series now has 18 entries. Remaining explicit stubs: 289.
