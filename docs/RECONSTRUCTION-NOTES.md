@@ -185,3 +185,33 @@ Known deltas at this stage:
   tree-wide; new code uses the public namei API.
 - Stub bodies, include blocks and a few cross-file static call sites still
   need disassembly-driven completion/validation.
+
+## 2026-11-25: smallest stub bodies and the full header set
+
+Disassembly-driven recovery replaced 64 of the 373 explicit stubs with
+bodies that reproduce the reference instruction sequences:
+
+- 16 immediate-return `void` bodies, 11 pointer getters returning NULL,
+  and three integer helpers returning 0.
+- Five `KERN_NOT_SUPPORTED` (46) and two `KERN_FAILURE` (5) returns in the
+  exclaves surface, DRAM ECC and APT entry points.
+- All 19 `sptm_gen3dart_*` unsupported paths, with the exact panic format
+  string, function name, `sptm_stubs.c`, and line numbers 42-60.
+- `image4_v2_interface_register` (single assignment plus the line-13
+  "already set" panic), `ecc_panic_non_acc`, and the APT zero-fill/no-op
+  helpers.
+- `hv_trap_vm_{map,unmap,protect}` tail calls into
+  `hv_space_map_op_nested` with selectors `0xc6000015`-`c6000017`, and
+  `hv_trap_vcpu_sysregs_sync` returning `HV_NO_DEVICE` (`0xfae94006`)
+  when the current thread has no `hv_thread_target`.
+
+The 30 headers that the reference source set contains but the public tree
+does not are now reconstructed from the DWARF type graph
+(`tools/newheader_recon.py`); per-file details are in
+[NEW-HEADERS.md](NEW-HEADERS.md). `struct tcp_seg_sent` and the IOPM
+driver-assertion typedefs were relocated textually out of their public
+headers into the new ones. `vm_map_store_types_internal.h` is generated
+but its definitions still also live in `vm_map_store_internal.h`; the
+textual relocation is the remaining delta.
+
+Current stub count: 309.
