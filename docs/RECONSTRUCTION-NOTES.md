@@ -1202,3 +1202,85 @@ Apple's `__builtin_xnu_type_summary`/`__builtin_xnu_type_signature`/
 those shims are harness-only and not part of the tree.
 
 The patch series now has 50 entries; 101 explicit stubs remain.
+
+
+## 2026-11-25: VM creation and the host capability query
+
+`hv_trap_vm_create` (line 190) and `pmap_ipa_size` (line 323) were
+recovered, and the nested-call initializers in the whole file were
+rewritten to the reference's nested designated-member form.
+
+`hv_trap_vm_create`:
+
+- The creation record is 28 bytes: DWARF gives the packed
+  `hv_vm_create_t` size 28 with `min_ipa` at 0, `ipa_size` at 8,
+  `granule` at 16, `flags` at 20 and `isa` at 24 (struct at
+  hv_interface.h:225, typedef at 231).  The copy-in length is 0x1c in
+  both images.  The header now marks the structure packed.
+- Order of operations, pinned by line/column pairs: copy-in at 196:6
+  (failure returns HV_BAD_ARGUMENT, 0xfae94003, the `sub w19,w19,#2`
+  from the entry constant); `hv_vm_allowed(param.isa)` at 200
+  (columns 27/7/6 for the isa load, the call and the `!`); the
+  `assert(hv_get_support())` at 205 (kasan; the release build compiles
+  the assert out, so no code appears); `kalloc_type(hv_vm_t, Z_WAITOK)`
+  at 207:7 (`kalloc_type_view_207`), NULL returns HV_NO_RESOURCES;
+  `LIST_INIT(&vm->map_list_head)` at 212:2 (store of zero at +0x28 in
+  the release layout); the mutex assignment inside the condition,
+  `if ((vm->mtx = lck_mtx_alloc_init(&hv_lck_grp, LCK_ATTR_NULL)) ==
+  NULL)`, at 215 (columns 17 = callee start, 15 = `=`, 65 = `==`),
+  whose failure frees the object at 217 and returns at 218 (same
+  HV_NO_RESOURCES); `vm->user_map = get_task_map(current_task());` at
+  221 (columns 17 and 30 for the two calls, 6/15 for the member and
+  the assignment).
+- The nested call record is built with the nested designated form
+  `.input = { .service = 0xc6000014, .args = { ... } }` (line 223:37
+  is the initializer brace; the service store is attributed to the
+  `.input = {` line at 224:12; the args address computations to
+  `.args = {` at 226:12; the four arguments share line 227 with
+  columns 11/42/57 for `param.min_ipa`, `param.granule` and
+  `param.isa`, which places them at four tabs and pins the nesting).
+  Only `min_ipa`, `ipa_size`, `granule` and `isa` are forwarded;
+  `flags` is not.
+- `hv_return_t ret = hv_nested_call(&pnv_args);` is at 231:20 (the
+  initializer of `ret`, whose DWARF decl line is 231); the host status
+  is then reloaded from `output.result[0]` (kasan 233:22, release
+  232:10) and tested as a 32-bit value at 235:10, which is why the
+  source casts to `hv_return_t`.  A refused VM frees the mutex at 237
+  (`vm->mtx` read at column 20) and the object at 239 before returning
+  the host status at 240.
+- Success stores `output.result[1]` into `host_vm_id` at 242
+  (columns 19/17/6), clears `vcpu_online_mask` at 244 (inline
+  `bitmap_zero`, call site 244:2, member column 19), takes `hv_lock`
+  at 247:2 and checks `hv_get_vm()` at 249:6: an existing VM is
+  destroyed under the unlocked mutex and HV_BUSY returned
+  (251:3 unlock, 252:3 destroy, 253:3 return); otherwise
+  `os_ref_init_count(&vm->refcnt, NULL, 1)` (257:2),
+  `hv_set_vm(vm)` (258:2) and `hv_unlock()` (259:2) complete the
+  function, whose closing brace is at 261:1.
+
+`pmap_ipa_size`:
+
+- The statics are at 325-327 (`ipa_sizes_acquired`, `ipa_bits_4k`,
+  `ipa_bits_16k`); the function returns 0 without hv support (338) and
+  performs the double-checked one-time query under `hv_lock` (339,
+  second check 340).
+- The capability buffer is a page-aligned kernel allocation:
+  `kernel_memory_allocate(kernel_map, &caps_buffer,
+  sizeof(hv_capabilities_t), PAGE_MASK, KMA_ZERO, VM_KERN_MEMORY_HV)`
+  at 343 (call column 36; the size is 475, the mask 0x3fff and the tag
+  0x1c in the image); `hv_get_host_capabilities()` at 350; the
+  failure path frees the buffer at 352 and unlocks; the cached widths
+  are read from the packed capability structure at offsets 417
+  (`ipa_bits_4k`) and 425 (`ipa_bits_16k`), published with a
+  release-order byte store, and the buffer is freed at 361; the outer
+  unlock is at 363.  The granule switch compares 0x4000 before 0x1000
+  and returns `1ULL << bits`.
+
+The reference initializer form was confirmed against `_hv_vm_destroy`
+(`.input = {` at 174:12, `.args = {` at 176:12, `vm->host_vm_id` at
+177:9) and `hv_get_host_capabilities` (`.input = {` at 138:12, the
+`args` block attributed to line 140, and the second argument cast to
+uint64_t: the call lands at 146:15, ten columns into the line,
+matching `(uint64_t)hv_vm_max_permitted_isa(),` at four tabs).
+
+The patch series now has 51 entries; 99 explicit stubs remain.

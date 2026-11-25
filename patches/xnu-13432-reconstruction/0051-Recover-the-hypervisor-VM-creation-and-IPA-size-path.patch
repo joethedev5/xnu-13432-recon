@@ -1,0 +1,236 @@
+From 50999cb01fec0b2642a4b7db3cb4d0f8c64bbe99 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 19:40:32 +0000
+Subject: [PATCH] Recover the hypervisor VM creation and IPA size paths
+
+Reconstruct hv_trap_vm_create() from the reference kernel: copy in the
+28-byte hv_vm_create_t record, check the caller's permitted ISA, allocate
+and initialize the hv_vm_t, issue the 0xc6000014 VM-create nested call,
+and publish the object on the calling task.  The creation record is
+declared packed to match the reference structure size.
+
+Also recover pmap_ipa_size(), which queries the host capabilities once
+under hv_mtx and caches the IPA widths for the 4K and 16K granules.
+
+The nested-call parameter initializers now use the reference's nested
+designated-member form, recovered from the DWARF line/column records.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ osfmk/arm64/hv/hv_interface.h     |   7 +-
+ osfmk/arm64/hv/hv_vm_paranested.c | 149 +++++++++++++++++++++++++++---
+ 2 files changed, 144 insertions(+), 12 deletions(-)
+
+diff --git a/osfmk/arm64/hv/hv_interface.h b/osfmk/arm64/hv/hv_interface.h
+index b72486751..9d2d0c8a3 100644
+--- a/osfmk/arm64/hv/hv_interface.h
++++ b/osfmk/arm64/hv/hv_interface.h
+@@ -99,7 +99,12 @@ typedef uint32_t hv_vm_isa_t;
+ /* Maximum number of vCPUs in a VM; also the width of vcpu_online_mask. */
+ #define HV_VCPU_MAX              64
+ 
+-typedef struct {
++/*
++ * The reference structure is 28 bytes: the trailing hv_vm_isa_t is not
++ * padded out to the uint64_t alignment.  hv_trap_vm_create() copies this
++ * many bytes in from the caller.
++ */
++typedef struct __attribute__((packed)) {
+ 	uint64_t min_ipa;
+ 	uint64_t ipa_size;
+ 	uint32_t granule;
+diff --git a/osfmk/arm64/hv/hv_vm_paranested.c b/osfmk/arm64/hv/hv_vm_paranested.c
+index 9449eaf53..16154f355 100644
+--- a/osfmk/arm64/hv/hv_vm_paranested.c
++++ b/osfmk/arm64/hv/hv_vm_paranested.c
+@@ -17,8 +17,11 @@
+ #include <kern/locks.h>
+ #include <libkern/copyio.h>
+ #include <mach/vm_param.h>
++#include <os/atomic.h>
+ #include <sys/queue.h>
+ #include <sys/ubc.h>
++#include <vm/vm_kern.h>
++#include <vm/vm_kern_xnu.h>
+ 
+ #define RECON_OSFMK_ARM64_HV_HV_VM_PARANESTED_C 1
+ 
+@@ -83,10 +86,17 @@ hv_get_host_capabilities(vm_offset_t caps_buffer)
+ 	assert((caps_buffer_paddr & PAGE_MASK) == 0);
+ 
+ 	hv_nested_call_params_t pnv_args = {
+-		.input.service = 0xc6000000,
+-		.input.args = {
+-			caps_buffer_paddr,
+-			hv_vm_max_permitted_isa(),
++		.input = {
++			.service = 0xc6000000,
++			.args = {
++				caps_buffer_paddr,
++
++				/*
++				 * The host filters the capability list by the
++				 * highest ISA level this task may use.
++				 */
++				(uint64_t)hv_vm_max_permitted_isa(),
++			},
+ 		},
+ 	};
+ 
+@@ -110,9 +120,11 @@ _hv_vm_destroy(hv_vm_t * vm)
+ 	}
+ 
+ 	hv_nested_call_params_t pnv_args = {
+-		.input.service = 0xc6000018,
+-		.input.args = {
+-			vm->host_vm_id,
++		.input = {
++			.service = 0xc6000018,
++			.args = {
++				vm->host_vm_id,
++			},
+ 		},
+ 	};
+ 
+@@ -126,8 +138,75 @@ _hv_vm_destroy(hv_vm_t * vm)
+ hv_return_t
+ hv_trap_vm_create(uint64_t arg)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: hv_trap_vm_create");
++	hv_vm_create_t param = { };
++	hv_vm_t * vm;
++
++	/* Copy in the VM creation parameters. */
++	if (copyin(arg, &param, sizeof(param)) != 0) {
++		return HV_BAD_ARGUMENT;
++	}
++
++	if (!hv_vm_allowed(param.isa)) {
++		return HV_DENIED;
++	}
++
++	/* Paravirtualized nested virtualization must be available. */
++	assert(hv_get_support());
++
++	vm = kalloc_type(hv_vm_t, Z_WAITOK);
++	if (vm == NULL) {
++		return HV_NO_RESOURCES;
++	}
++
++	LIST_INIT(&vm->map_list_head);
++
++	/* Allocate the per-VM mutex. */
++	if ((vm->mtx = lck_mtx_alloc_init(&hv_lck_grp, LCK_ATTR_NULL)) == NULL) {
++		kfree_type(hv_vm_t, vm);
++		return HV_NO_RESOURCES;
++	}
++
++	vm->user_map = get_task_map(current_task());
++
++	hv_nested_call_params_t pnv_args = {
++		.input = {
++			.service = 0xc6000014,
++			.args = {
++				param.min_ipa, param.ipa_size, param.granule, param.isa,
++			},
++		},
++	};
++
++	hv_return_t ret = hv_nested_call(&pnv_args);
++
++	ret = (hv_return_t)pnv_args.output.result[0];
++
++	if (ret != HV_SUCCESS) {
++		/* The host refused the VM; release the local resources. */
++		lck_mtx_free(vm->mtx, &hv_lck_grp);
++
++		kfree_type(hv_vm_t, vm);
++		return ret;
++	}
++
++	vm->host_vm_id = pnv_args.output.result[1];
++
++	bitmap_zero(&vm->vcpu_online_mask[0], HV_VCPU_MAX);
++
++	hv_lock();
++	if (hv_get_vm() != NULL) {
++		/* This task already owns a VM. */
++		hv_unlock();
++		_hv_vm_destroy(vm);
++		return HV_BUSY;
++	}
++
++	/* Adopt the new VM as this task's hypervisor VM. */
++	os_ref_init_count(&vm->refcnt, NULL, 1);
++	hv_set_vm(vm);
++	hv_unlock();
++
++	return HV_SUCCESS;
+ }
+ 
+ /* osfmk/arm64/hv/hv_vm_paranested.c:264 */
+@@ -181,10 +260,58 @@ hv_trap_paravirtualized_nested_service(uint64_t arg)
+ 	return ret;
+ }
+ 
++/*
++ * Return the number of IPA bits the host hypervisor reports for a
++ * translation granule, as an IPA size (1 << bits).  The capability page is
++ * fetched once, under hv_mtx, and the two granule results are cached.
++ */
+ /* osfmk/arm64/hv/hv_vm_paranested.c:323 */
+ uint64_t
+ pmap_ipa_size(uint64_t granule)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: pmap_ipa_size");
++	static _Atomic bool ipa_sizes_acquired;
++	static uint64_t ipa_bits_4k;
++	static uint64_t ipa_bits_16k;
++
++	if (!hv_get_support()) {
++		return 0;
++	}
++
++	/* Query the host once; the capability values never change. */
++	if (!os_atomic_load(&ipa_sizes_acquired, acquire)) {
++		hv_lock();
++		if (!os_atomic_load(&ipa_sizes_acquired, acquire)) {
++			vm_offset_t caps_buffer;
++
++			kern_return_t allocate_retval = kernel_memory_allocate(kernel_map, &caps_buffer,
++			    sizeof(hv_capabilities_t), PAGE_MASK, KMA_ZERO, VM_KERN_MEMORY_HV);
++			if (allocate_retval != KERN_SUCCESS) {
++				hv_unlock();
++				return 0;
++			}
++
++			hv_return_t get_caps_retval = hv_get_host_capabilities(caps_buffer);
++			if (get_caps_retval != HV_SUCCESS) {
++				kmem_free(kernel_map, caps_buffer, sizeof(hv_capabilities_t));
++				hv_unlock();
++				return 0;
++			}
++
++			hv_capabilities_t * cap = (hv_capabilities_t *)caps_buffer;
++			ipa_bits_4k = cap->ipa_bits_4k;
++			ipa_bits_16k = cap->ipa_bits_16k;
++			os_atomic_store(&ipa_sizes_acquired, true, release);
++			kmem_free(kernel_map, caps_buffer, sizeof(hv_capabilities_t));
++		}
++		hv_unlock();
++	}
++
++	switch (granule) {
++	case 0x1000:
++		return 1ULL << ipa_bits_4k;
++	case 0x4000:
++		return 1ULL << ipa_bits_16k;
++	default:
++		return 0;
++	}
+ }
+-- 
+2.47.3
+

@@ -9,7 +9,7 @@ Apply in numeric order from a clean checkout:
 
 ```
 git checkout xnu-12377.121.6
-git am 0001-*.patch ... 0050-*.patch
+git am 0001-*.patch ... 0051-*.patch
 ```
 
 Contents:
@@ -124,6 +124,11 @@ Contents:
     object teardown) and `hv_trap_paravirtualized_nested_service`,
     with the real 96-byte `hv_nested_call_params_t` and the LIST-based
     `hv_map_entry_s` linkage.
+51. The hypervisor VM creation path `hv_trap_vm_create` (28-byte packed
+    `hv_vm_create_t` copy-in, permitted-ISA check, VM object allocation,
+    the 0xc6000014 host call and task publication) and the one-time host
+    capability query behind `pmap_ipa_size`, with the reference nested
+    designated-initializer form for the nested-call records.
 
 The patches contain only public xnu text plus original reconstruction;
 no Apple binary, dSYM, SDK payload or extracted proprietary header is
