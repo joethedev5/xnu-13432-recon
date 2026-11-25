@@ -427,3 +427,36 @@ Four more translation units advanced:
   reference's window rounding and `0xffff << rcv_scale` clamp.
 
 The patch series now has 28 entries; 215 explicit stubs remain.
+
+## 2026-11-25: Virtual environment and the last ECN paths
+
+`osfmk/kern/virtual_env.c` is complete: all 20 reference bodies are
+recovered.  The object is a refcounted `struct virtual_env` (uuid,
+lazily materialized `IKOT_VIRTUAL_ENV` Mach port, lock, and copied-in
+subsystem root path) with `virtual_env_count`/0x1000 limit growth,
+`os_refgrp` accounting, the `virtual_env_no_senders` kobject callback
+and the MIG create/get-info/get-current entry points.  Availability
+checks the development-variant bits (`osvariant_status & 0xc00000 ==
+0xc00000`) and caches the answer, so this also required making the
+status word non-static in `bsd/kern/kern_sysctl.c` and declaring it in
+`variant_internal.h`.  The public create path's entitlement is
+`com.apple.private.virtualenv.manager`; the exec helper
+`virtual_env_create_from_subsystem_root_path` is what will replace
+`p_subsystem_root_path` once the exec/fork paths are reconstructed.
+
+`tcp_ecn.c` now has no stubs.  The SYN-ACK handling is split into
+`tcp_classic_ecn_process_synack`, `tcp_accecn_process_synack` (with
+the TH_AE/TH_CWR/TH_ECE ACE flag matrix and the ECT/CE setup bits)
+and `tcp_ecn_update_heuristics_synack`, dispatched by
+`tcp_ecn_process_synack`.  `tcp_ecn_lastack_respond`,
+`tcp_accecn_disable_option`, `tcp_ecn_set_ip`/`tcp_ecn_set_ip6` and
+`tcp_ecn_check_ece_heur` are recovered from the development-kernel
+image.  The ACE and AccECN option decoders live in this file in 13432
+(`tcp_accecn_process_ace`/`tcp_accecn_process_options`), so the
+duplicate public definitions were deleted from `tcp_input.c`.  The
+reference counts CE marks in `t_ecn_capable_packets_marked/acked`
+rather than the removed `total_ect_packets_*` fields; the remaining
+`tcp_input.c` increments still use the old fields and are a known
+existing-file delta.
+
+The patch series now has 30 entries; 185 explicit stubs remain.

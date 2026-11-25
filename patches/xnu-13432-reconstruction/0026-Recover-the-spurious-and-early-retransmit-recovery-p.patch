@@ -1,7 +1,7 @@
 From 601574c74f95b571ba84cdf8443a19b9efd19c47 Mon Sep 17 00:00:00 2001
 From: joethedev5 <deepsbx1@proton.me>
 Date: Wed, 25 Nov 2026 03:11:46 +0000
-Subject: [PATCH 26/28] Recover the spurious and early retransmit recovery
+Subject: [PATCH 26/30] Recover the spurious and early retransmit recovery
  paths
 
 Relocate the public tcp_input.c recovery logic into the 13432

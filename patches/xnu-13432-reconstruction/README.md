@@ -9,7 +9,7 @@ Apply in numeric order from a clean checkout:
 
 ```
 git checkout xnu-12377.121.6
-git am 0001-*.patch ... 0028-*.patch
+git am 0001-*.patch ... 0030-*.patch
 ```
 
 Contents:
@@ -39,6 +39,12 @@ Contents:
 26. The spurious/early retransmit recovery paths in `tcp_recovery.c`.
 27. The RTT helpers and `tcp_compute_rxmit_time` in `tcp_rtt.c`.
 28. The RBBR phase transitions and cruise backoff.
+29. The virtual-environment object: lifecycle, lazy Mach port
+    kobject, no-senders callback, MIG entry points, path copy-in and
+    the development-variant availability policy.
+30. The remaining AccECN acknowledgement paths: SYN-ACK dispatch and
+    helpers, last-ACK response, the ACE and option decoders moved out
+    of `tcp_input.c`, and the ECN marking helpers.
 
 The patches contain only public xnu text plus original reconstruction;
 no Apple binary, dSYM, SDK payload or extracted proprietary header is

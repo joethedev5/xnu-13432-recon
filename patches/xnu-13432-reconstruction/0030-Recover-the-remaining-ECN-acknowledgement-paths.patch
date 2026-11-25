@@ -1,0 +1,613 @@
+From 51cab82f79b5f8d51786c6ae568dcc447a64cbcb Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 03:31:29 +0000
+Subject: [PATCH 30/30] Recover the remaining ECN acknowledgement paths
+
+Complete bsd/netinet/tcp_ecn.c: split the inlined classic, accurate and
+heuristic SYN-ACK helpers back out of tcp_ecn_process_synack, and
+recover the last-ACK responder, the AccECN option disabler, the
+AccECN ACE/option decoders, the IPv4/IPv6 ECN marking helpers and the
+ECE heuristic.  The ACE and option decoders moved here from tcp_input.c
+in the reference kernel, so drop the now-unused public-base copies from
+tcp_input.c and call the renamed helpers from tcp_process_accecn.
+
+The reference kernel tracks the marked/acked ECT packet counts in
+t_ecn_capable_packets_marked/acked rather than total_ect_packets_*;
+tcp_ecn.c uses the former.  The tcp_input.c increments and the
+public-base tcpcb fields still need the same treatment.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ bsd/netinet/tcp_ecn.c   | 388 +++++++++++++++++++++++++---------------
+ bsd/netinet/tcp_input.c |  78 --------
+ 2 files changed, 244 insertions(+), 222 deletions(-)
+
+diff --git a/bsd/netinet/tcp_ecn.c b/bsd/netinet/tcp_ecn.c
+index 473aab549..f8522d9cb 100644
+--- a/bsd/netinet/tcp_ecn.c
++++ b/bsd/netinet/tcp_ecn.c
+@@ -12,6 +12,7 @@
+ #include <netinet/tcp_ecn.h>
+ #include <netinet/tcp_var.h>
+ #include <netinet/ip.h>
++#include <netinet/ip6.h>
+ #include <net/droptap.h>
+ 
+ #define RECON_BSD_NETINET_TCP_ECN_C 1
+@@ -72,24 +73,135 @@ tcp_ecn_process_syn(struct tcpcb * tp, int ace_flags, uint8_t ip_ecn)
+ void
+ tcp_classic_ecn_process_synack(struct tcpcb * tp)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_classic_ecn_process_synack");
++	tp->ecn_flags |= TE_SETUPRECEIVED;
++	if (TCP_ECN_ENABLED(tp)) {
++		tcp_heuristic_ecn_success(tp);
++		tcpstat.tcps_ecn_client_success++;
++	}
++
++	if (tp->ecn_flags & TE_ACE_SETUPSENT) {
++		/*
++		 * Sent AccECN SYN but received classic ECN SYN-ACK.
++		 * Set classic ECN related flags.
++		 */
++		tp->ecn_flags |= (TE_SETUPSENT | TE_SENDIPECT);
++		tp->ecn_flags &= ~TE_ACE_SETUPSENT;
++		if (tp->t_client_accecn_state ==
++		    tcp_connection_client_accurate_ecn_feature_enabled) {
++			tp->t_client_accecn_state =
++			    tcp_connection_client_classic_ecn_available;
++		}
++	}
+ }
+ 
+ /* bsd/netinet/tcp_ecn.c:139 */
+ void
+ tcp_accecn_process_synack(struct tcpcb * tp, int ace_flags)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_accecn_process_synack");
++	uint32_t ecn_flags;
++
++	/* Initialize sender side packet & byte counters */
++	tp->t_aecn.t_snd_ce_packets = 5;
++	tp->t_aecn.t_snd_ect1_bytes = tp->t_aecn.t_snd_ect0_bytes = 1;
++	tp->t_aecn.t_snd_ce_bytes = 0;
++
++	ecn_flags = tp->ecn_flags;
++	switch (ace_flags) {
++	case (0 | TH_CWR | 0):
++		/*
++		 * Non-ECT SYN was delivered.  The reference treats
++		 * this as mangling and stops sending IP ECT.
++		 */
++		tp->ecn_flags = (ecn_flags & ~TE_SENDIPECT) |
++		    TE_ACE_FINAL_ACK_3WHS | TE_ACE_SETUPRECEIVED;
++		tcpstat.tcps_ecn_ace_syn_not_ect++;
++		tp->t_client_accecn_state =
++		    tcp_connection_client_accurate_ecn_negotiation_success_ect_mangling_detected;
++		break;
++	case (0 | TH_CWR | TH_ECE):
++		/* ECT1 SYN was delivered */
++		tp->ecn_flags = ecn_flags | TE_ACE_FINAL_ACK_3WHS |
++		    TE_ACE_SETUPRECEIVED | TE_SENDIPECT;
++		tcpstat.tcps_ecn_ace_syn_ect1++;
++		tp->t_client_accecn_state =
++		    tcp_connection_client_accurate_ecn_negotiation_success;
++		break;
++	case (TH_AE | 0 | 0):
++		/* ECT0 SYN was delivered, mangling detected */
++		tp->ecn_flags = (ecn_flags & ~TE_SENDIPECT) |
++		    TE_ACE_FINAL_ACK_3WHS | TE_ACE_SETUPRECEIVED;
++		tcpstat.tcps_ecn_ace_syn_ect0++;
++		tp->t_client_accecn_state =
++		    tcp_connection_client_accurate_ecn_negotiation_success_ect_mangling_detected;
++		break;
++	case (TH_AE | TH_CWR | 0):
++		/* CE SYN was delivered */
++		tp->ecn_flags = ecn_flags | TE_ACE_FINAL_ACK_3WHS |
++		    TE_ACE_SETUPRECEIVED | TE_SENDIPECT;
++		tp->t_client_accecn_state =
++		    tcp_connection_client_accurate_ecn_negotiation_success;
++		if (tp->t_maxseg != 0) {
++			tp->snd_cwnd = 2 * tp->t_maxseg;
++		}
++		tcpstat.tcps_ecn_ace_syn_ce++;
++		break;
++	default:
++		/* Unused values for forward compatibility */
++		tp->ecn_flags = (ecn_flags & ~TE_SENDIPECT) |
++		    TE_ACE_FINAL_ACK_3WHS;
++		break;
++	}
++	tcp_set_accurate_ecn(tp);
++
++	if (TCP_ECN_ENABLED(tp)) {
++		tcp_heuristic_ecn_success(tp);
++		tcpstat.tcps_ecn_client_success++;
++	}
++	/*
++	 * A TCP client in AccECN mode MUST feed back which of the 4
++	 * possible values of the IP-ECN field was received in the
++	 * SYN/ACK.  Initialize the receive counters first.
++	 */
++	tp->t_aecn.t_rcv_ce_packets = 5;
++	tp->t_aecn.t_rcv_ect0_bytes = tp->t_aecn.t_rcv_ect1_bytes = 1;
++	tp->t_aecn.t_rcv_ce_bytes = 0;
+ }
+ 
+ /* bsd/netinet/tcp_ecn.c:227 */
+ void
+ tcp_ecn_update_heuristics_synack(struct tcpcb * tp)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_ecn_update_heuristics_synack");
++	if ((tp->ecn_flags & (TE_SETUPSENT | TE_ACE_SETUPSENT)) &&
++	    tp->t_rxtshift == 0) {
++		tcp_heuristic_ecn_success(tp);
++		tcpstat.tcps_ecn_not_supported++;
++	}
++	if (((tp->ecn_flags & TE_SETUPSENT) != 0 && tp->t_rxtshift == 1) ||
++	    ((tp->ecn_flags & TE_ACE_SETUPSENT) != 0 && tp->t_rxtshift == 2)) {
++		/*
++		 * The SYN ECN option was likely dropped at the
++		 * network; check the ACK for the retransmission.
++		 */
++		tcp_heuristic_ecn_loss(tp);
++	}
++
++	/* non-ECN-setup SYN-ACK */
++	tp->ecn_flags &= ~TE_SENDIPECT;
++	/*
++	 * If the Accurate ECN SYN was retransmitted twice and a
++	 * non-ECN SYN-ACK was received, consider AccECN blackholed.
++	 */
++	if ((tp->ecn_flags & TE_LOST_SYN) && tp->t_rxtshift <= 2 &&
++	    tp->t_client_accecn_state ==
++	    tcp_connection_client_accurate_ecn_feature_enabled) {
++		tp->t_client_accecn_state =
++		    tcp_connection_client_accurate_ecn_negotiation_blackholed;
++	}
++	if (tp->t_client_accecn_state ==
++	    tcp_connection_client_accurate_ecn_feature_enabled) {
++		tp->t_client_accecn_state =
++		    tcp_connection_client_ecn_not_available;
++	}
+ }
+ 
+ /* bsd/netinet/tcp_ecn.c:265 */
+@@ -99,93 +211,9 @@ tcp_ecn_process_synack(struct tcpcb * tp, struct tcpopt * to, int thflags,
+ {
+ 	if ((thflags & (TH_ECE | TH_CWR)) == TH_ECE) {
+ 		/* Receiving Any|0|1 is classic ECN-setup SYN-ACK */
+-		tp->ecn_flags |= TE_SETUPRECEIVED;
+-		if (TCP_ECN_ENABLED(tp)) {
+-			tcp_heuristic_ecn_success(tp);
+-			tcpstat.tcps_ecn_client_success++;
+-		}
+-
+-		if (tp->ecn_flags & TE_ACE_SETUPSENT) {
+-			/*
+-			 * Sent AccECN SYN but received classic ECN SYN-ACK.
+-			 * Set classic ECN related flags.
+-			 */
+-			tp->ecn_flags |= (TE_SETUPSENT | TE_SENDIPECT);
+-			tp->ecn_flags &= ~TE_ACE_SETUPSENT;
+-			if (tp->t_client_accecn_state ==
+-			    tcp_connection_client_accurate_ecn_feature_enabled) {
+-				tp->t_client_accecn_state =
+-				    tcp_connection_client_classic_ecn_available;
+-			}
+-		}
++		tcp_classic_ecn_process_synack(tp);
+ 	} else if (tp->l4s_enabled && ace_flags != 0 && ace_flags != TH_ACE) {
+-		uint32_t ecn_flags;
+-
+-		/* Initialize sender side packet & byte counters */
+-		tp->t_aecn.t_snd_ce_packets = 5;
+-		tp->t_aecn.t_snd_ect1_bytes = tp->t_aecn.t_snd_ect0_bytes = 1;
+-		tp->t_aecn.t_snd_ce_bytes = 0;
+-
+-		ecn_flags = tp->ecn_flags;
+-		switch (ace_flags) {
+-		case (0 | TH_CWR | 0):
+-			/*
+-			 * Non-ECT SYN was delivered.  The reference treats
+-			 * this as mangling and stops sending IP ECT.
+-			 */
+-			tp->ecn_flags = (ecn_flags & ~TE_SENDIPECT) |
+-			    TE_ACE_FINAL_ACK_3WHS | TE_ACE_SETUPRECEIVED;
+-			tcpstat.tcps_ecn_ace_syn_not_ect++;
+-			tp->t_client_accecn_state =
+-			    tcp_connection_client_accurate_ecn_negotiation_success_ect_mangling_detected;
+-			break;
+-		case (0 | TH_CWR | TH_ECE):
+-			/* ECT1 SYN was delivered */
+-			tp->ecn_flags = ecn_flags | TE_ACE_FINAL_ACK_3WHS |
+-			    TE_ACE_SETUPRECEIVED | TE_SENDIPECT;
+-			tcpstat.tcps_ecn_ace_syn_ect1++;
+-			tp->t_client_accecn_state =
+-			    tcp_connection_client_accurate_ecn_negotiation_success;
+-			break;
+-		case (TH_AE | 0 | 0):
+-			/* ECT0 SYN was delivered, mangling detected */
+-			tp->ecn_flags = (ecn_flags & ~TE_SENDIPECT) |
+-			    TE_ACE_FINAL_ACK_3WHS | TE_ACE_SETUPRECEIVED;
+-			tcpstat.tcps_ecn_ace_syn_ect0++;
+-			tp->t_client_accecn_state =
+-			    tcp_connection_client_accurate_ecn_negotiation_success_ect_mangling_detected;
+-			break;
+-		case (TH_AE | TH_CWR | 0):
+-			/* CE SYN was delivered */
+-			tp->ecn_flags = ecn_flags | TE_ACE_FINAL_ACK_3WHS |
+-			    TE_ACE_SETUPRECEIVED | TE_SENDIPECT;
+-			tp->t_client_accecn_state =
+-			    tcp_connection_client_accurate_ecn_negotiation_success;
+-			if (tp->t_maxseg != 0) {
+-				tp->snd_cwnd = 2 * tp->t_maxseg;
+-			}
+-			tcpstat.tcps_ecn_ace_syn_ce++;
+-			break;
+-		default:
+-			/* Unused values for forward compatibility */
+-			tp->ecn_flags = (ecn_flags & ~TE_SENDIPECT) |
+-			    TE_ACE_FINAL_ACK_3WHS;
+-			break;
+-		}
+-		tcp_set_accurate_ecn(tp);
+-
+-		if (TCP_ECN_ENABLED(tp)) {
+-			tcp_heuristic_ecn_success(tp);
+-			tcpstat.tcps_ecn_client_success++;
+-		}
+-		/*
+-		 * A TCP client in AccECN mode MUST feed back which of the 4
+-		 * possible values of the IP-ECN field was received in the
+-		 * SYN/ACK.  Initialize the receive counters first.
+-		 */
+-		tp->t_aecn.t_rcv_ce_packets = 5;
+-		tp->t_aecn.t_rcv_ect0_bytes = tp->t_aecn.t_rcv_ect1_bytes = 1;
+-		tp->t_aecn.t_rcv_ce_bytes = 0;
++		tcp_accecn_process_synack(tp, ace_flags);
+ 
+ 		/* Increment packet & byte counters based on IP-ECN */
+ 		tcp_ecn_update_counters(tp, tlen, segment_count, ip_ecn);
+@@ -214,37 +242,7 @@ tcp_ecn_process_synack(struct tcpcb * tp, struct tcpopt * to, int thflags,
+ 			tp->t_last_ack_tsecr = to->to_tsecr;
+ 		}
+ 	} else {
+-		if ((tp->ecn_flags & (TE_SETUPSENT | TE_ACE_SETUPSENT)) &&
+-		    tp->t_rxtshift == 0) {
+-			tcp_heuristic_ecn_success(tp);
+-			tcpstat.tcps_ecn_not_supported++;
+-		}
+-		if (((tp->ecn_flags & TE_SETUPSENT) != 0 && tp->t_rxtshift == 1) ||
+-		    ((tp->ecn_flags & TE_ACE_SETUPSENT) != 0 && tp->t_rxtshift == 2)) {
+-			/*
+-			 * The SYN ECN option was likely dropped at the
+-			 * network; check the ACK for the retransmission.
+-			 */
+-			tcp_heuristic_ecn_loss(tp);
+-		}
+-
+-		/* non-ECN-setup SYN-ACK */
+-		tp->ecn_flags &= ~TE_SENDIPECT;
+-		/*
+-		 * If the Accurate ECN SYN was retransmitted twice and a
+-		 * non-ECN SYN-ACK was received, consider AccECN blackholed.
+-		 */
+-		if ((tp->ecn_flags & TE_LOST_SYN) && tp->t_rxtshift <= 2 &&
+-		    tp->t_client_accecn_state ==
+-		    tcp_connection_client_accurate_ecn_feature_enabled) {
+-			tp->t_client_accecn_state =
+-			    tcp_connection_client_accurate_ecn_negotiation_blackholed;
+-		}
+-		if (tp->t_client_accecn_state ==
+-		    tcp_connection_client_accurate_ecn_feature_enabled) {
+-			tp->t_client_accecn_state =
+-			    tcp_connection_client_ecn_not_available;
+-		}
++		tcp_ecn_update_heuristics_synack(tp);
+ 	}
+ }
+ 
+@@ -567,16 +565,32 @@ tcp_ecn_synack_respond(struct tcpcb * tp, uint16_t thflags)
+ uint16_t
+ tcp_ecn_lastack_respond(struct tcpcb * tp, uint16_t thflags)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_ecn_lastack_respond");
++	thflags &= ~TH_ACE;
++
++	if (tp->ecn_flags & TE_ACE_SETUP_CE) {
++		thflags |= (TH_CWR | TH_AE);
++	} else if (tp->ecn_flags & TE_ACE_SETUP_ECT0) {
++		thflags |= TH_AE;
++	} else if (tp->ecn_flags & TE_ACE_SETUP_ECT1) {
++		thflags |= (TH_CWR | TH_ECE);
++	} else if (tp->ecn_flags & TE_ACE_SETUP_NON_ECT) {
++		thflags |= TH_CWR;
++	}
++
++	tp->ecn_flags &= ~(TE_ACE_SETUP_NON_ECT | TE_ACE_SETUP_ECT1 |
++	    TE_ACE_SETUP_ECT0 | TE_ACE_SETUP_CE | TE_ACE_FINAL_ACK_3WHS |
++	    TE_SETUPSENT);
++
++	return thflags;
+ }
+ 
+ /* bsd/netinet/tcp_ecn.c:657 */
+ void
+ tcp_accecn_disable_option(struct tcpcb * tp)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_accecn_disable_option");
++	if ((tp->ecn_flags & TE_RETRY_WITHOUT_ACO) == 0) {
++		tp->ecn_flags |= TE_RETRY_WITHOUT_ACO;
++	}
+ }
+ 
+ /* bsd/netinet/tcp_ecn.c:666 */
+@@ -688,16 +702,79 @@ ace_bleaching:
+ uint32_t
+ tcp_accecn_process_ace(struct tcpcb * tp, uint32_t pkts_acked, uint64_t old_sceb, uint8_t ace)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_accecn_process_ace");
++	/* Congestion was experienced if delta_cep > 0 */
++	uint32_t delta = 0, safe_delta = 0;
++	delta = (ace + TCP_ACE_DIV -
++	    (tp->t_aecn.t_snd_ce_packets & TCP_ACE_MASK)) & TCP_ACE_MASK;
++	if (pkts_acked <= TCP_ACE_MASK) {
++		return delta;
++	}
++
++	uint64_t d_ceb = tp->t_aecn.t_snd_ce_bytes - old_sceb;
++	safe_delta = pkts_acked - ((pkts_acked - delta) & TCP_ACE_MASK);
++
++	if (d_ceb == 0 || d_ceb < safe_delta * tp->t_maxseg >> 1) {
++		return delta;
++	}
++
++	return safe_delta;
+ }
+ 
+ /* bsd/netinet/tcp_ecn.c:773 */
+ uint32_t
+ tcp_accecn_process_options(struct tcpcb * tp, struct tcpopt * to)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_accecn_process_options");
++	int delta = 0;
++	uint32_t ce_bytes = 0;
++
++	if (to->to_num_accecn >= 1) {
++		delta = ntoh24(to->to_accecn + 0);
++		if (to->to_accecn_order == 0) {
++			delta = (delta + TCP_ACO_DIV -
++			    (tp->t_aecn.t_snd_ect0_bytes & TCP_ACO_MASK)) & TCP_ACO_MASK;
++			if (delta < 0) {
++				os_log_error(tcp_log_handle, "delta for AccECN0 options (ECT0 bytes) can't be zero");
++			}
++			tp->t_aecn.t_snd_ect0_bytes += delta;
++		} else {
++			delta = (delta + TCP_ACO_DIV -
++			    (tp->t_aecn.t_snd_ect1_bytes & TCP_ACO_MASK)) & TCP_ACO_MASK;
++			if (delta < 0) {
++				os_log_error(tcp_log_handle, "delta for AccECN1 options (ECT1 bytes) can't be zero");
++			}
++			tp->t_aecn.t_snd_ect1_bytes += delta;
++		}
++	}
++	if (to->to_num_accecn >= 2) {
++		delta = ntoh24(to->to_accecn + 1 * TCPOLEN_ACCECN_COUNTER);
++		delta = (delta + TCP_ACO_DIV -
++		    (tp->t_aecn.t_snd_ce_bytes & TCP_ACO_MASK)) & TCP_ACO_MASK;
++		if (delta < 0) {
++			os_log_error(tcp_log_handle, "delta for AccECN options (CE bytes) can't be zero");
++		}
++		tp->t_aecn.t_snd_ce_bytes += delta;
++		ce_bytes = delta;
++	}
++	if (to->to_num_accecn >= 3) {
++		delta = ntoh24(to->to_accecn + 2 * TCPOLEN_ACCECN_COUNTER);
++		if (to->to_accecn_order == 0) {
++			delta = (delta + TCP_ACO_DIV -
++			    (tp->t_aecn.t_snd_ect1_bytes & TCP_ACO_MASK)) & TCP_ACO_MASK;
++			if (delta < 0) {
++				os_log_error(tcp_log_handle, "delta for AccECN0 options (ECT1 bytes) can't be zero");
++			}
++			tp->t_aecn.t_snd_ect1_bytes += delta;
++		} else {
++			delta = (delta + TCP_ACO_DIV -
++			    (tp->t_aecn.t_snd_ect0_bytes & TCP_ACO_MASK)) & TCP_ACO_MASK;
++			if (delta < 0) {
++				os_log_error(tcp_log_handle, "delta for AccECN1 options (ECT0 bytes) can't be zero");
++			}
++			tp->t_aecn.t_snd_ect0_bytes += delta;
++		}
++	}
++
++	return ce_bytes;
+ }
+ 
+ /* bsd/netinet/tcp_ecn.c:829 */
+@@ -711,8 +788,8 @@ tcp_process_accecn(struct tcpcb *tp, struct tcpopt *to, struct tcphdr *th,
+ 	}
+ 
+ 	uint64_t old_sceb = tp->t_aecn.t_snd_ce_bytes;
+-	uint32_t new_ce_bytes = tcp_process_accecn_options(tp, to);
+-	uint32_t delta = tcp_process_ace_field(tp, pkts_acked, old_sceb, ace);
++	uint32_t new_ce_bytes = tcp_accecn_process_options(tp, to);
++	uint32_t delta = tcp_accecn_process_ace(tp, pkts_acked, old_sceb, ace);
+ 	tp->t_aecn.t_snd_ce_packets += delta;
+ 	tp->t_aecn.t_delta_ce_packets = delta;
+ 
+@@ -724,18 +801,17 @@ tcp_process_accecn(struct tcpcb *tp, struct tcpopt *to, struct tcphdr *th,
+ 
+ 	if (delta > 0) {
+ 		tp->ecn_flags |= (TE_INRECOVERY);
+-		tp->total_ect_packets_marked += delta;
++		tp->t_ecn_capable_packets_marked += delta;
+ 
+ 		/* update the stats */
+ 		tcpstat.tcps_ecn_ace_recv_ce += tp->t_aecn.t_delta_ce_packets;
+-		/* CE packets counter start at 5 */
+-		tp->t_ecn_capable_packets_marked = tp->t_aecn.t_snd_ce_packets - 5;
+ 		tcp_ccdbg_trace(tp, th, TCP_CC_ECN_RCVD);
+ 	}
+ 
+ 	if (CC_ALGO(tp)->process_ecn != NULL) {
+-		CC_ALGO(tp)->process_ecn(tp, th, new_ce_bytes, tp->total_ect_packets_marked,
+-		    tp->total_ect_packets_acked);
++		CC_ALGO(tp)->process_ecn(tp, th, new_ce_bytes,
++		    tp->t_ecn_capable_packets_marked,
++		    tp->t_ecn_capable_packets_acked);
+ 	}
+ 
+ 	tp->t_aecn.accecn_processed = 1;
+@@ -958,16 +1034,24 @@ tcp_accecn_add_option(struct tcpcb * tp, uint16_t flags, uint32_t *__indexable l
+ void
+ tcp_ecn_set_ip6(struct tcpcb * tp, struct ip6_hdr * ip6)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_ecn_set_ip6");
++	if (tp->ecn_flags & TE_FORCE_ECT1) {
++		ip6->ip6_flow |= htonl(IPTOS_ECN_ECT1 << 20);
++	} else if (tp->ecn_flags & TE_FORCE_ECT0) {
++		ip6->ip6_flow |= htonl(IPTOS_ECN_ECT0 << 20);
++	}
+ }
+ 
+ /* bsd/netinet/tcp_ecn.c:1125 */
+ void
+ tcp_ecn_set_ip(struct tcpcb * tp, struct inpcb * inp, struct ip * ip)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_ecn_set_ip");
++	ip->ip_tos |= inp->inp_depend4.inp4_ip_tos & ~IPTOS_ECN_MASK;
++
++	if (tp->ecn_flags & TE_FORCE_ECT1) {
++		ip->ip_tos |= IPTOS_ECN_ECT1;
++	} else if (tp->ecn_flags & TE_FORCE_ECT0) {
++		ip->ip_tos |= IPTOS_ECN_ECT0;
++	}
+ }
+ 
+ /* bsd/netinet/tcp_ecn.c:1139 */
+@@ -1024,8 +1108,24 @@ tcp_ecn_check_ce_heur(struct tcpcb * tp, uint32_t pkts_rcvd)
+ void
+ tcp_ecn_check_ece_heur(struct tcpcb * tp, uint32_t pkts_acked)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_ecn_check_ece_heur");
++	if (tp->ecn_flags & TE_ECEHEURI_SET) {
++		return;
++	}
++
++	tp->t_ecn_recv_ece_pkt =
++	    (uint8_t)(tp->t_ecn_recv_ece_pkt + pkts_acked);
++
++	if (tp->t_ecn_capable_packets_acked < 20) {
++		return;
++	}
++	if (tp->t_ecn_recv_ece_pkt < 19) {
++		tp->ecn_flags |= TE_ECEHEURI_SET;
++		return;
++	}
++
++	tcp_heuristic_ecn_aggressive(tp);
++	tp->ecn_flags &= ~(TE_SENDIPECT | TE_ECEHEURI_SET);
++	tp->ecn_flags |= TE_ECEHEURI_SET;
+ }
+ 
+ /* bsd/netinet/tcp_ecn.c:1220 */
+diff --git a/bsd/netinet/tcp_input.c b/bsd/netinet/tcp_input.c
+index 0e805cdfb..6f9f353a8 100644
+--- a/bsd/netinet/tcp_input.c
++++ b/bsd/netinet/tcp_input.c
+@@ -1431,84 +1431,6 @@ tcp_input_process_accecn_last_ack(struct tcpcb *tp, struct tcpopt *to,
+ 	}
+ }
+ 
+-static uint32_t
+-tcp_process_ace_field(struct tcpcb *tp, uint32_t pkts_acked, uint64_t old_sceb, uint8_t ace)
+-{
+-	/* Congestion was experienced if delta_cep > 0 */
+-	uint32_t delta = 0, safe_delta = 0;
+-	delta = (ace + TCP_ACE_DIV -
+-	    (tp->t_aecn.t_snd_ce_packets & TCP_ACE_MASK)) & TCP_ACE_MASK;
+-	if (pkts_acked <= TCP_ACE_MASK) {
+-		return delta;
+-	}
+-
+-	uint64_t d_ceb = tp->t_aecn.t_snd_ce_bytes - old_sceb;
+-	safe_delta = pkts_acked - ((pkts_acked - delta) & TCP_ACE_MASK);
+-
+-	if (d_ceb == 0 || d_ceb < safe_delta * tp->t_maxseg >> 1) {
+-		return delta;
+-	}
+-
+-	return safe_delta;
+-}
+-
+-/* Returns the number of CE marked bytes */
+-static uint32_t
+-tcp_process_accecn_options(struct tcpcb *tp, struct tcpopt *to)
+-{
+-	int delta = 0;
+-	uint32_t ce_bytes = 0;
+-
+-	if (to->to_num_accecn >= 1) {
+-		delta = ntoh24(to->to_accecn + 0);
+-		if (to->to_accecn_order == 0) {
+-			delta = (delta + TCP_ACO_DIV -
+-			    (tp->t_aecn.t_snd_ect0_bytes & TCP_ACO_MASK)) & TCP_ACO_MASK;
+-			if (delta < 0) {
+-				os_log_error(tcp_log_handle, "delta for AccECN0 options (ECT0 bytes) can't be zero");
+-			}
+-			tp->t_aecn.t_snd_ect0_bytes += delta;
+-		} else {
+-			delta = (delta + TCP_ACO_DIV -
+-			    (tp->t_aecn.t_snd_ect1_bytes & TCP_ACO_MASK)) & TCP_ACO_MASK;
+-			if (delta < 0) {
+-				os_log_error(tcp_log_handle, "delta for AccECN1 options (ECT1 bytes) can't be zero");
+-			}
+-			tp->t_aecn.t_snd_ect1_bytes += delta;
+-		}
+-	}
+-	if (to->to_num_accecn >= 2) {
+-		delta = ntoh24(to->to_accecn + 1 * TCPOLEN_ACCECN_COUNTER);
+-		delta = (delta + TCP_ACO_DIV -
+-		    (tp->t_aecn.t_snd_ce_bytes & TCP_ACO_MASK)) & TCP_ACO_MASK;
+-		if (delta < 0) {
+-			os_log_error(tcp_log_handle, "delta for AccECN options (CE bytes) can't be zero");
+-		}
+-		tp->t_aecn.t_snd_ce_bytes += delta;
+-		ce_bytes = delta;
+-	}
+-	if (to->to_num_accecn >= 3) {
+-		delta = ntoh24(to->to_accecn + 2 * TCPOLEN_ACCECN_COUNTER);
+-		if (to->to_accecn_order == 0) {
+-			delta = (delta + TCP_ACO_DIV -
+-			    (tp->t_aecn.t_snd_ect1_bytes & TCP_ACO_MASK)) & TCP_ACO_MASK;
+-			if (delta < 0) {
+-				os_log_error(tcp_log_handle, "delta for AccECN0 options (ECT1 bytes) can't be zero");
+-			}
+-			tp->t_aecn.t_snd_ect1_bytes += delta;
+-		} else {
+-			delta = (delta + TCP_ACO_DIV -
+-			    (tp->t_aecn.t_snd_ect0_bytes & TCP_ACO_MASK)) & TCP_ACO_MASK;
+-			if (delta < 0) {
+-				os_log_error(tcp_log_handle, "delta for AccECN1 options (ECT0 bytes) can't be zero");
+-			}
+-			tp->t_aecn.t_snd_ect0_bytes += delta;
+-		}
+-	}
+-
+-	return ce_bytes;
+-}
+-
+ static void
+ tcp_ece_aggressive_heur(struct tcpcb *tp, uint32_t pkts_acked)
+ {

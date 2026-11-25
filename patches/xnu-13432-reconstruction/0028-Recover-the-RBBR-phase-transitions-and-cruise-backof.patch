@@ -1,7 +1,7 @@
 From 46deb5a695e6a5e7e253504ec6ac32a81009e5be Mon Sep 17 00:00:00 2001
 From: joethedev5 <deepsbx1@proton.me>
 Date: Wed, 25 Nov 2026 03:13:45 +0000
-Subject: [PATCH 28/28] Recover the RBBR phase transitions and cruise backoff
+Subject: [PATCH 28/30] Recover the RBBR phase transitions and cruise backoff
 
 Three tcp_rbbr.c bodies from the reference disassembly:
 

@@ -1,7 +1,7 @@
 From 7ca91e91c6b678d6bbff7dc6ee0e36f86c44ccd6 Mon Sep 17 00:00:00 2001
 From: joethedev5 <deepsbx1@proton.me>
 Date: Wed, 25 Nov 2026 02:23:59 +0000
-Subject: [PATCH 05/28] Recover tcp_rbbr_rwnd_init and add t_rbbr_state to
+Subject: [PATCH 05/30] Recover tcp_rbbr_rwnd_init and add t_rbbr_state to
  tcpcb
 
 Disassembly shows the reference computes the initial RBBR window as

@@ -1,0 +1,754 @@
+From c5e4e549c03b2ce098c9d80fb7f0f9ef030c212d Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 03:25:52 +0000
+Subject: [PATCH 29/30] Reconstruct the virtual environment translation unit
+
+Recover all twenty bodies of osfmk/kern/virtual_env.c from the
+xnu-13432 reference kernel: the availability and object-count policy,
+the kernel/user argument translation, path copy-in, the refcounted
+virtual_env object with its lazily allocated Mach port, the no-senders
+callback and its IPC kobject definition, the MIG entry points, and the
+subsystem-root-path interface used by the exec paths.
+
+The reconstructed file needs three small deltas in existing headers:
+IKOT_VIRTUAL_ENV at the end of the kobject type enum (49), a
+p_virtual_env pointer in struct proc, and an osvariant_status
+declaration shared with osfmk.  The reference kernel removed
+p_subsystem_root_path in favour of p_virtual_env; the old field is
+retained for now because the exec and fork paths that use it have not
+been reconstructed yet.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ bsd/kern/kern_sysctl.c     |   3 +-
+ bsd/sys/proc_internal.h    |   8 +
+ bsd/sys/variant_internal.h |   6 +
+ osfmk/ipc/ipc_types.h      |   1 +
+ osfmk/kern/virtual_env.c   | 522 +++++++++++++++++++++++++++++++------
+ osfmk/kern/virtual_env.h   |  26 ++
+ 6 files changed, 491 insertions(+), 75 deletions(-)
+
+diff --git a/bsd/kern/kern_sysctl.c b/bsd/kern/kern_sysctl.c
+index 94a949b57..c8a9ac2e7 100644
+--- a/bsd/kern/kern_sysctl.c
++++ b/bsd/kern/kern_sysctl.c
+@@ -2250,7 +2250,8 @@ SYSCTL_PROC(_kern, OID_AUTO, iossupportversion,
+     iossupportversion_string, sizeof(iossupportversion_string),
+     sysctl_iossupportversion, "A", "The iOSSupportVersion from SystemVersion.plist");
+ 
+-static uint64_t osvariant_status = 0;
++/* RECON(13432): osfmk/kern/virtual_env.c reads the variant status word. */
++uint64_t osvariant_status = 0;
+ 
+ STATIC int
+ sysctl_osvariant_status(__unused struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
+diff --git a/bsd/sys/proc_internal.h b/bsd/sys/proc_internal.h
+index 22a54a700..2a7c279a1 100644
+--- a/bsd/sys/proc_internal.h
++++ b/bsd/sys/proc_internal.h
+@@ -512,6 +512,14 @@ struct proc {
+ #endif /* CONFIG_PROC_UDATA_STORAGE */
+ 
+ 	char * p_subsystem_root_path;
++
++	/*
++	 * RECON(13432): the reference kernel removed p_subsystem_root_path
++	 * and placed struct virtual_env *p_virtual_env at offset 1976.  The
++	 * public-base field above is kept until the exec and fork paths that
++	 * use it are reconstructed, so this pointer currently lands at 1984.
++	 */
++	struct virtual_env *p_virtual_env;
+ };
+ 
+ #define PGRPID_DEAD 0xdeaddead
+diff --git a/bsd/sys/variant_internal.h b/bsd/sys/variant_internal.h
+index 2ce9e62d5..cd972f13e 100644
+--- a/bsd/sys/variant_internal.h
++++ b/bsd/sys/variant_internal.h
+@@ -67,6 +67,12 @@ __END_DECLS
+ 
+ __BEGIN_DECLS
+ 
++/*
++ * RECON(13432): the status word is shared with osfmk (virtual_env.c reads
++ * the development-variant check bits directly).
++ */
++extern uint64_t osvariant_status;
++
+ bool os_variant_has_internal_diagnostics(const char *subsystem);
+ 
+ __END_DECLS
+diff --git a/osfmk/ipc/ipc_types.h b/osfmk/ipc/ipc_types.h
+index 4f5d7be87..b50ac9b1b 100644
+--- a/osfmk/ipc/ipc_types.h
++++ b/osfmk/ipc/ipc_types.h
+@@ -313,6 +313,7 @@ __enum_decl(ipc_object_type_t, uint8_t, {
+ 	IKOT_KCDATA,
+ 	IKOT_UND_REPLY,                 /* CONFIG_USER_NOTIFICATION only */
+ 	IKOT_UX_HANDLER,
++	IKOT_VIRTUAL_ENV,
+ 
+ 	/* catchall, keep last */
+ 	IOT_UNKNOWN,
+diff --git a/osfmk/kern/virtual_env.c b/osfmk/kern/virtual_env.c
+index 702fdc74c..96cf281de 100644
+--- a/osfmk/kern/virtual_env.c
++++ b/osfmk/kern/virtual_env.c
+@@ -10,167 +10,541 @@
+ #include <kern/assert.h>
+ #include <kern/debug.h>
+ #include <kern/zalloc.h>
+-#include <sys/systm.h>
++#include <kern/kalloc.h>
++#include <kern/locks.h>
++#include <kern/misc_protos.h>
++#include <kern/task.h>
++#include <kern/thread.h>
++#include <kern/ipc_kobject.h>
+ #include <kern/virtual_env.h>
++#include <ipc/ipc_port.h>
++#include <libkern/libkern.h>
++#include <os/atomic.h>
++#include <os/log.h>
++#include <os/overflow.h>
++#include <os/refcnt.h>
++#include <sys/errno.h>
++#include <sys/param.h>
++#include <sys/proc_internal.h>
++#include <sys/variant_internal.h>
++#include <uuid/uuid.h>
++#include <IOKit/IOBSD.h> // IOTaskHasEntitlement
++
++#include <string.h>
+ 
+ #define RECON_OSFMK_KERN_VIRTUAL_ENV_C 1
+ 
+-/* osfmk/kern/virtual_env.c:125 */
+-_Bool
++#define ENTITLEMENT_VIRTUAL_ENV_MANAGER \
++	"com.apple.private.virtualenv.manager"
++
++/*
++ * A virtual environment groups a subsystem root path with a UUID and the
++ * port that represents the object in user space.
++ *
++ * osfmk/kern/virtual_env.c:96
++ */
++struct virtual_env {
++	os_refcnt_t     refcount;
++	uuid_t          vid;
++	ipc_port_t      port;
++	lck_mtx_t       mtx;
++	char           *subsystem_root_path;
++	uint32_t        subsystem_root_path_size;
++};
++
++/* osfmk/kern/virtual_env.c:108 */
++static volatile int64_t virtual_env_count;
++static int64_t virtual_env_count_limit = 0x1000;
++
++/*
++ * Enforce and slowly raise the cap on the number of live virtual
++ * environments.  The limit doubles by 4096 whenever it is hit.
++ *
++ * osfmk/kern/virtual_env.c:125
++ */
++static bool
+ virtual_env_count_check(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: virtual_env_count_check");
++	bool exceeded = (virtual_env_count_limit <= virtual_env_count);
++
++	if (exceeded) {
++		os_log_error(OS_LOG_DEFAULT,
++		    "virtual_env: exceeds object limit %lld",
++		    virtual_env_count_limit);
++
++		if (os_add_overflow(virtual_env_count_limit, 0x1000,
++		    &virtual_env_count_limit)) {
++			return false;
++		}
++	}
++	return true;
+ }
+ 
+-/* osfmk/kern/virtual_env.c:151 */
+-int
+-virtual_env_path_copyin(char * dst, uint32_t * dst_size, const void * src)
++/*
++ * Copy a NUL terminated path from user space and hand back a kernel copy.
++ *
++ * osfmk/kern/virtual_env.c:151
++ */
++static int
++virtual_env_path_copyin(char **dst, uint32_t *dst_size, const void *src)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: virtual_env_path_copyin");
++	char buffer[PATH_MAX] = {};
++	size_t size;
++	int error;
++
++	if (src != NULL) {
++		error = copyinstr((user_addr_t)src, buffer, sizeof(buffer),
++		    &size);
++		if (error != 0) {
++			return error;
++		}
++
++		if (size != 0) {
++			/*
++			 * copyinstr() includes the terminating NUL in its
++			 * returned length; drop it from the count and make
++			 * sure the copy is terminated at that point.
++			 */
++			buffer[size - 1] = '\0';
++
++			*dst = kalloc_data(size, Z_WAITOK_ZERO_NOFAIL);
++			memcpy(*dst, buffer, size);
++			*dst_size = (uint32_t)size;
++		}
++	}
++	return 0;
+ }
+ 
+-/* osfmk/kern/virtual_env.c:182 */
+-_Bool
++/*
++ * Virtual environments are only usable when the running system variant is
++ * a development variant.  The answer is cached in @c state.
++ *
++ * osfmk/kern/virtual_env.c:182
++ */
++bool
+ virtual_env_is_available(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: virtual_env_is_available");
++	const uint8_t QUERIED_BIT = 0x1;
++	const uint8_t AVAILABLE_BIT = 0x2;
++	static uint8_t state;
++	bool result;
++	uint8_t current_state = os_atomic_load(&state, relaxed);
++
++	if (!(current_state & QUERIED_BIT)) {
++		bool is_development =
++		    (osvariant_status & 0xc00000) == 0xc00000;
++		uint8_t new_state = QUERIED_BIT;
++
++		if (is_development) {
++			new_state |= AVAILABLE_BIT;
++		}
++
++		(void)os_atomic_cmpxchg(&state, 0, new_state, relaxed);
++
++		result = is_development;
++	} else {
++		result = (current_state & AVAILABLE_BIT) != 0;
++	}
++
++	return result;
+ }
+ 
++/* osfmk/kern/virtual_env.c:234 */
++static LCK_GRP_DECLARE(virtual_env_lock_grp, "virtual_env_lock_grp");
++
+ /* osfmk/kern/virtual_env.c:238 */
+-void
++static void
+ virtual_env_lock_init(virtual_env_t venv)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: virtual_env_lock_init");
++	lck_mtx_init(&venv->mtx, &virtual_env_lock_grp, LCK_ATTR_NULL);
+ }
+ 
+ /* osfmk/kern/virtual_env.c:245 */
+-void
++static void
+ virtual_env_lock_destroy(virtual_env_t venv)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: virtual_env_lock_destroy");
++	lck_mtx_destroy(&venv->mtx, &virtual_env_lock_grp);
+ }
+ 
+ /* osfmk/kern/virtual_env.c:252 */
+-void
++static void
+ virtual_env_lock(virtual_env_t venv)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: virtual_env_lock");
++	lck_mtx_lock(&venv->mtx);
+ }
+ 
+ /* osfmk/kern/virtual_env.c:259 */
+-void
++static void
+ virtual_env_unlock(virtual_env_t venv)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: virtual_env_unlock");
++	lck_mtx_unlock(&venv->mtx);
+ }
+ 
+-/* osfmk/kern/virtual_env.c:272 */
+-virtual_env_t
+-virtual_env_alloc(char * subsystem_root_path, uint32_t subsystem_root_path_size)
++/* osfmk/kern/virtual_env.c:270 */
++os_refgrp_decl(static, virtual_env_refgrp, "virtual_env", NULL);
++
++/*
++ * Allocate and initialize a virtual environment.  Takes ownership of
++ * @c subsystem_root_path.
++ *
++ * osfmk/kern/virtual_env.c:272
++ */
++static virtual_env_t
++virtual_env_alloc(char *subsystem_root_path, uint32_t subsystem_root_path_size)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: virtual_env_alloc");
++	virtual_env_t venv = kalloc_type(struct virtual_env,
++	    Z_WAITOK_ZERO_NOFAIL);
++
++	os_atomic_inc(&virtual_env_count, relaxed);
++	os_ref_init(&venv->refcount, &virtual_env_refgrp);
++
++	uuid_generate_random(venv->vid);
++	virtual_env_lock_init(venv);
++	venv->port = IPC_PORT_NULL;
++	venv->subsystem_root_path = subsystem_root_path;
++	venv->subsystem_root_path_size = subsystem_root_path_size;
++
++	return venv;
+ }
+ 
+-/* osfmk/kern/virtual_env.c:291 */
++/*
++ * osfmk/kern/virtual_env.c:291
++ */
+ virtual_env_t
+ virtual_env_retain(virtual_env_t venv)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: virtual_env_retain");
++	if (venv != NULL) {
++		os_ref_retain(&venv->refcount);
++	}
++	return venv;
+ }
+ 
+-/* osfmk/kern/virtual_env.c:302 */
+-void
++/*
++ * osfmk/kern/virtual_env.c:302
++ */
++static void
+ virtual_env_destroy(virtual_env_t venv)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: virtual_env_destroy");
++	if (venv->subsystem_root_path != NULL) {
++		kfree_data(venv->subsystem_root_path,
++		    venv->subsystem_root_path_size);
++		venv->subsystem_root_path = NULL;
++	}
++
++	virtual_env_lock_destroy(venv);
++	os_atomic_dec(&virtual_env_count, relaxed);
++	kfree_type(struct virtual_env, venv);
+ }
+ 
+-/* osfmk/kern/virtual_env.c:321 */
++/*
++ * osfmk/kern/virtual_env.c:321
++ */
+ void
+ virtual_env_release(virtual_env_t venv)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: virtual_env_release");
++	if (venv != NULL && os_ref_release(&venv->refcount) == 0) {
++		virtual_env_destroy(venv);
++	}
+ }
+ 
+-/* osfmk/kern/virtual_env.c:333 */
++/*
++ * osfmk/kern/virtual_env.c:333
++ */
+ virtual_env_t
+ convert_port_to_virtual_env(ipc_port_t port)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: convert_port_to_virtual_env");
++	virtual_env_t venv = NULL;
++
++	if (IP_VALID(port) && ip_type(port) == IKOT_VIRTUAL_ENV) {
++		venv = ip_kobject(port);
++		if (venv != NULL) {
++			virtual_env_retain(venv);
++		}
++	}
++	return venv;
+ }
+ 
+-/* osfmk/kern/virtual_env.c:352 */
++/*
++ * Return a send right for the port representing @c venv, allocating the
++ * port lazily.  Consumes the caller's reference on success.
++ *
++ * osfmk/kern/virtual_env.c:352
++ */
+ ipc_port_t
+ convert_virtual_env_to_port(virtual_env_t venv)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: convert_virtual_env_to_port");
++	ipc_port_t port = IPC_PORT_NULL;
++	bool to_release = false;
++
++	if (venv != NULL) {
++		virtual_env_lock(venv);
++		port = venv->port;
++		if (port == IPC_PORT_NULL) {
++			port = ipc_kobject_alloc_port(venv, IKOT_VIRTUAL_ENV,
++			    IPC_KOBJECT_ALLOC_MAKE_SEND);
++			venv->port = port;
++		} else {
++			port = ipc_kobject_make_send(port, venv,
++			    IKOT_VIRTUAL_ENV);
++			to_release = true;
++		}
++		virtual_env_unlock(venv);
++
++		if (to_release) {
++			virtual_env_release(venv);
++		}
++	}
++	return port;
+ }
+ 
+-/* osfmk/kern/virtual_env.c:387 */
++/*
++ * osfmk/kern/virtual_env.c:387
++ */
+ void
+ virtual_env_no_senders(ipc_port_t port, mach_port_mscount_t mscount)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: virtual_env_no_senders");
++	virtual_env_t venv;
++
++	ip_mq_lock(port);
++	if (!ipc_kobject_is_mscount_current_locked(port, mscount)) {
++		ip_mq_unlock(port);
++		return;
++	}
++
++	venv = ipc_kobject_get_locked(port, IKOT_VIRTUAL_ENV);
++	if (venv == NULL) {
++		ip_mq_unlock(port);
++		return;
++	}
++
++	ipc_kobject_dealloc_port_and_unlock(port, mscount, IKOT_VIRTUAL_ENV);
++
++	virtual_env_lock(venv);
++	venv->port = IPC_PORT_NULL;
++	virtual_env_unlock(venv);
++
++	virtual_env_release(venv);
+ }
+ 
+-/* osfmk/kern/virtual_env.c:428 */
+-kern_return_t
+-virtual_env_args_from_user(virtual_env_args_user_t uarg, uint32_t size, task_t task, virtual_env_args_t args)
++IPC_KOBJECT_DEFINE(IKOT_VIRTUAL_ENV,
++    .iko_op_stable = true,
++    .iko_op_movable_send = true,
++    .iko_op_no_senders = virtual_env_no_senders);
++
++/*
++ * The 32-bit user space layout of virtual_env_args_s.
++ *
++ * osfmk/kern/virtual_env.c:421
++ */
++struct virtual_env_args_user32_s {
++	uint32_t version;
++	uint32_t subsystem_root_path;
++};
++typedef struct virtual_env_args_user32_s *virtual_env_args_user32_t;
++
++/*
++ * Validate and translate the user space argument structure.  @c uarg points
++ * into the already copied-in MIG request message.
++ *
++ * osfmk/kern/virtual_env.c:428
++ */
++static kern_return_t
++virtual_env_args_from_user(virtual_env_args_user_t uarg, uint32_t size,
++    task_t task, virtual_env_args_t args)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: virtual_env_args_from_user");
++	bool user32 = !task_has_64Bit_addr(task);
++	size_t expected_size;
++
++	if (uarg == NULL) {
++		return KERN_INVALID_ARGUMENT;
++	}
++
++	expected_size = user32 ?
++	    sizeof(virtual_env_args_user32_s) : sizeof(virtual_env_args_s);
++
++	if (size < expected_size) {
++		return KERN_INVALID_ARGUMENT;
++	}
++
++	if (user32) {
++		virtual_env_args_user32_t args_user32 =
++		    (virtual_env_args_user32_t)uarg;
++
++		args->version = args_user32->version;
++		args->subsystem_root_path = (const char *)(uintptr_t)
++		    args_user32->subsystem_root_path;
++	} else {
++		args->version = ((virtual_env_args_t)uarg)->version;
++		args->subsystem_root_path =
++		    ((virtual_env_args_t)uarg)->subsystem_root_path;
++	}
++
++	return KERN_SUCCESS;
+ }
+ 
+-/* osfmk/kern/virtual_env.c:462 */
++/*
++ * osfmk/kern/virtual_env.c:462
++ */
+ kern_return_t
+-virtual_env_create(task_t task, virtual_env_args_user_t uarg, mach_msg_type_number_t size, virtual_env_t * venvp)
++virtual_env_create(task_t task, virtual_env_args_user_t uarg,
++    mach_msg_type_number_t size, virtual_env_t *venvp)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: virtual_env_create");
++	virtual_env_args_s args;
++	char *path;
++	uint32_t path_size;
++	kern_return_t kr;
++	int error;
++
++	if (!virtual_env_is_available()) {
++		return KERN_NOT_SUPPORTED;
++	}
++
++	if (task == NULL || task != get_threadtask(current_thread())) {
++		return KERN_INVALID_TASK;
++	}
++
++	if (!IOTaskHasEntitlement(task, ENTITLEMENT_VIRTUAL_ENV_MANAGER)) {
++		return KERN_NO_ACCESS;
++	}
++
++	if (!virtual_env_count_check()) {
++		return KERN_NO_SPACE;
++	}
++
++	kr = virtual_env_args_from_user(uarg, size, task, &args);
++	if (kr != KERN_SUCCESS) {
++		return kr;
++	}
++
++	if (args.version == 0) {
++		return KERN_INVALID_ARGUMENT;
++	}
++
++	error = virtual_env_path_copyin(&path, &path_size,
++	    args.subsystem_root_path);
++	if (error != 0) {
++		return KERN_INVALID_ADDRESS;
++	}
++
++	*venvp = virtual_env_alloc(path, path_size);
++
++	return KERN_SUCCESS;
+ }
+ 
+-/* osfmk/kern/virtual_env.c:514 */
++/*
++ * osfmk/kern/virtual_env.c:514
++ */
+ kern_return_t
+-virtual_env_get_info(virtual_env_t venv, virtual_env_info_user_t uinfo, mach_msg_type_number_t * size)
++virtual_env_get_info(virtual_env_t venv, virtual_env_info_user_t uinfo,
++    mach_msg_type_number_t *size)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: virtual_env_get_info");
++	if (!virtual_env_is_available()) {
++		return KERN_NOT_SUPPORTED;
++	}
++
++	if (venv == NULL) {
++		return KERN_INVALID_OBJECT;
++	}
++
++	if (uinfo == NULL || size == NULL) {
++		return KERN_INVALID_ARGUMENT;
++	}
++
++	if (*size < sizeof(virtual_env_info_s)) {
++		return KERN_INVALID_ARGUMENT;
++	}
++
++	virtual_env_info_t info = (virtual_env_info_t)uinfo;
++
++	info->version = 1;
++	uuid_copy(info->vid, venv->vid);
++
++	*size = sizeof(virtual_env_info_s);
++
++	return KERN_SUCCESS;
+ }
+ 
+-/* osfmk/kern/virtual_env.c:553 */
++/*
++ * osfmk/kern/virtual_env.c:553
++ */
+ kern_return_t
+-virtual_env_get_current(task_t task, virtual_env_t * venvp)
++virtual_env_get_current(task_t task, virtual_env_t *venvp)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: virtual_env_get_current");
++	virtual_env_t venv;
++	proc_t p;
++
++	if (!virtual_env_is_available()) {
++		return KERN_NOT_SUPPORTED;
++	}
++
++	if (task == NULL || task != get_threadtask(current_thread())) {
++		return KERN_INVALID_TASK;
++	}
++
++	p = get_bsdtask_info(task);
++	if (p == NULL || proc_ref(p, 0) != p) {
++		venv = NULL;
++	} else {
++		venv = p->p_virtual_env;
++		if (venv != NULL) {
++			virtual_env_retain(venv);
++		}
++		proc_rele(p);
++	}
++
++	*venvp = venv;
++
++	return venv != NULL ? KERN_SUCCESS : KERN_NOT_FOUND;
+ }
+ 
+-/* osfmk/kern/virtual_env.c:633 */
++/*
++ * Create a virtual environment from a kernel-space subsystem root path.
++ * Used by the exec paths, hence the errno based interface.
++ *
++ * osfmk/kern/virtual_env.c:633
++ */
+ int
+-virtual_env_create_from_subsystem_root_path(const char * subsystem_root_path, virtual_env_t * venvp)
++virtual_env_create_from_subsystem_root_path(const char *subsystem_root_path,
++    virtual_env_t *venvp)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: virtual_env_create_from_subsystem_root_path");
++	virtual_env_t venv;
++	char *path;
++	uint32_t path_size;
++
++	if (subsystem_root_path == NULL || venvp == NULL) {
++		return EINVAL;
++	}
++
++	if (!virtual_env_is_available()) {
++		return ENOENT;
++	}
++
++	if (!virtual_env_count_check()) {
++		return ENOSPC;
++	}
++
++	path_size = (uint32_t)strnlen(subsystem_root_path, PATH_MAX - 1) + 1;
++
++	path = kalloc_data(path_size, Z_WAITOK_ZERO_NOFAIL);
++	memcpy(path, subsystem_root_path, path_size - 1);
++	path[path_size - 1] = '\0';
++
++	venv = virtual_env_alloc(path, path_size);
++
++	virtual_env_release(*venvp);
++	*venvp = venv;
++
++	return 0;
+ }
+ 
+-/* osfmk/kern/virtual_env.c:681 */
++/*
++ * osfmk/kern/virtual_env.c:681
++ */
+ char *
+ virtual_env_get_subsystem_root_path(virtual_env_t venv)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: virtual_env_get_subsystem_root_path");
++	if (venv == NULL) {
++		return NULL;
++	}
++	return venv->subsystem_root_path;
+ }
+diff --git a/osfmk/kern/virtual_env.h b/osfmk/kern/virtual_env.h
+index 800d89909..2f813b322 100644
+--- a/osfmk/kern/virtual_env.h
++++ b/osfmk/kern/virtual_env.h
+@@ -7,6 +7,14 @@
+ #ifndef XNU13432_OSFMK_KERN_VIRTUAL_ENV_H
+ #define XNU13432_OSFMK_KERN_VIRTUAL_ENV_H
+ 
++#include <stdbool.h>
++#include <stdint.h>
++#include <mach/mach_types.h>
++#include <mach/message.h>
++#include <mach/port.h>
++#include <mach/kern_return.h>
++#include <uuid/uuid.h>
++
+ struct virtual_env_args_s {
+ 	uint32_t version;
+ 	const char *subsystem_root_path;
+@@ -22,4 +30,22 @@ typedef struct virtual_env *virtual_env_t;
+ typedef uint8_t *virtual_env_args_user_t;
+ typedef uint8_t *virtual_env_info_user_t;
+ 
++bool virtual_env_is_available(void);
++virtual_env_t virtual_env_retain(virtual_env_t venv);
++void virtual_env_release(virtual_env_t venv);
++
++virtual_env_t convert_port_to_virtual_env(ipc_port_t port);
++ipc_port_t convert_virtual_env_to_port(virtual_env_t venv);
++void virtual_env_no_senders(ipc_port_t port, mach_port_mscount_t mscount);
++
++kern_return_t virtual_env_create(task_t task,
++    virtual_env_args_user_t uarg, mach_msg_type_number_t size,
++    virtual_env_t *venvp);
++kern_return_t virtual_env_get_info(virtual_env_t venv,
++    virtual_env_info_user_t uinfo, mach_msg_type_number_t *size);
++kern_return_t virtual_env_get_current(task_t task, virtual_env_t *venvp);
++int virtual_env_create_from_subsystem_root_path(
++    const char *subsystem_root_path, virtual_env_t *venvp);
++char *virtual_env_get_subsystem_root_path(virtual_env_t venv);
++
+ #endif /* XNU13432_OSFMK_KERN_VIRTUAL_ENV_H */
