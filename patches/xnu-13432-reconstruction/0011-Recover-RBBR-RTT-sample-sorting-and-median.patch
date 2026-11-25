@@ -1,7 +1,7 @@
 From c475a32f74fdf2da9485fa569ace9447aea9e7fd Mon Sep 17 00:00:00 2001
 From: joethedev5 <deepsbx1@proton.me>
 Date: Wed, 25 Nov 2026 02:28:36 +0000
-Subject: [PATCH 11/18] Recover RBBR RTT sample sorting and median
+Subject: [PATCH 11/19] Recover RBBR RTT sample sorting and median
 
 - rbbr_insertion_sort: in-place insertion sort of the RTT sample array.
 - rbbr_sorted_median: middle element for an odd count, mean of the two

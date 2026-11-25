@@ -1,0 +1,35 @@
+From d9f078b50ef20bbbadcca05056721b62cbd60da7 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 02:34:21 +0000
+Subject: [PATCH 19/19] Use tcp_calc_rcv_window in SYN-ACK processing
+
+Replace the rLedbat-specific window clamp with the reference's
+tcp_calc_rcv_window(tp, TCP_RECV_BG(so)) call; the helper now selects
+RBBR or rLedbat through t_recv_cc_algo and is the only caller path in
+the reference tcp_input.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ bsd/netinet/tcp_input.c | 9 +--------
+ 1 file changed, 1 insertion(+), 8 deletions(-)
+
+diff --git a/bsd/netinet/tcp_input.c b/bsd/netinet/tcp_input.c
+index 6b90fe8ea..0e805cdfb 100644
+--- a/bsd/netinet/tcp_input.c
++++ b/bsd/netinet/tcp_input.c
+@@ -3004,14 +3004,7 @@ syn_cookie_valid:
+ 				tp->rcv_scale = tp->request_r_scale;
+ 			}
+ 
+-			uint32_t recwin = min(tp->rcv_wnd, TCP_MAXWIN << tp->rcv_scale);
+-			if (TCP_USE_RLEDBAT(tp, so) && tcp_cc_rledbat.get_rlwin != NULL) {
+-				/* For a LBE receiver, also use rledbat_win */
+-				uint32_t rledbat_win = tcp_cc_rledbat.get_rlwin(tp);
+-				if (rledbat_win > 0) {
+-					recwin = min(recwin, rledbat_win);
+-				}
+-			}
++			uint32_t recwin = tcp_calc_rcv_window(tp, TCP_RECV_BG(so));
+ 			tp->rcv_adv += recwin;
+ 
+ 			tp->snd_una++;          /* SYN is acked */

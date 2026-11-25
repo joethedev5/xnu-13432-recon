@@ -310,3 +310,11 @@ applies cleanly to xnu-12377.121.6. Remaining explicit stubs: 292.
   and a first data segment before invoking `tcp_heuristic_ecn_droprst`.
 
 The patch series now has 18 entries. Remaining explicit stubs: 289.
+
+## 2026-11-25: SYN-ACK window path
+
+The reference's only call to `tcp_calc_rcv_window` is in TCP input at
+the SYN-ACK receive-window update; the public rLedbat-only clamp is
+replaced by `tcp_calc_rcv_window(tp, TCP_RECV_BG(so))`. The argument
+matches the `SOF1_TRAFFIC_MGT_TCP_RECVBG` (0x4000) test seen in the
+reference disassembly. Patch series: 19 entries.
