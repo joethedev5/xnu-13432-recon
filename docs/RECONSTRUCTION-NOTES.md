@@ -215,3 +215,18 @@ but its definitions still also live in `vm_map_store_internal.h`; the
 textual relocation is the remaining delta.
 
 Current stub count: 309.
+
+## 2026-11-25: RBBR window init, tcpcb delta, VM map store relocation
+
+`tcp_rbbr_rwnd_init` is recovered from its 100-byte body: initial window
+= 10x MSS, rounded down to an MSS multiple, clamped to
+`0xffff << rcv_scale`, then `win_change_pending = 1`.  The reference
+reads the multiplier (10) from `0xfffffe0007cbf450`.  This required the
+missing 13432 `tcpcb.t_rbbr_state` pointer between `t_rlstate` and
+`rcv_srtt`; the field is now present.
+
+The VM map store packed-pointer, node/root, reservation and guard-object
+types and their packing macros moved verbatim from
+`vm_map_store_internal.h` into `vm_map_store_types_internal.h`, so the
+header set no longer duplicates live definitions.  Remaining explicit
+stubs: 308.
