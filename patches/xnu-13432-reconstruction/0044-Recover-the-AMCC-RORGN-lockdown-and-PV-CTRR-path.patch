@@ -1,7 +1,7 @@
 From 5da9e04f7812d6a28d4e77adfff0f0c4bc6ff60e Mon Sep 17 00:00:00 2001
 From: joethedev5 <deepsbx1@proton.me>
 Date: Wed, 25 Nov 2026 05:24:19 +0000
-Subject: [PATCH 44/44] Recover the AMCC RORGN lockdown and PV CTRR path
+Subject: [PATCH 44/45] Recover the AMCC RORGN lockdown and PV CTRR path
 
 Fill in rorgn_contains, rorgn_stash_range, rorgn_lockdown,
 rorgn_validate_core, lock_mmu, pv_ctrr_map_reg_base and pv_ctrr_init

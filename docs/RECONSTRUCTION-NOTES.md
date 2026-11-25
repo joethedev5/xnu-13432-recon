@@ -825,3 +825,54 @@ and only publishes `rorgn_begin`/`rorgn_end` when the CTRR is usable.
 addition with `os_add_overflow` and tests the inclusive physical range.
 
 The patch series now has 44 entries; 135 explicit stubs remain.
+
+## 2026-11-25: ARM feature detection and the Apple AIDR keys
+
+xnu-13432 moved the EL0-visible ARM feature detection out of
+`osfmk/arm/commpage/commpage.c` and rewrote it around static_if keys.
+The kasan DWARF names the true source files once the CU file table is
+resolved: the 16 functions live in `osfmk/arm/arm_features.inc`
+(lines 73-739), `osfmk/arm64/cpu_features.c` only defines the Apple
+keys (lines 30-47) and includes the shared file, and all ARM_FEAT_*
+jump keys are defined in `osfmk/arm64/static_if.h` (lines 37-197).
+`osfmk/arm/apple_features.inc` is included too but contributes nothing
+on this platform.  The public 12377 commpage code is the exact
+template for the register tests, so the recovery is a matter of
+carrying the tests over, converting each `gARM_FEAT_* = 1` into a
+`static_if_key_enable()`, and adding the fields new in 13432.
+
+Recovered layout:
+
+ - `cpu_features.c` defines `Apple_AFP`, `Apple_AMAIRCfg`, `Apple_AMX`,
+   `Apple_AMX4_1`, `Apple_APFLG`, `Apple_CTRRv2`, `Apple_CTRRv3`,
+   `Apple_GEXSCM`, `Apple_MILDDSB`, `Apple_MTE`, `Apple_MTEver_1`,
+   `Apple_PRSVScalarFP`, `Apple_TBCF` and `Apple_TSO`.
+ - `arm_features.inc` holds zfr0/isar0/isar1/isar2/isar3/mmfr0/mmfr2/
+   pfr0/pfr1/pfr2/smfr0/mmfr1/fpcr/misc init routines, the
+   `arm_cpu_features_init` dispatcher (with the `enable_sme` boot arg)
+   and `apple_cpu_features_init`, each registered with
+   `STATIC_IF_INIT()`.
+ - New field tests beyond public 12377: ISAR1 API value 6
+   (`FEAT_PAuth_LR`), ISAR2 LUT, ISAR3 FAMINMAX/CPA, MMFR0 ASIDBits,
+   MMFR2 VARANGE, PFR1 CSV2_frac 1.2, PFR2 FPMR, SMFR0 LUTv2/F8F16/
+   F8F32 and the SME2/SME2.1 version check read directly from SMFR0.
+ - The Apple side reads AIDR and MIDR: a part-number test
+   (`MIDR_EL1_PNUM_MASK & ~0x10 == 0x300`) clears AIDR bit 25
+   (MILDDSB); MTE version V1 enables `Apple_MTEver_1`; bits for TSO,
+   APFLG, PRSVScalarFP, AFP, TBCF, GEXSCM and the two CTRR versions
+   map one-to-one to keys, and AMAIRCfg is enabled when its bit is
+   clear.  MILDDSB requires both the AIDR bit and the `mdsb` boot arg.
+
+The key enable sequence was verified against the reference image: the
+recovered file enables the same 82 ARM keys and the same Apple keys,
+with identical masks, thresholds and control flow.  Column numbers in
+the kasan line table pin down the exact macro spellings, which is how
+the longer `(pnum & (MIDR_EL1_PNUM_MASK & ~0x10)) == 0x300` form was
+recovered instead of a plain PNUM compare.
+
+The 12377 `ARM_FEATURE_FLAG()` list that used to live in
+`osfmk/arm/arm_features.inc` moved to `osfmk/arm/arm_features.h` so
+`commpage.c` and `kern_mib.c` keep generating their feature flags; the
+`.inc` path now carries the 13432 detection implementation.
+
+The patch series now has 45 entries; 119 explicit stubs remain.

@@ -1,0 +1,1416 @@
+From 9f59ff3a80f726615947b91b6b797e86f0f47e81 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 05:41:14 +0000
+Subject: [PATCH 45/45] Recover the ARM feature detection and Apple AIDR keys
+
+xnu-13432 moved the EL0-visible ARM feature detection out of the
+commpage and into osfmk/arm/arm_features.inc, where each feature is
+enabled as a static_if key.  Reconstruct the whole file from the KDK
+27.0.1 DWARF and both reference kernel images:
+
+ - osfmk/arm64/cpu_features.c defines the Apple_* jump keys and pulls
+   in the shared detection code.
+ - osfmk/arm/arm_features.inc holds the per-register init routines
+   (zfr0, isar0-3, mmfr0-2, pfr0-2, smfr0, fpcr, misc), the two
+   static_if initializers, and the ARM_FEAT_* key definitions.
+ - The ID-register tests mirror the public commpage code, extended with
+   the new 13432 fields (ISAR1 PAuth_LR, ISAR2 LUT, ISAR3, MMFR0
+   ASIDBits, MMFR2 VARANGE_EN, PFR1 CSV2_1p2, PFR2 FPMR, SMFR0
+   LUTv2/F8F16/F8F32) and the Apple AIDR bits.
+ - The old ARM_FEATURE_FLAG list moves to osfmk/arm/arm_features.h so
+   commpage and kern_mib keep building.
+
+Verified against the reference disassembly: the recovered code enables
+the same 82 ARM feature keys and the same Apple keys, with matching
+masks, thresholds and control flow.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ bsd/kern/kern_mib.c           |   4 +-
+ osfmk/arm/Makefile            |   1 +
+ osfmk/arm/arm_features.h      | 131 +++++
+ osfmk/arm/arm_features.inc    | 865 +++++++++++++++++++++++++++++-----
+ osfmk/arm/commpage/commpage.c |   2 +-
+ osfmk/arm64/cpu_features.c    | 177 ++-----
+ osfmk/arm64/proc_reg.h        |  63 ++-
+ 7 files changed, 979 insertions(+), 264 deletions(-)
+ create mode 100644 osfmk/arm/arm_features.h
+
+diff --git a/bsd/kern/kern_mib.c b/bsd/kern/kern_mib.c
+index e67ea79ad..421476ed1 100644
+--- a/bsd/kern/kern_mib.c
++++ b/bsd/kern/kern_mib.c
+@@ -1175,7 +1175,7 @@ SECURITY_READ_ONLY_LATE(int) arm64_flag = 0;
+ 	SYSCTL_INT(_hw_optional_arm, OID_AUTO, flag_name, CTLFLAG_RD | CTLFLAG_KERN | CTLFLAG_LOCKED, &gARM_ ## flag_name, 0, "")
+ 
+ 
+-#include <arm/arm_features.inc>
++#include <arm/arm_features.h>
+ #undef ARM_FEATURE_FLAG
+ 
+ /* Legacy Names ARM Optional Feature Sysctls */
+@@ -1287,7 +1287,7 @@ sysctl_hw_caps(__unused struct sysctl_oid *oidp, __unused void *arg1,
+ 
+ 	/* Report presence of all FEATs. */
+ 	#define ARM_FEATURE_FLAG(x) CAP_SET_BIT(x)
+-	#include <arm/arm_features.inc>
++	#include <arm/arm_features.h>
+ 	#undef ARM_FEATURE_FLAG
+ 
+ 
+diff --git a/osfmk/arm/Makefile b/osfmk/arm/Makefile
+index 75abb0754..56c3c5144 100644
+--- a/osfmk/arm/Makefile
++++ b/osfmk/arm/Makefile
+@@ -8,6 +8,7 @@ include $(MakeInc_def)
+ 
+ ARM_HEADER_FILES =	\
+ 		arch.h \
++		arm_features.h \
+ 		arm_features.inc \
+ 		atomic.h \
+ 		cpu_number.h \
+diff --git a/osfmk/arm/arm_features.h b/osfmk/arm/arm_features.h
+new file mode 100644
+index 000000000..2053740ed
+--- /dev/null
++++ b/osfmk/arm/arm_features.h
+@@ -0,0 +1,131 @@
++/*
++ * Copyright (c) 2024 Apple Inc. All rights reserved.
++ *
++ * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
++ *
++ * This file contains Original Code and/or Modifications of Original Code
++ * as defined in and that are subject to the Apple Public Source License
++ * Version 2.0 (the 'License'). You may not use this file except in
++ * compliance with the License. The rights granted to you under the License
++ * may not be used to create, or enable the creation or redistribution of,
++ * unlawful or unlicensed copies of an Apple operating system, or to
++ * circumvent, violate, or enable the circumvention or violation of, any
++ * terms of an Apple operating system software license agreement.
++ *
++ * Please obtain a copy of the License at
++ * http://www.opensource.apple.com/apsl/ and read it before using this file.
++ *
++ * The Original Code and all software distributed under the License are
++ * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
++ * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
++ * INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
++ * Please see the License for the specific language governing rights and
++ * limitations under the License.
++ *
++ * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
++ */
++
++/**
++ * Enumerated ARM optional features to be exported to userspace. These are to be
++ * enumerated using the official feature name from the ARM ARM. They are grouped
++ * below based on the MSR that will be used to populate the data.
++ */
++
++
++/* Features from: ID_AA64ISAR0_EL1 */
++ARM_FEATURE_FLAG(FEAT_CRC32);
++ARM_FEATURE_FLAG(FEAT_FlagM);
++ARM_FEATURE_FLAG(FEAT_FlagM2);
++ARM_FEATURE_FLAG(FEAT_FHM);
++ARM_FEATURE_FLAG(FEAT_DotProd);
++ARM_FEATURE_FLAG(FEAT_SHA3);
++ARM_FEATURE_FLAG(FEAT_RDM);
++ARM_FEATURE_FLAG(FEAT_LSE);
++ARM_FEATURE_FLAG(FEAT_SHA256);
++ARM_FEATURE_FLAG(FEAT_SHA512);
++ARM_FEATURE_FLAG(FEAT_SHA1);
++ARM_FEATURE_FLAG(FEAT_AES);
++ARM_FEATURE_FLAG(FEAT_PMULL);
++
++/* Features from: ID_AA64ISAR1_EL1 */
++ARM_FEATURE_FLAG(FEAT_SPECRES);
++ARM_FEATURE_FLAG(FEAT_SPECRES2);
++ARM_FEATURE_FLAG(FEAT_SB);
++ARM_FEATURE_FLAG(FEAT_FRINTTS);
++ARM_FEATURE_FLAG(FEAT_PACIMP);
++ARM_FEATURE_FLAG(FEAT_LRCPC);
++ARM_FEATURE_FLAG(FEAT_LRCPC2);
++ARM_FEATURE_FLAG(FEAT_FCMA);
++ARM_FEATURE_FLAG(FEAT_JSCVT);
++ARM_FEATURE_FLAG(FEAT_PAuth);
++ARM_FEATURE_FLAG(FEAT_PAuth2);
++ARM_FEATURE_FLAG(FEAT_FPAC);
++ARM_FEATURE_FLAG(FEAT_FPACCOMBINE);
++ARM_FEATURE_FLAG(FEAT_DPB);
++ARM_FEATURE_FLAG(FEAT_DPB2);
++ARM_FEATURE_FLAG(FEAT_BF16);
++ARM_FEATURE_FLAG(FEAT_EBF16);
++ARM_FEATURE_FLAG(FEAT_I8MM);
++
++/* Features from: ID_AA64ISAR2_EL1 */
++ARM_FEATURE_FLAG(FEAT_WFxT);
++ARM_FEATURE_FLAG(FEAT_RPRES);
++ARM_FEATURE_FLAG(FEAT_CSSC);
++ARM_FEATURE_FLAG(FEAT_HBC);
++
++
++
++/* Features from: ID_AA64MMFR0_EL1 */
++ARM_FEATURE_FLAG(FEAT_ECV);
++
++/* Features from: ID_AA64MMFR1_EL1 */
++ARM_FEATURE_FLAG(FEAT_AFP);
++
++/* Features from: ID_AA64MMFR2_EL1 */
++ARM_FEATURE_FLAG(FEAT_LSE2);
++
++/* Features from: ID_AA64PFR0_EL1 */
++ARM_FEATURE_FLAG(FEAT_CSV2);
++ARM_FEATURE_FLAG(FEAT_CSV3);
++ARM_FEATURE_FLAG(FEAT_DIT);
++ARM_FEATURE_FLAG(AdvSIMD);
++ARM_FEATURE_FLAG(AdvSIMD_HPFPCvt);
++ARM_FEATURE_FLAG(FEAT_FP16);
++
++/* Features from: ID_AA64PFR1_EL1 */
++ARM_FEATURE_FLAG(FEAT_SSBS);
++ARM_FEATURE_FLAG(FEAT_BTI);
++ARM_FEATURE_FLAG(FEAT_SME);
++ARM_FEATURE_FLAG(FEAT_SME2);
++ARM_FEATURE_FLAG(FEAT_SME2p1);
++ARM_FEATURE_FLAG(FEAT_MTE);
++ARM_FEATURE_FLAG(FEAT_MTE2);
++ARM_FEATURE_FLAG(FEAT_MTE3);
++ARM_FEATURE_FLAG(FEAT_MTE4);
++ARM_FEATURE_FLAG(FEAT_MTE_ASYNC);
++
++/* Features from: ID_AA64PFR2_EL1 */
++ARM_FEATURE_FLAG(FEAT_MTE_STORE_ONLY);
++
++/* Features from: ID_AA64SMFR0_EL1 */
++ARM_FEATURE_FLAG(SME_F32F32);
++ARM_FEATURE_FLAG(SME_BI32I32);
++ARM_FEATURE_FLAG(SME_B16F32);
++ARM_FEATURE_FLAG(SME_F16F32);
++ARM_FEATURE_FLAG(SME_I8I32);
++ARM_FEATURE_FLAG(SME_I16I32);
++ARM_FEATURE_FLAG(FEAT_SME_F64F64);
++ARM_FEATURE_FLAG(FEAT_SME_I16I64);
++ARM_FEATURE_FLAG(FEAT_SME_F16F16);
++ARM_FEATURE_FLAG(FEAT_SME_B16B16);
++
++/* Features from: ID_AA64ZFR0_EL1 */
++ARM_FEATURE_FLAG(FEAT_SVE_B16B16);
++
++/* Features from: FPCR */
++ARM_FEATURE_FLAG(FP_SyncExceptions);
++
++/* Features derived from other feature flags */
++ARM_FEATURE_FLAG(FEAT_MTE_CANONICAL_TAGS);
++ARM_FEATURE_FLAG(FEAT_MTE_NO_ADDRESS_TAGS);
+diff --git a/osfmk/arm/arm_features.inc b/osfmk/arm/arm_features.inc
+index 2053740ed..d287b706d 100644
+--- a/osfmk/arm/arm_features.inc
++++ b/osfmk/arm/arm_features.inc
+@@ -1,131 +1,750 @@
+ /*
+- * Copyright (c) 2024 Apple Inc. All rights reserved.
++ * Reconstruction of osfmk/arm/arm_features.inc from the xnu-13432
++ * reference kernel.
+  *
+- * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
++ * The reference moved the EL0-visible ARM feature detection that used to
++ * live in osfmk/arm/commpage/commpage.c into this file, and turned each
++ * feature into a static_if key that is enabled at boot.  Function order,
++ * signatures, locals and the ID-register field tests are recovered from
++ * the KDK 27.0.1 DWARF and both reference kernel images.
+  *
+- * This file contains Original Code and/or Modifications of Original Code
+- * as defined in and that are subject to the Apple Public Source License
+- * Version 2.0 (the 'License'). You may not use this file except in
+- * compliance with the License. The rights granted to you under the License
+- * may not be used to create, or enable the creation or redistribution of,
+- * unlawful or unlicensed copies of an Apple operating system, or to
+- * circumvent, violate, or enable the circumvention or violation of, any
+- * terms of an Apple operating system software license agreement.
++ * The ARM_FEAT_* jump keys are declared by osfmk/arm64/static_if.h in the
++ * reference; they are defined here, before their first use, because this
++ * file is only built into osfmk/arm64/cpu_features.c.
++ */
++
++#ifndef _ARM_ARM_FEATURES_INC_
++#define _ARM_ARM_FEATURES_INC_
++
++#include <sys/cdefs.h>
++#include <kern/kern_types.h>
++#include <machine/static_if.h>
++#include <arm64/proc_reg.h>
++#include <arm/cpuid_internal.h>
++
++/* static_if.h:37 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_FP8);
++/* static_if.h:41 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_CRC32);
++/* static_if.h:42 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_FlagM);
++/* static_if.h:43 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_FlagM2);
++/* static_if.h:44 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_FHM);
++/* static_if.h:45 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_DotProd);
++/* static_if.h:46 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_SHA3);
++/* static_if.h:47 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_RDM);
++/* static_if.h:48 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_LSE);
++/* static_if.h:49 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_SHA256);
++/* static_if.h:50 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_SHA512);
++/* static_if.h:51 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_SHA1);
++/* static_if.h:52 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_AES);
++/* static_if.h:53 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_PMULL);
++
++/* static_if.h:56 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_SPECRES);
++/* static_if.h:57 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_SPECRES2);
++/* static_if.h:58 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_SB);
++/* static_if.h:59 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_FRINTTS);
++/* static_if.h:60 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_PACIMP);
++/* static_if.h:61 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_LRCPC);
++/* static_if.h:62 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_LRCPC2);
++/* static_if.h:63 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_FCMA);
++/* static_if.h:64 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_JSCVT);
++/* static_if.h:65 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_PAuth);
++/* static_if.h:66 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_PAuth2);
++/* static_if.h:67 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_FPAC);
++/* static_if.h:68 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_FPACCOMBINE);
++/* static_if.h:70 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_PAuth_LR);
++/* static_if.h:72 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_DPB);
++/* static_if.h:73 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_DPB2);
++/* static_if.h:74 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_BF16);
++/* static_if.h:75 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_EBF16);
++/* static_if.h:76 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_I8MM);
++
++/* static_if.h:79 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_WFxT);
++/* static_if.h:80 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_RPRES);
++/* static_if.h:81 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_CSSC);
++/* static_if.h:82 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_HBC);
++/* static_if.h:84 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_LUT);
++
++/* static_if.h:92 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_FAMINMAX);
++/* static_if.h:97 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_CPA);
++/* static_if.h:98 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_CPA2);
++
++/* static_if.h:114 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_ECV);
++/* static_if.h:115 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_ASID16);
++
++/* static_if.h:118 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_AFP);
++
++/* static_if.h:121 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_LVA);
++/* static_if.h:122 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_LSE2);
++/* static_if.h:123 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_TTCNP);
++
++/* static_if.h:131 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_CSV2_2);
++/* static_if.h:132 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_CSV2);
++/* static_if.h:133 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_CSV3);
++/* static_if.h:134 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_DIT);
++/* static_if.h:135 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_AdvSIMD);
++/* static_if.h:136 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_AdvSIMD_HPFPCvt);
++/* static_if.h:137 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_FP16);
++/* static_if.h:140 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_CSV2_1p2);
++/* static_if.h:141 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_SSBS);
++/* static_if.h:142 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_BTI);
++/* static_if.h:143 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_SME);
++/* static_if.h:144 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_SME2);
++/* static_if.h:145 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_SME2p1);
++/* static_if.h:146 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_MTE);
++/* static_if.h:147 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_MTE2);
++/* static_if.h:148 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_MTE3);
++/* static_if.h:149 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_MTE4);
++/* static_if.h:150 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_MTE_ASYNC);
++/* static_if.h:153 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_MTE_STORE_ONLY);
++/* static_if.h:155 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_FPMR);
++
++/* static_if.h:159 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_SME_F32F32);
++/* static_if.h:160 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_SME_BI32I32);
++/* static_if.h:161 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_SME_B16F32);
++/* static_if.h:162 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_SME_F16F32);
++/* static_if.h:163 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_SME_I8I32);
++/* static_if.h:164 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_SME_I16I32);
++/* static_if.h:165 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_SME_F64F64);
++/* static_if.h:166 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_SME_I16I64);
++/* static_if.h:167 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_SME_F16F16);
++/* static_if.h:168 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_SME_B16B16);
++/* static_if.h:170 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_SME_LUTv2);
++/* static_if.h:171 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_SME_F8F16);
++/* static_if.h:172 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_SME_F8F32);
++
++/* static_if.h:186 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FP_SyncExceptions);
++
++/* static_if.h:189 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_SVE_B16B16);
++
++/* static_if.h:196 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_MTE_CANONICAL_TAGS);
++/* static_if.h:197 */
++STATIC_IF_KEY_DEFINE_FALSE(ARM_FEAT_MTE_NO_ADDRESS_TAGS);
++
++/**
++ * Read the system register @name, attempt to set set bits of @mask if not
++ * already, test if bits were actually set, reset the register to its
++ * previous value if required, and 'return' @mask with only bits that
++ * were successfully set (or already set) in the system register.
++ */
++#define _test_sys_bits(name, mask) ({ \
++	const uint64_t src = __builtin_arm_rsr64(#name); \
++	uint64_t test = src | mask; \
++	if (test != src) { \
++		__builtin_arm_wsr64(#name, test); \
++		test = __builtin_arm_rsr64(#name); \
++		if (test != src) { \
++			__builtin_arm_wsr64(#name, src); \
++		}\
++	} \
++	mask & test; \
++})
++
++/*
++ * arm_features.inc:73
++ *
++ * Features from ID_AA64ZFR0_EL1.
++ */
++static void
++arm_cpu_features_zfr0_init(void)
++{
++	uint64_t zfr0 = __builtin_arm_rsr64("S3_0_C0_C4_4" /* ID_AA64ZFR0_EL1 */);
++
++	if ((zfr0 & ID_AA64ZFR0_EL1_B16B16_MASK) >= ID_AA64ZFR0_EL1_B16B16_EN) {
++		static_if_key_enable(ARM_FEAT_SVE_B16B16);
++	}
++}
++
++/*
++ * arm_features.inc:97
+  *
+- * Please obtain a copy of the License at
+- * http://www.opensource.apple.com/apsl/ and read it before using this file.
++ * Features from ID_AA64ISAR0_EL1.
++ */
++static void
++arm_cpu_features_isar0_init(void)
++{
++	uint64_t isar0 = __builtin_arm_rsr64("ID_AA64ISAR0_EL1");
++
++	if ((isar0 & ID_AA64ISAR0_EL1_TS_MASK) >= ID_AA64ISAR0_EL1_TS_FLAGM_EN) {
++		static_if_key_enable(ARM_FEAT_FlagM);
++	}
++	if ((isar0 & ID_AA64ISAR0_EL1_TS_MASK) >= ID_AA64ISAR0_EL1_TS_FLAGM2_EN) {
++		static_if_key_enable(ARM_FEAT_FlagM2);
++	}
++	if ((isar0 & ID_AA64ISAR0_EL1_FHM_MASK) >= ID_AA64ISAR0_EL1_FHM_8_2) {
++		static_if_key_enable(ARM_FEAT_FHM);
++	}
++	if ((isar0 & ID_AA64ISAR0_EL1_DP_MASK) >= ID_AA64ISAR0_EL1_DP_EN) {
++		static_if_key_enable(ARM_FEAT_DotProd);
++	}
++	if ((isar0 & ID_AA64ISAR0_EL1_SHA3_MASK) >= ID_AA64ISAR0_EL1_SHA3_EN) {
++		static_if_key_enable(ARM_FEAT_SHA3);
++	}
++	if ((isar0 & ID_AA64ISAR0_EL1_RDM_MASK) >= ID_AA64ISAR0_EL1_RDM_EN) {
++		static_if_key_enable(ARM_FEAT_RDM);
++	}
++	if ((isar0 & ID_AA64ISAR0_EL1_ATOMIC_MASK) >= ID_AA64ISAR0_EL1_ATOMIC_8_1) {
++		static_if_key_enable(ARM_FEAT_LSE);
++	}
++	if ((isar0 & ID_AA64ISAR0_EL1_SHA2_MASK) >= ID_AA64ISAR0_EL1_SHA2_512_EN) {
++		static_if_key_enable(ARM_FEAT_SHA512);
++	}
++	if ((isar0 & ID_AA64ISAR0_EL1_CRC32_MASK) == ID_AA64ISAR0_EL1_CRC32_EN) {
++		static_if_key_enable(ARM_FEAT_CRC32);
++	}
++
++	/**
++	 * T7000 has a bug in the ISAR0 register that reports that PMULL is not
++	 * supported when it actually is. To work around this, for all of the crypto
++	 * extensions, just check if they're supported using the board_config.h
++	 * values.
++	 */
++#if __ARM_V8_CRYPTO_EXTENSIONS__
++	static_if_key_enable(ARM_FEAT_PMULL);
++	static_if_key_enable(ARM_FEAT_SHA1);
++	static_if_key_enable(ARM_FEAT_AES);
++	static_if_key_enable(ARM_FEAT_SHA256);
++#endif /* __ARM_V8_CRYPTO_EXTENSIONS__ */
++}
++
++/*
++ * arm_features.inc:148
+  *
+- * The Original Code and all software distributed under the License are
+- * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
+- * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+- * INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY,
+- * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
+- * Please see the License for the specific language governing rights and
+- * limitations under the License.
++ * Features from ID_AA64ISAR1_EL1.
++ */
++static void
++arm_cpu_features_isar1_init(void)
++{
++	uint64_t isar1 = __builtin_arm_rsr64("ID_AA64ISAR1_EL1");
++	uint64_t sctlr = __builtin_arm_rsr64("SCTLR_EL1");
++
++	if ((isar1 & ID_AA64ISAR1_EL1_SPECRES_MASK) >= ID_AA64ISAR1_EL1_SPECRES_EN &&
++	    sctlr & SCTLR_EnRCTX) {
++		static_if_key_enable(ARM_FEAT_SPECRES);
++#ifdef HAS_SPECRES2
++		if ((isar1 & ID_AA64ISAR1_EL1_SPECRES_MASK) >= ID_AA64ISAR1_EL1_SPECRES2_EN) {
++			static_if_key_enable(ARM_FEAT_SPECRES2);
++		}
++#endif /* HAS_SPECRES2 */
++	}
++	if ((isar1 & ID_AA64ISAR1_EL1_SB_MASK) >= ID_AA64ISAR1_EL1_SB_EN) {
++		static_if_key_enable(ARM_FEAT_SB);
++	}
++	if ((isar1 & ID_AA64ISAR1_EL1_FRINTTS_MASK) >= ID_AA64ISAR1_EL1_FRINTTS_EN) {
++		static_if_key_enable(ARM_FEAT_FRINTTS);
++	}
++	if ((isar1 & ID_AA64ISAR1_EL1_GPI_MASK) >= ID_AA64ISAR1_EL1_GPI_EN) {
++		static_if_key_enable(ARM_FEAT_PACIMP);
++	}
++	if ((isar1 & ID_AA64ISAR1_EL1_LRCPC_MASK) >= ID_AA64ISAR1_EL1_LRCPC_EN) {
++		static_if_key_enable(ARM_FEAT_LRCPC);
++	}
++	if ((isar1 & ID_AA64ISAR1_EL1_LRCPC_MASK) >= ID_AA64ISAR1_EL1_LRCP2C_EN) {
++		static_if_key_enable(ARM_FEAT_LRCPC2);
++	}
++	if ((isar1 & ID_AA64ISAR1_EL1_FCMA_MASK) >= ID_AA64ISAR1_EL1_FCMA_EN) {
++		static_if_key_enable(ARM_FEAT_FCMA);
++	}
++	if ((isar1 & ID_AA64ISAR1_EL1_JSCVT_MASK) >= ID_AA64ISAR1_EL1_JSCVT_EN) {
++		static_if_key_enable(ARM_FEAT_JSCVT);
++	}
++	if ((isar1 & ID_AA64ISAR1_EL1_API_MASK) >= ID_AA64ISAR1_EL1_API_PAuth_EN) {
++		static_if_key_enable(ARM_FEAT_PAuth);
++	}
++	if ((isar1 & ID_AA64ISAR1_EL1_API_MASK) >= ID_AA64ISAR1_EL1_API_PAuth2_EN) {
++		static_if_key_enable(ARM_FEAT_PAuth2);
++	}
++	if ((isar1 & ID_AA64ISAR1_EL1_API_MASK) >= ID_AA64ISAR1_EL1_API_FPAC_EN) {
++		static_if_key_enable(ARM_FEAT_FPAC);
++	}
++	if ((isar1 & ID_AA64ISAR1_EL1_API_MASK) >= ID_AA64ISAR1_EL1_API_FPACCOMBINE) {
++		static_if_key_enable(ARM_FEAT_FPACCOMBINE);
++	}
++	if ((isar1 & ID_AA64ISAR1_EL1_API_MASK) >= ID_AA64ISAR1_EL1_API_PAuth_LR) {
++		static_if_key_enable(ARM_FEAT_PAuth_LR);
++	}
++	if ((isar1 & ID_AA64ISAR1_EL1_DPB_MASK) >= ID_AA64ISAR1_EL1_DPB_EN) {
++		static_if_key_enable(ARM_FEAT_DPB);
++	}
++	if ((isar1 & ID_AA64ISAR1_EL1_DPB_MASK) >= ID_AA64ISAR1_EL1_DPB2_EN) {
++		static_if_key_enable(ARM_FEAT_DPB2);
++	}
++	if ((isar1 & ID_AA64ISAR1_EL1_BF16_MASK) >= ID_AA64ISAR1_EL1_BF16_EN) {
++		static_if_key_enable(ARM_FEAT_BF16);
++	}
++	if ((isar1 & ID_AA64ISAR1_EL1_BF16_MASK) >= ID_AA64ISAR1_EL1_EBF16_EN) {
++		static_if_key_enable(ARM_FEAT_EBF16);
++	}
++	if ((isar1 & ID_AA64ISAR1_EL1_I8MM_MASK) >= ID_AA64ISAR1_EL1_I8MM_EN) {
++		static_if_key_enable(ARM_FEAT_I8MM);
++	}
++}
++
++/*
++ * arm_features.inc:222
+  *
+- * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
++ * Features from ID_AA64ISAR2_EL1.
+  */
++static void
++arm_cpu_features_isar2_init(void)
++{
++	uint64_t isar2 = __builtin_arm_rsr64("ID_AA64ISAR2_EL1");
+ 
+-/**
+- * Enumerated ARM optional features to be exported to userspace. These are to be
+- * enumerated using the official feature name from the ARM ARM. They are grouped
+- * below based on the MSR that will be used to populate the data.
+- */
+-
+-
+-/* Features from: ID_AA64ISAR0_EL1 */
+-ARM_FEATURE_FLAG(FEAT_CRC32);
+-ARM_FEATURE_FLAG(FEAT_FlagM);
+-ARM_FEATURE_FLAG(FEAT_FlagM2);
+-ARM_FEATURE_FLAG(FEAT_FHM);
+-ARM_FEATURE_FLAG(FEAT_DotProd);
+-ARM_FEATURE_FLAG(FEAT_SHA3);
+-ARM_FEATURE_FLAG(FEAT_RDM);
+-ARM_FEATURE_FLAG(FEAT_LSE);
+-ARM_FEATURE_FLAG(FEAT_SHA256);
+-ARM_FEATURE_FLAG(FEAT_SHA512);
+-ARM_FEATURE_FLAG(FEAT_SHA1);
+-ARM_FEATURE_FLAG(FEAT_AES);
+-ARM_FEATURE_FLAG(FEAT_PMULL);
+-
+-/* Features from: ID_AA64ISAR1_EL1 */
+-ARM_FEATURE_FLAG(FEAT_SPECRES);
+-ARM_FEATURE_FLAG(FEAT_SPECRES2);
+-ARM_FEATURE_FLAG(FEAT_SB);
+-ARM_FEATURE_FLAG(FEAT_FRINTTS);
+-ARM_FEATURE_FLAG(FEAT_PACIMP);
+-ARM_FEATURE_FLAG(FEAT_LRCPC);
+-ARM_FEATURE_FLAG(FEAT_LRCPC2);
+-ARM_FEATURE_FLAG(FEAT_FCMA);
+-ARM_FEATURE_FLAG(FEAT_JSCVT);
+-ARM_FEATURE_FLAG(FEAT_PAuth);
+-ARM_FEATURE_FLAG(FEAT_PAuth2);
+-ARM_FEATURE_FLAG(FEAT_FPAC);
+-ARM_FEATURE_FLAG(FEAT_FPACCOMBINE);
+-ARM_FEATURE_FLAG(FEAT_DPB);
+-ARM_FEATURE_FLAG(FEAT_DPB2);
+-ARM_FEATURE_FLAG(FEAT_BF16);
+-ARM_FEATURE_FLAG(FEAT_EBF16);
+-ARM_FEATURE_FLAG(FEAT_I8MM);
+-
+-/* Features from: ID_AA64ISAR2_EL1 */
+-ARM_FEATURE_FLAG(FEAT_WFxT);
+-ARM_FEATURE_FLAG(FEAT_RPRES);
+-ARM_FEATURE_FLAG(FEAT_CSSC);
+-ARM_FEATURE_FLAG(FEAT_HBC);
+-
+-
+-
+-/* Features from: ID_AA64MMFR0_EL1 */
+-ARM_FEATURE_FLAG(FEAT_ECV);
+-
+-/* Features from: ID_AA64MMFR1_EL1 */
+-ARM_FEATURE_FLAG(FEAT_AFP);
+-
+-/* Features from: ID_AA64MMFR2_EL1 */
+-ARM_FEATURE_FLAG(FEAT_LSE2);
+-
+-/* Features from: ID_AA64PFR0_EL1 */
+-ARM_FEATURE_FLAG(FEAT_CSV2);
+-ARM_FEATURE_FLAG(FEAT_CSV3);
+-ARM_FEATURE_FLAG(FEAT_DIT);
+-ARM_FEATURE_FLAG(AdvSIMD);
+-ARM_FEATURE_FLAG(AdvSIMD_HPFPCvt);
+-ARM_FEATURE_FLAG(FEAT_FP16);
+-
+-/* Features from: ID_AA64PFR1_EL1 */
+-ARM_FEATURE_FLAG(FEAT_SSBS);
+-ARM_FEATURE_FLAG(FEAT_BTI);
+-ARM_FEATURE_FLAG(FEAT_SME);
+-ARM_FEATURE_FLAG(FEAT_SME2);
+-ARM_FEATURE_FLAG(FEAT_SME2p1);
+-ARM_FEATURE_FLAG(FEAT_MTE);
+-ARM_FEATURE_FLAG(FEAT_MTE2);
+-ARM_FEATURE_FLAG(FEAT_MTE3);
+-ARM_FEATURE_FLAG(FEAT_MTE4);
+-ARM_FEATURE_FLAG(FEAT_MTE_ASYNC);
+-
+-/* Features from: ID_AA64PFR2_EL1 */
+-ARM_FEATURE_FLAG(FEAT_MTE_STORE_ONLY);
+-
+-/* Features from: ID_AA64SMFR0_EL1 */
+-ARM_FEATURE_FLAG(SME_F32F32);
+-ARM_FEATURE_FLAG(SME_BI32I32);
+-ARM_FEATURE_FLAG(SME_B16F32);
+-ARM_FEATURE_FLAG(SME_F16F32);
+-ARM_FEATURE_FLAG(SME_I8I32);
+-ARM_FEATURE_FLAG(SME_I16I32);
+-ARM_FEATURE_FLAG(FEAT_SME_F64F64);
+-ARM_FEATURE_FLAG(FEAT_SME_I16I64);
+-ARM_FEATURE_FLAG(FEAT_SME_F16F16);
+-ARM_FEATURE_FLAG(FEAT_SME_B16B16);
+-
+-/* Features from: ID_AA64ZFR0_EL1 */
+-ARM_FEATURE_FLAG(FEAT_SVE_B16B16);
+-
+-/* Features from: FPCR */
+-ARM_FEATURE_FLAG(FP_SyncExceptions);
+-
+-/* Features derived from other feature flags */
+-ARM_FEATURE_FLAG(FEAT_MTE_CANONICAL_TAGS);
+-ARM_FEATURE_FLAG(FEAT_MTE_NO_ADDRESS_TAGS);
++	if ((isar2 & ID_AA64ISAR2_EL1_WFxT_MASK) >= ID_AA64ISAR2_EL1_WFxT_EN) {
++		static_if_key_enable(ARM_FEAT_WFxT);
++	}
++	if ((isar2 & ID_AA64ISAR2_EL1_RPRES_MASK) >= ID_AA64ISAR2_EL1_RPRES_EN) {
++		static_if_key_enable(ARM_FEAT_RPRES);
++	}
++	if ((isar2 & ID_AA64ISAR2_EL1_CSSC_MASK) >= ID_AA64ISAR2_EL1_CSSC_EN) {
++		static_if_key_enable(ARM_FEAT_CSSC);
++	}
++	if ((isar2 & ID_AA64ISAR2_EL1_BC_MASK) >= ID_AA64ISAR2_EL1_BC_EN) {
++		static_if_key_enable(ARM_FEAT_HBC);
++	}
++	if ((isar2 & ID_AA64ISAR2_EL1_LUT_MASK) >= ID_AA64ISAR2_EL1_LUT_EN) {
++		static_if_key_enable(ARM_FEAT_LUT);
++	}
++}
++
++/*
++ * arm_features.inc:256
++ *
++ * Features from ID_AA64ISAR3_EL1.
++ */
++static void
++arm_cpu_features_isar3_init(void)
++{
++	uint64_t isar3 = __builtin_arm_rsr64("ID_AA64ISAR3_EL1");
++
++	if ((isar3 & ID_AA64ISAR3_EL1_FAMINMAX_MASK) >= ID_AA64ISAR3_EL1_FAMINMAX_EN) {
++		static_if_key_enable(ARM_FEAT_FAMINMAX);
++	}
++
++	uint64_t cpa_ver = (isar3 & ID_AA64ISAR3_EL1_CPA_MASK);
++	if (cpa_ver != 0) {
++		static_if_key_enable(ARM_FEAT_CPA);
++	}
++	if (cpa_ver != 1) {
++		static_if_key_enable(ARM_FEAT_CPA2);
++	}
++}
++
++/*
++ * arm_features.inc:296
++ *
++ * Features from ID_AA64MMFR0_EL1.
++ */
++static void
++arm_cpu_features_mmfr0_init(void)
++{
++	uint64_t mmfr0 = __builtin_arm_rsr64("ID_AA64MMFR0_EL1");
++
++	if ((mmfr0 & ID_AA64MMFR0_EL1_ECV_MASK) >= ID_AA64MMFR0_EL1_ECV_EN) {
++		static_if_key_enable(ARM_FEAT_ECV);
++	}
++	if ((mmfr0 & ID_AA64MMFR0_EL1_ASID_BITS_MASK) >= ID_AA64MMFR0_EL1_ASID_BITS_16) {
++		static_if_key_enable(ARM_FEAT_ASID16);
++	}
++}
++
++/*
++ * arm_features.inc:313
++ *
++ * Features from ID_AA64MMFR2_EL1.
++ */
++static void
++arm_cpu_features_mmfr2_init(void)
++{
++	uint64_t mmfr2 = __builtin_arm_rsr64("ID_AA64MMFR2_EL1");
++
++	if ((mmfr2 & ID_AA64MMFR2_EL1_AT_MASK) >= ID_AA64MMFR2_EL1_AT_LSE2_EN) {
++		static_if_key_enable(ARM_FEAT_LSE2);
++	}
++	if ((mmfr2 & ID_AA64MMFR2_EL1_VARANGE_MASK) >= ID_AA64MMFR2_EL1_VARANGE_EN) {
++		static_if_key_enable(ARM_FEAT_LVA);
++	}
++	if ((mmfr2 & ID_AA64MMFR2_EL1_CNP_MASK) >= ID_AA64MMFR2_EL1_CNP_EN) {
++		static_if_key_enable(ARM_FEAT_TTCNP);
++	}
++}
++
++/*
++ * arm_features.inc:333
++ *
++ * Features from ID_AA64PFR0_EL1.
++ */
++static void
++arm_cpu_features_pfr0_init(void)
++{
++	uint64_t pfr0 = __builtin_arm_rsr64("ID_AA64PFR0_EL1");
++
++	if ((pfr0 & ID_AA64PFR0_EL1_CSV3_MASK) >= ID_AA64PFR0_EL1_CSV3_EN) {
++		static_if_key_enable(ARM_FEAT_CSV3);
++	}
++	uint64_t csv2_ver = (pfr0 & ID_AA64PFR0_EL1_CSV2_MASK);
++	if (csv2_ver != 0) {
++		static_if_key_enable(ARM_FEAT_CSV2);
++	}
++	if (csv2_ver == ID_AA64PFR0_EL1_CSV2_2) {
++		static_if_key_enable(ARM_FEAT_CSV2_2);
++	}
++	if ((pfr0 & ID_AA64PFR0_EL1_DIT_MASK) >= ID_AA64PFR0_EL1_DIT_EN) {
++		static_if_key_enable(ARM_FEAT_DIT);
++	}
++	if ((pfr0 & ID_AA64PFR0_EL1_AdvSIMD_MASK) != ID_AA64PFR0_EL1_AdvSIMD_DIS) {
++		static_if_key_enable(ARM_AdvSIMD);
++		if ((pfr0 & ID_AA64PFR0_EL1_AdvSIMD_MASK) >= ID_AA64PFR0_EL1_AdvSIMD_HPFPCVT) {
++			static_if_key_enable(ARM_AdvSIMD_HPFPCvt);
++		}
++		if ((pfr0 & ID_AA64PFR0_EL1_AdvSIMD_MASK) >= ID_AA64PFR0_EL1_AdvSIMD_FP16) {
++			static_if_key_enable(ARM_FEAT_FP16);
++		}
++	}
++}
++
++/*
++ * arm_features.inc:366
++ *
++ * Features from ID_AA64PFR1_EL1.
++ */
++static void
++arm_cpu_features_pfr1_init(_Bool enable_sme)
++{
++	uint64_t pfr1 = __builtin_arm_rsr64("ID_AA64PFR1_EL1");
++
++	if ((pfr1 & ID_AA64PFR1_EL1_CSV2_frac_MASK) == ID_AA64PFR1_EL1_CSV2_frac_1p2) {
++		static_if_key_enable(ARM_FEAT_CSV2_1p2);
++	}
++	if ((pfr1 & ID_AA64PFR1_EL1_SSBS_MASK) >= ID_AA64PFR1_EL1_SSBS_EN) {
++		static_if_key_enable(ARM_FEAT_SSBS);
++	}
++	if ((pfr1 & ID_AA64PFR1_EL1_BT_MASK) >= ID_AA64PFR1_EL1_BT_EN) {
++		static_if_key_enable(ARM_FEAT_BTI);
++	}
++	if (enable_sme) {
++		if ((pfr1 & ID_AA64PFR1_EL1_SME_MASK) >= ID_AA64PFR1_EL1_SME_EN) {
++			static_if_key_enable(ARM_FEAT_SME);
++		}
++	}
++	uint64_t mte_ver = (pfr1 & ID_AA64PFR1_EL1_MTE_MASK) >> ID_AA64PFR1_EL1_MTE_OFFSET;
++	if (mte_ver >= 1) {
++		static_if_key_enable(ARM_FEAT_MTE);
++	}
++	if (mte_ver >= 2) {
++		static_if_key_enable(ARM_FEAT_MTE2);
++		if ((pfr1 & ID_AA64PFR1_EL1_MTEX_MASK) >= ID_AA64PFR1_EL1_MTEX_EN) {
++			static_if_key_enable(ARM_FEAT_MTE4);
++		}
++		if ((pfr1 & ID_AA64PFR1_EL1_MTE_FRAC_MASK) == 0) {
++			static_if_key_enable(ARM_FEAT_MTE_ASYNC);
++		}
++	}
++	if (mte_ver >= 3) {
++		static_if_key_enable(ARM_FEAT_MTE3);
++	}
++}
++
++/*
++ * arm_features.inc:411
++ *
++ * Features from ID_AA64PFR2_EL1.
++ */
++static void
++arm_cpu_features_pfr2_init(void)
++{
++	uint64_t pfr2 = __builtin_arm_rsr64("ID_AA64PFR2_EL1");
++
++	if ((pfr2 & ID_AA64PFR2_EL1_MTE_STORE_ONLY_MASK) >= ID_AA64PFR2_EL1_MTE_STORE_ONLY_EN) {
++		static_if_key_enable(ARM_FEAT_MTE_STORE_ONLY);
++	}
++	if ((pfr2 & ID_AA64PFR2_EL1_FPMR_MASK) >= ID_AA64PFR2_EL1_FPMR_EN) {
++		static_if_key_enable(ARM_FEAT_FPMR);
++	}
++}
++
++/*
++ * arm_features.inc:431
++ *
++ * Features from ID_AA64SMFR0_EL1.  Only reached when SME is enabled.
++ */
++static void
++arm_cpu_features_smfr0_init(void)
++{
++	uint64_t smfr0 = __builtin_arm_rsr64("ID_AA64SMFR0_EL1");
++
++	/*
++	 * ID_AA64SMFR0_EL1 has to be parsed differently from other feature ID
++	 * registers.  See "Alternative ID scheme used for ID_AA64SMFR0_EL1" in
++	 * the ARM ARM.
++	 */
++	uint64_t smever = smfr0 & ID_AA64SMFR0_EL1_SMEver_MASK;
++	if (smever != 0) {
++		static_if_key_enable(ARM_FEAT_SME2);
++	}
++	if (smever >= ID_AA64SMFR0_EL1_SMEver_SME2p1) {
++		static_if_key_enable(ARM_FEAT_SME2p1);
++	}
++
++	/* 1-bit fields */
++	if (smfr0 & ID_AA64SMFR0_EL1_F32F32_EN) {
++		static_if_key_enable(ARM_SME_F32F32);
++	}
++	if (smfr0 & ID_AA64SMFR0_EL1_BI32I32_EN) {
++		static_if_key_enable(ARM_SME_BI32I32);
++	}
++	if (smfr0 & ID_AA64SMFR0_EL1_B16F32_EN) {
++		static_if_key_enable(ARM_SME_B16F32);
++	}
++	if (smfr0 & ID_AA64SMFR0_EL1_F16F32_EN) {
++		static_if_key_enable(ARM_SME_F16F32);
++	}
++	if (smfr0 & ID_AA64SMFR0_EL1_F64F64_EN) {
++		static_if_key_enable(ARM_FEAT_SME_F64F64);
++	}
++	if (smfr0 & ID_AA64SMFR0_EL1_F16F16_EN) {
++		static_if_key_enable(ARM_FEAT_SME_F16F16);
++	}
++	if (smfr0 & ID_AA64SMFR0_EL1_B16B16_EN) {
++		static_if_key_enable(ARM_FEAT_SME_B16B16);
++	}
++	if (smfr0 & ID_AA64SMFR0_EL1_LUTv2_EN) {
++		static_if_key_enable(ARM_FEAT_SME_LUTv2);
++	}
++	if (smfr0 & ID_AA64SMFR0_EL1_F8F16_EN) {
++		static_if_key_enable(ARM_FEAT_SME_F8F16);
++	}
++	if (smfr0 & ID_AA64SMFR0_EL1_F8F32_EN) {
++		static_if_key_enable(ARM_FEAT_SME_F8F32);
++	}
++
++	/* 4-bit fields (0 bits are ignored) */
++	if ((smfr0 & ID_AA64SMFR0_EL1_I8I32_EN) == ID_AA64SMFR0_EL1_I8I32_EN) {
++		static_if_key_enable(ARM_SME_I8I32);
++	}
++	if ((smfr0 & ID_AA64SMFR0_EL1_I16I32_EN) == ID_AA64SMFR0_EL1_I16I32_EN) {
++		static_if_key_enable(ARM_SME_I16I32);
++	}
++	if ((smfr0 & ID_AA64SMFR0_EL1_I16I64_EN) == ID_AA64SMFR0_EL1_I16I64_EN) {
++		static_if_key_enable(ARM_FEAT_SME_I16I64);
++	}
++}
++
++/*
++ * arm_features.inc:523
++ *
++ * Features from ID_AA64MMFR1_EL1.
++ */
++static void
++arm_cpu_features_mmfr1_init(void)
++{
++	const uint64_t mmfr1 = __builtin_arm_rsr64("ID_AA64MMFR1_EL1");
++
++	if ((mmfr1 & ID_AA64MMFR1_EL1_AFP_MASK) == ID_AA64MMFR1_EL1_AFP_EN) {
++		static_if_key_enable(ARM_FEAT_AFP);
++	}
++}
++
++/*
++ * arm_features.inc:583
++ *
++ * FPCR exception support.
++ */
++static void
++arm_cpu_features_fpcr_init(void)
++{
++	uint64_t support_mask = FPCR_IDE | FPCR_IXE | FPCR_UFE | FPCR_OFE |
++	    FPCR_DZE | FPCR_IOE;
++	uint64_t FPCR_bits = _test_sys_bits(FPCR, support_mask);
++	if (FPCR_bits == support_mask) {
++		static_if_key_enable(ARM_FP_SyncExceptions);
++	}
++}
++
++/*
++ * arm_features.inc:611
++ *
++ * Features derived from other keys.
++ */
++static void
++arm_cpu_features_misc_init(void)
++{
++	if (ARM_FEAT_MTE4_jump_key.key.sik_enable_count < 0) {
++		return;
++	}
++	static_if_key_enable(ARM_FEAT_MTE_CANONICAL_TAGS);
++	static_if_key_enable(ARM_FEAT_MTE_NO_ADDRESS_TAGS);
++}
++
++/*
++ * arm_features.inc:621
++ */
++static void
++arm_cpu_features_init(const char *boot_args)
++{
++	bool enable_sme = !!static_if_boot_arg_uint64(boot_args, "enable_sme", 1);
++
++	arm_cpu_features_zfr0_init();
++	arm_cpu_features_isar0_init();
++	arm_cpu_features_isar1_init();
++	arm_cpu_features_isar2_init();
++
++	arm_cpu_features_isar3_init();
++
++	arm_cpu_features_mmfr0_init();
++	arm_cpu_features_mmfr1_init();
++	arm_cpu_features_mmfr2_init();
++
++	arm_cpu_features_pfr0_init();
++	arm_cpu_features_pfr1_init(enable_sme);
++	arm_cpu_features_pfr2_init();
++	if (enable_sme) {
++		arm_cpu_features_smfr0_init();
++	}
++	arm_cpu_features_fpcr_init();
++
++	arm_cpu_features_misc_init();
++}
++/* arm_features.inc:657 */
++STATIC_IF_INIT(arm_cpu_features_init);
++
++/*
++ * arm_features.inc:667
++ */
++static void
++apple_cpu_features_init(const char *boot_args)
++{
++	uint64_t aidr = __builtin_arm_rsr64("AIDR_EL1");
++
++	uint64_t pnum = machine_read_midr();
++	if ((pnum & (MIDR_EL1_PNUM_MASK & ~0x10)) == 0x300) {
++		aidr &= ~AIDR_MILDDSB;
++	}
++
++	uint64_t mtever = aidr & AIDR_MTEVER_MASK;
++	if (mtever != 0) {
++		static_if_key_enable(Apple_MTE);
++		if (mtever == AIDR_MTEVER_V1) {
++			static_if_key_enable(Apple_MTEver_1);
++		}
++	}
++	if (aidr & AIDR_TSO) {
++		static_if_key_enable(Apple_TSO);
++	}
++	if (aidr & AIDR_APFLG) {
++		static_if_key_enable(Apple_APFLG);
++	}
++	if (aidr & AIDR_PRSVScalarFP) {
++		static_if_key_enable(Apple_PRSVScalarFP);
++	}
++	if (aidr & AIDR_AFP) {
++		static_if_key_enable(Apple_AFP);
++	}
++	if (static_if_boot_arg_uint64(boot_args, "mdsb", 1)) {
++		if (aidr & AIDR_MILDDSB) {
++			static_if_key_enable(Apple_MILDDSB);
++		}
++	}
++	if (aidr & AIDR_TBCF) {
++		static_if_key_enable(Apple_TBCF);
++	}
++	if ((aidr & AIDR_AMAIRCFG) == 0) {
++		static_if_key_enable(Apple_AMAIRCfg);
++	}
++	if (aidr & AIDR_GEXSCM) {
++		static_if_key_enable(Apple_GEXSCM);
++	}
++	switch (aidr & AIDR_CTRR_MASK) {
++	case AIDR_CTRRv2:
++		static_if_key_enable(Apple_CTRRv2);
++		break;
++	case AIDR_CTRRv3:
++		static_if_key_enable(Apple_CTRRv3);
++		break;
++	}
++}
++/* arm_features.inc:739 */
++STATIC_IF_INIT(apple_cpu_features_init);
++
++#endif /* _ARM_ARM_FEATURES_INC_ */
+diff --git a/osfmk/arm/commpage/commpage.c b/osfmk/arm/commpage/commpage.c
+index 298466320..9e7252948 100644
+--- a/osfmk/arm/commpage/commpage.c
++++ b/osfmk/arm/commpage/commpage.c
+@@ -90,7 +90,7 @@ extern user32_addr_t commpage_text32_location;
+ /* For sysctl access from BSD side */
+ #define ARM_FEATURE_FLAG(x) \
+ 	extern int gARM_ ## x;
+-#include <arm/arm_features.inc>
++#include <arm/arm_features.h>
+ #undef ARM_FEATURE_FLAG
+ 
+ extern int      gUCNormalMem;
+diff --git a/osfmk/arm64/cpu_features.c b/osfmk/arm64/cpu_features.c
+index b1d766f53..d3a227f56 100644
+--- a/osfmk/arm64/cpu_features.c
++++ b/osfmk/arm64/cpu_features.c
+@@ -1,143 +1,48 @@
+ /*
+- * Reconstruction of osfmk/arm64/cpu_features.c from the xnu-13432 reference kernel.
++ * Reconstruction of osfmk/arm64/cpu_features.c from the xnu-13432
++ * reference kernel.
+  *
+- * Function signatures and ordering are derived from the KDK 27.0.1
+- * DWARF.  Functions marked RECON were moved from the public xnu source
+- * when the reference kernel placed them in this file; bodies marked
+- * "body not recovered" are still stubs.
++ * The reference file defines the Apple-specific static_if jump keys and
++ * pulls in the shared ARM feature detection implementations from
++ * osfmk/arm/arm_features.inc.  The key set, their order and the
++ * initializer entry points are recovered from the KDK 27.0.1 DWARF and
++ * both reference kernel images.
+  */
++#include <sys/cdefs.h>
+ #include <kern/kern_types.h>
+-#include <kern/assert.h>
+-#include <kern/debug.h>
+-#include <kern/zalloc.h>
+-#include <sys/systm.h>
++#include <machine/static_if.h>
+ 
+ #define RECON_OSFMK_ARM64_CPU_FEATURES_C 1
+ 
+-/* osfmk/arm64/cpu_features.c:73 */
+-void
+-arm_cpu_features_zfr0_init(void)
+-{
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: arm_cpu_features_zfr0_init");
+-}
+-
+-/* osfmk/arm64/cpu_features.c:97 */
+-void
+-arm_cpu_features_isar0_init(void)
+-{
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: arm_cpu_features_isar0_init");
+-}
+-
+-/* osfmk/arm64/cpu_features.c:148 */
+-void
+-arm_cpu_features_isar1_init(void)
+-{
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: arm_cpu_features_isar1_init");
+-}
+-
+-/* osfmk/arm64/cpu_features.c:222 */
+-void
+-arm_cpu_features_isar2_init(void)
+-{
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: arm_cpu_features_isar2_init");
+-}
+-
+-/* osfmk/arm64/cpu_features.c:256 */
+-void
+-arm_cpu_features_isar3_init(void)
+-{
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: arm_cpu_features_isar3_init");
+-}
+-
+-/* osfmk/arm64/cpu_features.c:296 */
+-void
+-arm_cpu_features_mmfr0_init(void)
+-{
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: arm_cpu_features_mmfr0_init");
+-}
+-
+-/* osfmk/arm64/cpu_features.c:313 */
+-void
+-arm_cpu_features_mmfr2_init(void)
+-{
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: arm_cpu_features_mmfr2_init");
+-}
+-
+-/* osfmk/arm64/cpu_features.c:333 */
+-void
+-arm_cpu_features_pfr0_init(void)
+-{
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: arm_cpu_features_pfr0_init");
+-}
+-
+-/* osfmk/arm64/cpu_features.c:366 */
+-void
+-arm_cpu_features_pfr1_init(_Bool enable_sme)
+-{
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: arm_cpu_features_pfr1_init");
+-}
+-
+-/* osfmk/arm64/cpu_features.c:411 */
+-void
+-arm_cpu_features_pfr2_init(void)
+-{
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: arm_cpu_features_pfr2_init");
+-}
+-
+-/* osfmk/arm64/cpu_features.c:431 */
+-void
+-arm_cpu_features_smfr0_init(void)
+-{
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: arm_cpu_features_smfr0_init");
+-}
+-
+-/* osfmk/arm64/cpu_features.c:523 */
+-void
+-arm_cpu_features_mmfr1_init(void)
+-{
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: arm_cpu_features_mmfr1_init");
+-}
+-
+-/* osfmk/arm64/cpu_features.c:583 */
+-void
+-arm_cpu_features_fpcr_init(void)
+-{
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: arm_cpu_features_fpcr_init");
+-}
+-
+-/* osfmk/arm64/cpu_features.c:611 */
+-void
+-arm_cpu_features_misc_init(void)
+-{
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: arm_cpu_features_misc_init");
+-}
+-
+-/* osfmk/arm64/cpu_features.c:621 */
+-void
+-arm_cpu_features_init(const char * boot_args)
+-{
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: arm_cpu_features_init");
+-}
+-
+-/* osfmk/arm64/cpu_features.c:667 */
+-void
+-apple_cpu_features_init(const char * boot_args)
+-{
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: apple_cpu_features_init");
+-}
++/* osfmk/arm64/cpu_features.c:30 */
++STATIC_IF_KEY_DEFINE_FALSE(Apple_AFP);
++/* osfmk/arm64/cpu_features.c:31 */
++STATIC_IF_KEY_DEFINE_FALSE(Apple_AMAIRCfg);
++/* osfmk/arm64/cpu_features.c:32 */
++STATIC_IF_KEY_DEFINE_FALSE(Apple_AMX);
++/* osfmk/arm64/cpu_features.c:33 */
++STATIC_IF_KEY_DEFINE_FALSE(Apple_AMX4_1);
++/* osfmk/arm64/cpu_features.c:34 */
++STATIC_IF_KEY_DEFINE_FALSE(Apple_APFLG);
++/* osfmk/arm64/cpu_features.c:35 */
++STATIC_IF_KEY_DEFINE_FALSE(Apple_CTRRv2);
++/* osfmk/arm64/cpu_features.c:36 */
++STATIC_IF_KEY_DEFINE_FALSE(Apple_CTRRv3);
++/* osfmk/arm64/cpu_features.c:37 */
++STATIC_IF_KEY_DEFINE_FALSE(Apple_GEXSCM);
++/* osfmk/arm64/cpu_features.c:38 */
++STATIC_IF_KEY_DEFINE_FALSE(Apple_MILDDSB);
++
++/* osfmk/arm64/cpu_features.c:41 */
++STATIC_IF_KEY_DEFINE_FALSE(Apple_MTE);
++/* osfmk/arm64/cpu_features.c:42 */
++STATIC_IF_KEY_DEFINE_FALSE(Apple_MTEver_1);
++
++/* osfmk/arm64/cpu_features.c:45 */
++STATIC_IF_KEY_DEFINE_FALSE(Apple_PRSVScalarFP);
++/* osfmk/arm64/cpu_features.c:46 */
++STATIC_IF_KEY_DEFINE_FALSE(Apple_TBCF);
++/* osfmk/arm64/cpu_features.c:47 */
++STATIC_IF_KEY_DEFINE_FALSE(Apple_TSO);
++
++#include <arm/arm_features.inc>
+diff --git a/osfmk/arm64/proc_reg.h b/osfmk/arm64/proc_reg.h
+index f4d148bd1..55c716b19 100644
+--- a/osfmk/arm64/proc_reg.h
++++ b/osfmk/arm64/proc_reg.h
+@@ -3020,12 +3020,23 @@ typedef enum {
+ #define AIDR_WKDM             (1ULL << 1)
+ #define AIDR_ARCHRETENTION    (1ULL << 2)
+ 
++/* xnu-13432: additional Apple ISA extension bits. */
++#define AIDR_TSO              (1ULL << 9)
++#define AIDR_APFLG            (1ULL << 19)
++#define AIDR_PRSVScalarFP     (1ULL << 20)
++#define AIDR_AFP              (1ULL << 23)
++#define AIDR_MILDDSB          (1ULL << 25)
++#define AIDR_CTRRv2           (1ULL << 14)
++#define AIDR_CTRRv3           (2ULL << 14)
++#define AIDR_CTRR_MASK        (0b11ULL << 14)
++#define AIDR_TBCF             (1ULL << 45)
++#define AIDR_AMAIRCFG         (1ULL << 49)
++#define AIDR_GEXSCM           (1ULL << 57)
++
+ 
+-#if HAS_MTE
+ #define AIDR_MTEVER_SHIFT     41
+ #define AIDR_MTEVER_MASK      (0b11ULL << AIDR_MTEVER_SHIFT)
+ #define AIDR_MTEVER_V1        (0b01ULL << AIDR_MTEVER_SHIFT)
+-#endif
+ 
+ 
+ /*
+@@ -3162,6 +3173,8 @@ typedef enum {
+ #define ID_AA64ISAR1_EL1_API_PAuth2_EN  (3ull << ID_AA64ISAR1_EL1_API_OFFSET)
+ #define ID_AA64ISAR1_EL1_API_FPAC_EN    (4ull << ID_AA64ISAR1_EL1_API_OFFSET)
+ #define ID_AA64ISAR1_EL1_API_FPACCOMBINE (5ull << ID_AA64ISAR1_EL1_API_OFFSET)
++/* xnu-13432: API value 6 advertises FEAT_PAuth_LR. */
++#define ID_AA64ISAR1_EL1_API_PAuth_LR   (6ull << ID_AA64ISAR1_EL1_API_OFFSET)
+ 
+ #define ID_AA64ISAR1_EL1_APA_OFFSET     4
+ #define ID_AA64ISAR1_EL1_APA_MASK       (0xfull << ID_AA64ISAR1_EL1_APA_OFFSET)
+@@ -3197,6 +3210,28 @@ typedef enum {
+ #define ID_AA64ISAR2_EL1_WFxT_MASK      (0xfull << ID_AA64ISAR2_EL1_WFxT_OFFSET)
+ #define ID_AA64ISAR2_EL1_WFxT_EN        (1ull << ID_AA64ISAR2_EL1_WFxT_OFFSET)
+ 
++/* xnu-13432: ID_AA64ISAR2_EL1.LUT advertises FEAT_LUT. */
++#define ID_AA64ISAR2_EL1_LUT_OFFSET     56
++#define ID_AA64ISAR2_EL1_LUT_MASK       (0xfull << ID_AA64ISAR2_EL1_LUT_OFFSET)
++#define ID_AA64ISAR2_EL1_LUT_EN         (1ull << ID_AA64ISAR2_EL1_LUT_OFFSET)
++
++/*
++ * ID_AA64ISAR3_EL1 - AArch64 Instruction Set Attribute Register 3
++ *
++ *  63                                    8 7        4 3        0
++ * +---------------------------------------+----------+----------+
++ * |                 RES0                  | FAMINMAX |   CPA    |
++ * +---------------------------------------+----------+----------+
++ */
++
++#define ID_AA64ISAR3_EL1_FAMINMAX_OFFSET 4
++#define ID_AA64ISAR3_EL1_FAMINMAX_MASK   (0xfull << ID_AA64ISAR3_EL1_FAMINMAX_OFFSET)
++#define ID_AA64ISAR3_EL1_FAMINMAX_EN     (1ull << ID_AA64ISAR3_EL1_FAMINMAX_OFFSET)
++
++#define ID_AA64ISAR3_EL1_CPA_OFFSET      0
++#define ID_AA64ISAR3_EL1_CPA_MASK        (0xfull << ID_AA64ISAR3_EL1_CPA_OFFSET)
++#define ID_AA64ISAR3_EL1_CPA_EN          (1ull << ID_AA64ISAR3_EL1_CPA_OFFSET)
++
+ 
+ /*
+  * ID_AA64MMFR0_EL1 - AArch64 Memory Model Feature Register 0
+@@ -3210,6 +3245,11 @@ typedef enum {
+ #define ID_AA64MMFR0_EL1_ECV_MASK        (0xfull << ID_AA64MMFR0_EL1_ECV_OFFSET)
+ #define ID_AA64MMFR0_EL1_ECV_EN          (1ull << ID_AA64MMFR0_EL1_ECV_OFFSET)
+ 
++/* xnu-13432: ASIDBits advertises 16-bit ASIDs. */
++#define ID_AA64MMFR0_EL1_ASID_BITS_OFFSET 4
++#define ID_AA64MMFR0_EL1_ASID_BITS_MASK  (0xfull << ID_AA64MMFR0_EL1_ASID_BITS_OFFSET)
++#define ID_AA64MMFR0_EL1_ASID_BITS_16    (2ull << ID_AA64MMFR0_EL1_ASID_BITS_OFFSET)
++
+ /*
+  * ID_AA64MMFR2_EL1 - AArch64 Memory Model Feature Register 2
+  *  63  60 59   56 55   52 51   48 47    44 43   40 39   36 35  32 31  28 27  24 23   20 19     16 15  12 14    8 7     4 3     0
+@@ -3223,6 +3263,7 @@ typedef enum {
+ #define ID_AA64MMFR2_EL1_AT_LSE2_EN     (1ull << ID_AA64MMFR2_EL1_AT_OFFSET)
+ #define ID_AA64MMFR2_EL1_VARANGE_OFFSET 16
+ #define ID_AA64MMFR2_EL1_VARANGE_MASK   (0xfull << ID_AA64MMFR2_EL1_VARANGE_OFFSET)
++#define ID_AA64MMFR2_EL1_VARANGE_EN     (1ull << ID_AA64MMFR2_EL1_VARANGE_OFFSET)
+ 
+ #define ID_AA64MMFR2_EL1_CNP_OFFSET     0
+ #define ID_AA64MMFR2_EL1_CNP_MASK       (0xfull << ID_AA64MMFR2_EL1_CNP_OFFSET)
+@@ -3308,6 +3349,11 @@ typedef enum {
+ #define ID_AA64PFR2_EL1_MTE_PERM_MASK       (0xfull << ID_AA64PFR2_EL1_MTE_PERM_OFFSET)
+ #define ID_AA64PFR2_EL1_MTE_PERM_EN         (1ull << ID_AA64PFR2_EL1_MTE_PERM_OFFSET)
+ 
++/* xnu-13432: FPMR advertises FEAT_FPMR. */
++#define ID_AA64PFR2_EL1_FPMR_OFFSET     32
++#define ID_AA64PFR2_EL1_FPMR_MASK       (0xfull << ID_AA64PFR2_EL1_FPMR_OFFSET)
++#define ID_AA64PFR2_EL1_FPMR_EN         (1ull << ID_AA64PFR2_EL1_FPMR_OFFSET)
++
+ /*
+  * ID_AA64MMFR1_EL1 - AArch64 Memory Model Feature Register 1
+  *
+@@ -3341,6 +3387,11 @@ typedef enum {
+ #define ID_AA64SMFR0_EL1_SMEver_SME2    (1ull << ID_AA64SMFR0_EL1_SMEver_OFFSET)
+ #define ID_AA64SMFR0_EL1_SMEver_SME2p1  (2ull << ID_AA64SMFR0_EL1_SMEver_OFFSET)
+ 
++/* xnu-13432: newer SME feature bits. */
++#define ID_AA64SMFR0_EL1_LUTv2_OFFSET   60
++#define ID_AA64SMFR0_EL1_LUTv2_MASK     (1ull << ID_AA64SMFR0_EL1_LUTv2_OFFSET)
++#define ID_AA64SMFR0_EL1_LUTv2_EN       (1ull << ID_AA64SMFR0_EL1_LUTv2_OFFSET)
++
+ #define ID_AA64SMFR0_EL1_I16I64_OFFSET  52
+ #define ID_AA64SMFR0_EL1_I16I64_MASK    (0xfull << ID_AA64SMFR0_EL1_I16I64_OFFSET)
+ #define ID_AA64SMFR0_EL1_I16I64_EN      (0xfull << ID_AA64SMFR0_EL1_I16I64_OFFSET)
+@@ -3361,6 +3412,14 @@ typedef enum {
+ #define ID_AA64SMFR0_EL1_F16F16_MASK    (1ull << ID_AA64SMFR0_EL1_F16F16_OFFSET)
+ #define ID_AA64SMFR0_EL1_F16F16_EN      (1ull << ID_AA64SMFR0_EL1_F16F16_OFFSET)
+ 
++#define ID_AA64SMFR0_EL1_F8F16_OFFSET   41
++#define ID_AA64SMFR0_EL1_F8F16_MASK     (1ull << ID_AA64SMFR0_EL1_F8F16_OFFSET)
++#define ID_AA64SMFR0_EL1_F8F16_EN       (1ull << ID_AA64SMFR0_EL1_F8F16_OFFSET)
++
++#define ID_AA64SMFR0_EL1_F8F32_OFFSET   40
++#define ID_AA64SMFR0_EL1_F8F32_MASK     (1ull << ID_AA64SMFR0_EL1_F8F32_OFFSET)
++#define ID_AA64SMFR0_EL1_F8F32_EN       (1ull << ID_AA64SMFR0_EL1_F8F32_OFFSET)
++
+ 
+ #define ID_AA64SMFR0_EL1_I8I32_OFFSET   36
+ #define ID_AA64SMFR0_EL1_I8I32_MASK     (0xfull << ID_AA64SMFR0_EL1_I8I32_OFFSET)

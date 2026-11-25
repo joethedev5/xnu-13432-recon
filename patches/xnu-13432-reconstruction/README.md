@@ -9,7 +9,7 @@ Apply in numeric order from a clean checkout:
 
 ```
 git checkout xnu-12377.121.6
-git am 0001-*.patch ... 0044-*.patch
+git am 0001-*.patch ... 0045-*.patch
 ```
 
 Contents:
@@ -88,6 +88,10 @@ Contents:
 44. The AMCC RORGN/PV CTRR path: `rorgn_contains`,
     `rorgn_stash_range`, the MMU lockdown/validation helpers and
     `pv_ctrr_init`, with the recovered PV CTRR register definitions.
+45. The ARM feature detection: the per-register init routines and
+    static_if initializers in `osfmk/arm/arm_features.inc`, the Apple
+    AIDR feature keys in `osfmk/arm64/cpu_features.c`, and the new
+    13432 ID-register field definitions in `arm64/proc_reg.h`.
 
 The patches contain only public xnu text plus original reconstruction;
 no Apple binary, dSYM, SDK payload or extracted proprietary header is
