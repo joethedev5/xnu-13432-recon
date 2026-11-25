@@ -1714,3 +1714,43 @@ bookkeeping at the same lines; kasan's larger `hv_vm_t` only moves
 `host_vm_id` and `map_list_head` by 8 bytes.
 
 The patch series now has 58 entries; 76 explicit stubs remain.
+
+## 2026-11-25: create_upl_chunk (in progress)
+
+`create_upl_chunk` (decl 181, parameters at 181-183) resolves the
+mapping window and creates the UPL for one chunk.  The release
+disassembly gives:
+
+- 185: `map = current_thread()->map`; 186 `prot`; 187 `entry_end`;
+  188 `kr`.
+- The protection lookup is `hv_map_lookup_protection(map,
+  current_uva, &prot, &entry_end)` (inlined; hv_vm.c:377-384); its
+  failure returns HV_ERROR.
+- 198: `assert(entry_end > current_uva)`.
+- 199: `*chunk_mapping_size = MIN(remaining_size, entry_end -
+  current_uva)`.
+- 201:18/20: `*upl_chunk_size = (upl_size_t)MIN(*chunk_mapping_size,
+  UPL_SIZE_MAX)` (the 0xffffc000 mask).
+- 220:6 and 225:6 test two protection/behaviour bits of the vm_map
+  entry's 0x38 word; bit 5 skips the temporary write protection and
+  bit 6 rejects the mapping with HV_ERROR.
+- The `need_protect` path (223/224) raises the protection of the
+  current window with mach_vm_protect_kernel (226/227), the protect
+  size being the entry remainder rounded to a page.
+- 232/233: `upl_flags = UPL_SET_INTERNAL | UPL_SET_IO_WIRE` (0x1040)
+  and `upl_count = 0`; 237 calls vm_map_create_upl(map, current_uva,
+  upl_chunk_size, upl, NULL, &upl_count, &upl_flags,
+  VM_KERN_MEMORY_HV) (tag 0x1c).
+- The asserts at 235/236 (current_uva and the UPL size page-aligned)
+  follow the call, as do 253-255 (`*upl_chunk_size` nonzero, not
+  larger than remaining_size, page-aligned), 264 (`*upl_chunk_size >
+  first_page_offset`), 269 (`*chunk_mapping_size > last_page_trim`)
+  and 273 (`*chunk_mapping_size > 0`).
+- The 242/243 path restores the original protection when
+  `need_protect` was set; 250/257 adjust `*chunk_mapping_size` by the
+  UPL's actual size and trim the last page; 264-273 finalise the two
+  output sizes.
+
+The remaining evidence to decode is the exact protect/unprotect call
+arguments and the 250-273 output arithmetic; the function is otherwise
+mapped out.
