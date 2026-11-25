@@ -1,0 +1,297 @@
+From 6ace51a8aa294669a4d32cbb480cf925bbb658af Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 19:53:27 +0000
+Subject: [PATCH] Recover the hypervisor measurement handshake
+
+Reconstruct hv_paranested_virtualization_init_handshake() and its
+measurements_compatible() helper from the kasan reference kernel, which
+keeps the full DWARF the release dSYM omits:
+
+  - negotiate the interface version with host service 0xc600001a
+    (args {0x300, 0x300}); reject unless result[0] is zero and the raw
+    64-bit result[1] is 0x300;
+  - look up the guest measurement for that version, copy it into the
+    first half of a 456-byte zeroed kernel buffer, translate it, and ask
+    host service 0xc6000019 to fill the second half;
+  - accept the pair only when the sizes match, the shared measurement is
+    valid, the interface and state version majors agree, and the state
+    version major equals the selected one; otherwise zero the shared
+    measurement and fail;
+  - report a context measurement mismatch when any real context entry
+    differs, skipping the three size-only entries.
+
+Add hv_get_state_version_major() as the static inline recovered from
+hv_compat_paranested.h (assert plus >> 16 cast to the 16-bit major) and
+the 25-entry hv_measurement_type[] array recovered from the reference
+image (two context roots, twelve read-write, seven read-only, three
+sizes, one read-write).  Rename the handshake parameters and add the
+assert include.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ osfmk/arm64/hv/guest_thread_state.h   |  36 +++++++
+ osfmk/arm64/hv/hv_compat_paranested.h |  13 ++-
+ osfmk/arm64/hv/hv_vm.h                |   6 +-
+ osfmk/arm64/hv/hv_vm_paranested.c     | 148 ++++++++++++++++++++++++++
+ 4 files changed, 198 insertions(+), 5 deletions(-)
+
+diff --git a/osfmk/arm64/hv/guest_thread_state.h b/osfmk/arm64/hv/guest_thread_state.h
+index d8e9b1171..f7c646539 100644
+--- a/osfmk/arm64/hv/guest_thread_state.h
++++ b/osfmk/arm64/hv/guest_thread_state.h
+@@ -381,4 +381,40 @@ typedef enum {
+ 	MEASUREMENT_TYPE_SIZE = 3
+ } hv_measurement_type_t;
+ 
++/*
++ * Kind of each entry of hv_paranested_measurement_t.measurement_array,
++ * in entry order: two context roots, twelve read-write contexts, seven
++ * read-only contexts, three size-only entries and one more read-write
++ * context.  The values were read out of the reference kernel image
++ * (both local copies of the array are identical).
++ */
++/* guest_thread_state.h:730 */
++static const hv_measurement_type_t hv_measurement_type[] = {
++	MEASUREMENT_TYPE_CONTEXT_ROOT,
++	MEASUREMENT_TYPE_CONTEXT_ROOT,
++	MEASUREMENT_TYPE_RW_CONTEXT,
++	MEASUREMENT_TYPE_RW_CONTEXT,
++	MEASUREMENT_TYPE_RW_CONTEXT,
++	MEASUREMENT_TYPE_RW_CONTEXT,
++	MEASUREMENT_TYPE_RW_CONTEXT,
++	MEASUREMENT_TYPE_RW_CONTEXT,
++	MEASUREMENT_TYPE_RW_CONTEXT,
++	MEASUREMENT_TYPE_RW_CONTEXT,
++	MEASUREMENT_TYPE_RW_CONTEXT,
++	MEASUREMENT_TYPE_RW_CONTEXT,
++	MEASUREMENT_TYPE_RW_CONTEXT,
++	MEASUREMENT_TYPE_RW_CONTEXT,
++	MEASUREMENT_TYPE_RO_CONTEXT,
++	MEASUREMENT_TYPE_RO_CONTEXT,
++	MEASUREMENT_TYPE_RO_CONTEXT,
++	MEASUREMENT_TYPE_RO_CONTEXT,
++	MEASUREMENT_TYPE_RO_CONTEXT,
++	MEASUREMENT_TYPE_RO_CONTEXT,
++	MEASUREMENT_TYPE_RO_CONTEXT,
++	MEASUREMENT_TYPE_SIZE,
++	MEASUREMENT_TYPE_SIZE,
++	MEASUREMENT_TYPE_SIZE,
++	MEASUREMENT_TYPE_RW_CONTEXT,
++};
++
+ #endif /* XNU13432_OSFMK_ARM64_HV_GUEST_THREAD_STATE_H */
+diff --git a/osfmk/arm64/hv/hv_compat_paranested.h b/osfmk/arm64/hv/hv_compat_paranested.h
+index 13c0b03c7..762b60f00 100644
+--- a/osfmk/arm64/hv/hv_compat_paranested.h
++++ b/osfmk/arm64/hv/hv_compat_paranested.h
+@@ -10,6 +10,7 @@
+ 
+ #include <stdint.h>
+ #include <sys/types.h>
++#include <kern/assert.h>
+ #include <arm64/hv/guest_thread_state.h>
+ #include <arm64/hv/hv_interface.h>
+ #include <arm64/hv/hv_objects.h>
+@@ -26,9 +27,17 @@ const hv_paranested_measurement_t * hv_get_supported_measurement_nofail(
+ /* hv_compat_paranested.h:53 */
+ _Bool measurement_valid(const hv_paranested_measurement_t * measurement);
+ 
++/*
++ * Return the context version major encoded in the measurement's ARM
++ * hypervisor state version (bits 16-31).
++ */
+ /* hv_compat_paranested.h:56 */
+-hv_context_version_major_t hv_get_state_version_major(
+-	const hv_paranested_measurement_t * measurement);
++static inline hv_context_version_major_t
++hv_get_state_version_major(const hv_paranested_measurement_t * measurement)
++{
++	assert(measurement);
++	return (hv_context_version_major_t)(measurement->arm_hv_state_version >> 16);
++}
+ 
+ /* hv_compat_paranested.h:65 */
+ _Bool hv_paranested_virtualization_init(void);
+diff --git a/osfmk/arm64/hv/hv_vm.h b/osfmk/arm64/hv/hv_vm.h
+index bf68118e1..0d27f63be 100644
+--- a/osfmk/arm64/hv/hv_vm.h
++++ b/osfmk/arm64/hv/hv_vm.h
+@@ -37,9 +37,9 @@ extern hv_return_t hv_nested_call(hv_nested_call_params_t * pnv_args);
+ 
+ /* hv_vm.h:47 */
+ _Bool hv_paranested_virtualization_init_handshake(
+-	_Bool * initialized,
+-	_Bool * supported,
+-	hv_paranested_measurement_t * measurement);
++	_Bool * hv_major_conversion_needed,
++	_Bool * hv_context_measurement_mismatch,
++	hv_paranested_measurement_t * shared_measurement);
+ 
+ /* hv_vm.h:50 */
+ kern_return_t hv_map_lookup_protection(
+diff --git a/osfmk/arm64/hv/hv_vm_paranested.c b/osfmk/arm64/hv/hv_vm_paranested.c
+index 16154f355..7e625f317 100644
+--- a/osfmk/arm64/hv/hv_vm_paranested.c
++++ b/osfmk/arm64/hv/hv_vm_paranested.c
+@@ -11,6 +11,7 @@
+ #include <arm64/hv/hv_vm.h>
+ #include <arm64/hv/hv_internal.h>
+ #include <arm64/hv/hv_objects.h>
++#include <arm64/hv/hv_compat_paranested.h>
+ #include <arm/pmap.h>
+ #include <kern/assert.h>
+ #include <kern/kalloc.h>
+@@ -315,3 +316,150 @@ pmap_ipa_size(uint64_t granule)
+ 		return 0;
+ 	}
+ }
++
++/*
++ * Two measurements are compatible when they describe the same context:
++ * identical sizes, a valid shared measurement, and matching interface
++ * and state version majors.
++ */
++/* osfmk/arm64/hv/hv_vm_paranested.c:381 */
++static _Bool
++measurements_compatible(
++	const hv_paranested_measurement_t * measurement,
++	const hv_paranested_measurement_t * shared_measurement)
++{
++	return measurement->this_size == shared_measurement->this_size &&
++	       measurement->measurement_array_size ==
++	       shared_measurement->measurement_array_size &&
++	       measurement_valid(shared_measurement) &&
++	       measurement->version_major == shared_measurement->version_major &&
++	       hv_get_state_version_major(measurement) ==
++	       hv_get_state_version_major(shared_measurement);
++}
++
++/*
++ * Run the paravirtualized virtualization handshake with the host:
++ *
++ *  - negotiate the interface/state version major (0x300),
++ *  - hand the host a two-measurement buffer: the guest's supported
++ *    measurement and a second slot the host fills in,
++ *  - require the measurements to be compatible and the state version
++ *    majors to agree,
++ *  - compare the per-entry measurement types against the host's copy
++ *    and report a context measurement mismatch,
++ *  - clear the major-conversion flag and report success.
++ *
++ * Returns false when the host refuses the handshake or provides an
++ * incompatible measurement; shared_measurement is zeroed in the
++ * incompatible case.
++ */
++/* osfmk/arm64/hv/hv_vm_paranested.c:406 */
++_Bool
++hv_paranested_virtualization_init_handshake(
++	_Bool * hv_major_conversion_needed,
++	_Bool * hv_context_measurement_mismatch,
++	hv_paranested_measurement_t * shared_measurement)
++{
++	_Bool paranested_supported = false;
++
++	/* Ask the host which interface version it speaks. */
++	hv_nested_call_params_t version_call_args = {
++		.input = {
++			.service = 0xc600001a,
++			.args = {
++				0x300,
++				0x300,
++			},
++		},
++	};
++
++	hv_return_t version_result = hv_nested_call(&version_call_args);
++	if (version_result != HV_SUCCESS ||
++	    version_call_args.output.result[0] != 0) {
++		return false;
++	}
++
++	hv_context_version_major_t selected_version_major =
++	    (hv_context_version_major_t)version_call_args.output.result[1];
++	if (version_call_args.output.result[1] != 0x300) {
++		return false;
++	}
++
++	const hv_paranested_measurement_t * intermediate_measurement =
++	    hv_get_supported_measurement_nofail(selected_version_major);
++
++	const size_t measurement_pair_size =
++	    sizeof(hv_paranested_measurement_t) * 2;
++	vm_offset_t measurement_pair_addr;
++	kern_return_t allocate_retval = kernel_memory_allocate(kernel_map,
++	    &measurement_pair_addr, measurement_pair_size, PAGE_MASK, KMA_ZERO,
++	    VM_KERN_MEMORY_HV);
++	if (allocate_retval != KERN_SUCCESS) {
++		return false;
++	}
++
++	hv_paranested_measurement_t * measurement_pair =
++	    (hv_paranested_measurement_t *)measurement_pair_addr;
++	memmove(measurement_pair, intermediate_measurement,
++	    sizeof(hv_paranested_measurement_t));
++
++	vm_offset_t measurement_pair_phys =
++	    (vm_offset_t)kvtophys_nofail((vm_offset_t)measurement_pair);
++
++	hv_nested_call_params_t nested_call_args = {
++		.input = {
++			.service = 0xc6000019,
++			.args = {
++				measurement_pair_phys,
++				measurement_pair_size,
++			},
++		},
++	};
++
++	if ((hv_nested_call(&nested_call_args)) != HV_SUCCESS ||
++	    nested_call_args.output.result[0] != 0) {
++		goto error;
++	}
++
++	/* The host fills in the second measurement of the pair. */
++	memmove(shared_measurement, measurement_pair + 1,
++	    sizeof(hv_paranested_measurement_t));
++
++	if (!measurements_compatible(intermediate_measurement,
++	    shared_measurement)) {
++		memset(shared_measurement, 0, sizeof(*shared_measurement));
++		goto error;
++	}
++
++	assert(selected_version_major == hv_get_state_version_major(shared_measurement));
++
++	*hv_major_conversion_needed = false;
++
++	/*
++	 * Compare the host's measurement entries with the guest's; any
++	 * difference in a real context entry is a context mismatch.
++	 */
++	*hv_context_measurement_mismatch = false;
++
++	for (unsigned int i = 0; i < 25; i++) {
++		const hv_measurement_type_t measurement_type =
++		    hv_measurement_type[i];
++
++		if (measurement_type > MEASUREMENT_TYPE_RO_CONTEXT) {
++			continue;
++		}
++
++		if (memcmp(&intermediate_measurement->measurement_array[i],
++		    &shared_measurement->measurement_array[i],
++		    sizeof(hv_measurement_entry_t)) != 0) {
++			*hv_context_measurement_mismatch = true;
++			break;
++		}
++	}
++
++	paranested_supported = true;
++
++error:
++	kmem_free(kernel_map, measurement_pair_addr, measurement_pair_size);
++	return paranested_supported;
++}
+-- 
+2.47.3
+

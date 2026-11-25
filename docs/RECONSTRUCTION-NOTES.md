@@ -1284,3 +1284,69 @@ uint64_t: the call lands at 146:15, ten columns into the line,
 matching `(uint64_t)hv_vm_max_permitted_isa(),` at four tabs).
 
 The patch series now has 51 entries; 99 explicit stubs remain.
+
+## 2026-11-25: the measurement handshake
+
+The release dSYM omits `hv_paranested_virtualization_init_handshake`
+and `measurements_compatible` (LTO), so both bodies come from
+`kernel.kasan.vmapple` and were cross-checked against
+`kernel.development.vmapple` (which also keeps them out of line, though
+without DWARF).  The kasan build's DWARF supplies the exact local
+lines: 409 `paranested_supported`, 412 `version_call_args`, 423
+`version_result`, 428 `selected_version_major`, 435
+`intermediate_measurement`, 441/443 the pair size and address, 446
+`allocate_retval`, 451/455 `measurement_pair` and its physical
+address, 458 `nested_call_args`, the 512 `error` label and the 481
+assert.  The assert descriptor at `_hv_paranested_virtualization_init_
+handshake.__desc` spells out the recovered text exactly:
+`selected_version_major == hv_get_state_version_major(shared_measurement)`.
+
+- The version call uses service 0xc600001a with args {0x300, 0x300}
+  (line 412; the two stores at 412:26, the inlined `hvc` at 423:31).
+  The reply is tested as `output.result[0]` (424:54) and the raw
+  64-bit `output.result[1]` is compared with 0x300 (428:82 loads it,
+  429:29 compares it): the kasan and development kernels both emit
+  `ldr x, [record, #0x38]; cmp x, #0x300` with no 16-bit truncation,
+  so the check is on the full result register even though
+  `selected_version_major` is the 16-bit `hv_context_version_major_t`.
+  The lookup at 435:64 is folded to the constant 0x300 on the success
+  path.
+- The measurement pair is a 456-byte zeroed kernel allocation
+  (`kmem_alloc_guard` with mask 0x3fff, flags 0x80, tag 0x1c; call at
+  446:34, failure return at 448:6).  The guest measurement is copied
+  into the first 228 bytes (memmove at 452:28), translated with
+  `kvtophys_nofail` (455:51), and the pair's physical address plus the
+  456-byte size are passed to service 0xc6000019 (initializer at 458,
+  `hvc` at 468:7).  A nonzero `output.result[0]` (469:23) goes to the
+  error label.
+- The host-filled second measurement is copied out at 473:42 and
+  checked by `measurements_compatible` (475:6).  An incompatible pair
+  zeroes the shared measurement (476:3, 228 bytes) and leaves through
+  the error label; the error path frees the 456-byte pair at 514:12
+  and returns at 517:1.
+- On success the major-conversion flag is cleared (482:30), the
+  context-mismatch flag initialized (495:35), and the loop at 497:2
+  walks the 25 entries (`measurement_type[i]` loaded at 498:50 from
+  `hv_measurement_type[]`).  Entries whose type is greater than
+  `MEASUREMENT_TYPE_RO_CONTEXT` are skipped (500:7); real entries
+  compare 8 bytes (505:8, 505:101) and the first difference sets the
+  mismatch flag (506:38) and breaks.  The function reports success
+  even when contexts differ.
+- `measurements_compatible` is at 381 (body brace 383:0) and is a pure
+  return expression whose terms the image orders as: `this_size`
+  (loads 387:30/387:69, compare 388:9), `measurement_array_size`
+  (388:33/389:38, compare 390:9), `measurement_valid(shared)` (call
+  390:12, branch 391:9), `version_major` (ldrh 391:33/391:76, compare
+  392:9) and the state majors (inlined `hv_get_state_version_major`
+  from hv_compat_paranested.h:58-59, compare 393:9; the second call is
+  expanded as a 64-bit load plus `lsr #16`).
+- `hv_get_state_version_major` is a static inline at
+  hv_compat_paranested.h:56 with the assert at 58 and the
+  `(hv_context_version_major_t)(arm_hv_state_version >> 16)` return at
+  59; the inline's body compiles to a halfword load at +0x16.
+- `hv_measurement_type[]` is the 25-entry constant at
+  guest_thread_state.h:730 with kinds
+  [CONTEXT_ROOT, CONTEXT_ROOT, RW x12, RO x7, SIZE x3, RW]; both local
+  copies in the reference image are identical.
+
+The patch series now has 52 entries; 98 explicit stubs remain.

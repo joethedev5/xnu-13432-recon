@@ -9,7 +9,7 @@ Apply in numeric order from a clean checkout:
 
 ```
 git checkout xnu-12377.121.6
-git am 0001-*.patch ... 0051-*.patch
+git am 0001-*.patch ... 0052-*.patch
 ```
 
 Contents:
@@ -129,6 +129,15 @@ Contents:
     the 0xc6000014 host call and task publication) and the one-time host
     capability query behind `pmap_ipa_size`, with the reference nested
     designated-initializer form for the nested-call records.
+52. The hypervisor measurement handshake:
+    `hv_paranested_virtualization_init_handshake` (version negotiation
+    with host service 0xc600001a, the 456-byte measurement pair filled
+    by service 0xc6000019, the compatibility check, the state-version
+    assertion and the per-entry context mismatch scan) and
+    `measurements_compatible`, with the static inline
+    `hv_get_state_version_major` and the 25-entry
+    `hv_measurement_type[]` array recovered from the kasan reference
+    kernel, which keeps the full DWARF the release dSYM omits.
 
 The patches contain only public xnu text plus original reconstruction;
 no Apple binary, dSYM, SDK payload or extracted proprietary header is

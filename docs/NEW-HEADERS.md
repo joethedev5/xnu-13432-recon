@@ -23,9 +23,9 @@ small declaration-only APIs recovered from the reference DWARF.
 | `iokit/IOKit/pwr_mgt/IOPMAssertionTypes.h` | 40 |
 | `iokit/Kernel/IOAnalytics.h` | 30 |
 | `libkern/os/metric_types.h` | 75 |
-| `osfmk/arm64/hv/guest_thread_state.h` | 384 |
+| `osfmk/arm64/hv/guest_thread_state.h` | 420 |
 | `osfmk/arm64/hv/hv.h` | 33 |
-| `osfmk/arm64/hv/hv_compat_paranested.h` | 60 |
+| `osfmk/arm64/hv/hv_compat_paranested.h` | 69 |
 | `osfmk/arm64/hv/hv_interface.h` | 123 |
 | `osfmk/arm64/hv/hv_internal.h` | 123 |
 | `osfmk/arm64/hv/hv_kern_types.h` | 32 |
