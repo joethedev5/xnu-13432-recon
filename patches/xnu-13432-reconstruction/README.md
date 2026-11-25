@@ -9,7 +9,7 @@ Apply in numeric order from a clean checkout:
 
 ```
 git checkout xnu-12377.121.6
-git am 0001-*.patch ... 0056-*.patch
+git am 0001-*.patch ... 0057-*.patch
 ```
 
 Contents:
@@ -171,6 +171,13 @@ Contents:
     shared/intermediate context buffers for conversion guests, host
     service 0xc6000011, the post-create conversion, the copyout and
     its host-destroy failure path, and the online-bitmap publication).
+57. The hypervisor vCPU run and run-cancel paths in
+    `osfmk/arm64/hv/hv_vcpu_paranested.c`: `hv_trap_vcpu_run` (the
+    shared-layout context conversion, host service 0xc6000010, the
+    re-entry loop on result[1] == 0xb with the pending-AST check under
+    disabled preemption, and the conversion back) and
+    `hv_trap_vcpu_run_cancel` (the vCPU/VM selection with its VM
+    reference, host service 0xc6000013 and the conditional VM release).
 
 The patches contain only public xnu text plus original reconstruction;
 no Apple binary, dSYM, SDK payload or extracted proprietary header is

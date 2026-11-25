@@ -1,0 +1,172 @@
+From 3fb3804b60b5aae163a7203fe60876167af0b79a Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 20:22:30 +0000
+Subject: [PATCH] Recover the hypervisor vCPU run and run-cancel paths
+
+hv_trap_vcpu_run converts the guest context to the shared layout,
+issues the 0xc6000010 host call with the VM id and vCPU id, and loops
+while the host asks for re-entry (result[1] == 0xb) and no AST is
+pending for the calling thread; preemption is disabled while the CPU's
+pending-AST word is inspected.  The context is converted back before
+the host's status is returned.
+
+hv_trap_vcpu_run_cancel uses the thread's vCPU VM when present and
+otherwise references the thread's VM, issues the 0xc6000013 host call
+with the VM id and the trap argument, and releases the VM reference it
+took before returning the host's status.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ osfmk/arm64/hv/hv_vcpu_paranested.c | 115 +++++++++++++++++++++++++++-
+ 1 file changed, 111 insertions(+), 4 deletions(-)
+
+diff --git a/osfmk/arm64/hv/hv_vcpu_paranested.c b/osfmk/arm64/hv/hv_vcpu_paranested.c
+index 1c924041d..0f4d56867 100644
+--- a/osfmk/arm64/hv/hv_vcpu_paranested.c
++++ b/osfmk/arm64/hv/hv_vcpu_paranested.c
+@@ -8,12 +8,17 @@
+  */
+ #include <kern/kern_types.h>
+ #include <kern/assert.h>
++#include <kern/ast.h>
++#include <kern/cpu_data.h>
+ #include <kern/debug.h>
+ #include <kern/task.h>
++#include <kern/thread.h>
+ #include <libkern/copyio.h>
+ #include <mach/vm_param.h>
+ #include <vm/vm_kern.h>
+ #include <vm/vm_kern_xnu.h>
++#include <arm/cpu_data.h>
++#include <arm/cpu_data_internal.h>
+ #include <arm/pmap.h>
+ #include <arm64/hv/hv_compat_paranested.h>
+ #include <arm64/hv/hv_internal.h>
+@@ -344,18 +349,120 @@ hv_trap_vcpu_sysregs_sync(uint64_t arg)
+ 	return HV_SUCCESS;
+ }
+ 
++/*
++ * Run the current thread's vCPU.
++ *
++ * The guest's context must be in the shared layout before the host can
++ * enter the guest, so it is converted first when the guest's layout
++ * differs.  The host is then asked to run the vCPU and is re-entered
++ * for as long as it asks to stay in the run loop and no AST is pending
++ * for the calling thread; preemption is disabled while the CPU's
++ * pending AST is inspected.  Once the loop is done, the context is
++ * converted back to the native layout.
++ */
+ /* osfmk/arm64/hv/hv_vcpu_paranested.c:332 */
+ hv_return_t
+ hv_trap_vcpu_run(uint64_t arg)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: hv_trap_vcpu_run");
++	hv_vcpu_t * vcpu;
++
++	if ((vcpu = hv_get_vcpu()) == NULL) {
++		return HV_NO_DEVICE;
++	}
++
++	/* The guest's context must be in the shared layout to run. */
++
++	if (hv_guest_needs_context_conversion()) {
++		convert_context_by_guest(vcpu, NATIVE_TO_SHARED);
++	}
++
++	hv_nested_call_params_t pnv_args = {
++		.input = {
++			.service = 0xc6000010,
++			.args = {
++				vcpu->vm->host_vm_id,
++				vcpu->id,
++			},
++		},
++	};
++
++	hv_return_t ret;
++	_Bool stay_in_runloop;
++	do {
++		hv_return_t hypercall_ret = hv_nested_call(&pnv_args);
++		ret = (hv_return_t)pnv_args.output.result[0];
++
++		if (hypercall_ret) {
++			ret = hypercall_ret;
++			break;
++		} else if (ret || pnv_args.output.result[1] != 0xb) {
++			break;
++		} else {
++			/*
++			 * Check for a pending AST before re-entering the guest.
++			 */
++			disable_preemption();
++			cpu_data_t *pcpu = current_cpu_datap();
++			stay_in_runloop = (pcpu->cpu_pending_ast & ~AST_DEBUG_ASSERT) == 0;
++			enable_preemption();
++		}
++	} while (stay_in_runloop);
++
++	/* Restore the guest's context layout after the host returns. */
++
++	if (hv_guest_needs_context_conversion()) {
++		convert_context_by_guest(vcpu, SHARED_TO_NATIVE);
++	}
++
++	/*
++	 * Return the host's status: the loop only exits successfully when
++	 * the host asked to leave and no AST is pending.
++	 */
++	return ret;
+ }
+ 
++/*
++ * Cancel a vCPU run.
++ *
++ * When the current thread has a vCPU the cancel goes to that vCPU's
++ * VM; without one the VM is looked up and referenced instead, and
++ * released once the host has been told to cancel.  The trap argument
++ * is forwarded to the host.
++ */
+ /* osfmk/arm64/hv/hv_vcpu_paranested.c:392 */
+ hv_return_t
+ hv_trap_vcpu_run_cancel(uint64_t arg)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: hv_trap_vcpu_run_cancel");
++	hv_vcpu_t * vcpu;
++	hv_vm_t * vm;
++
++	/*
++	 * Use the thread's vCPU's VM, if any; otherwise reference it.
++	 */
++	if ((vcpu = hv_get_vcpu()) != NULL) {
++		vm = vcpu->vm;
++	} else if ((vm = hv_get_and_reference_vm()) == NULL) {
++		return HV_NO_DEVICE;
++	}
++
++	hv_nested_call_params_t pnv_args = {
++		.input = {
++			.service = 0xc6000013,
++			.args = {
++				vm->host_vm_id,
++				arg,
++			},
++		},
++	};
++
++	hv_return_t ret = hv_nested_call(&pnv_args);
++	if (!ret) {
++		ret = (hv_return_t)pnv_args.output.result[0];
++	}
++
++	if (vcpu == NULL) {
++		hv_release_vm(vm);
++	}
++
++	return ret;
+ }
+-- 
+2.47.3
+

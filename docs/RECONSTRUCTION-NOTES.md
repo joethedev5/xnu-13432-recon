@@ -1623,3 +1623,46 @@ labels `copyout_failed` (278), `vcpu_hvc_failed` (290),
   297 returns `ret`.
 
 The patch series now has 56 entries; 84 explicit stubs remain.
+
+## 2026-11-25: the vCPU run and run-cancel paths
+
+`hv_trap_vcpu_run` (decl 332, brace 333:0) declares `vcpu` at 334 and
+checks `hv_get_vcpu()` at 336:6, returning HV_NO_DEVICE, then converts
+the context to the shared layout at 342:6/343:3
+(`convert_context_by_guest(vcpu, NATIVE_TO_SHARED)`).  The nested call
+record (`pnv_args`, 346:26) carries service 0xc6000010 with
+`{ vcpu->vm->host_vm_id, vcpu->id }` (the two member loads at 350:11
+and 350:15, the id load at 351:11, and the arguments store at 349:12).
+
+The do loop starts at 358:2.  Each iteration issues the call
+(359:31), takes `ret` from result[0] (360:22), leaves the loop when
+the call itself failed (`if (hypercall_ret)`, 362:7) or when the host
+status is nonzero or the second result word is not 0xb (365:46 and
+365:49, the 11 compare), and otherwise disables preemption (371:4),
+loads `current_thread()->machine.CpuDatap` (372:23), computes
+`stay_in_runloop = (pcpu->cpu_pending_ast & ~AST_DEBUG_ASSERT) == 0`
+(the 0x4c member load at 373:29 and the 0xff7fffff mask at 373:45),
+and enables preemption again (374:4) before the back edge.  After the
+loop the context is converted back at 380:6/381:28 and the host status
+is returned (389:1).
+
+`hv_trap_vcpu_run_cancel` (decl 392, brace 393:0) declares `vcpu`
+(394), `vm` (395), `pnv_args` (406) and `ret` (416).  A thread vCPU
+makes `vm = vcpu->vm` (the member load at 401:14, the join at 402:2);
+without one the VM is looked up and referenced with
+`hv_get_and_reference_vm()` (the inline's hv_lock/hv_get_vm/
+hv_reference_vm/hv_unlock sites are hv_internal.h:158:2, 159:7, 161:3
+and 163:2), returning HV_NO_DEVICE when there is no VM.  The record
+uses service 0xc6000013 with `{ vm->host_vm_id, arg }` (410:9 and the
+argument store at 409:12), the call is made at 416:20, result[0] is
+taken under `if (!ret)` (417:6/418:22), and the VM reference is
+released at 422:3 only when the vCPU was absent.  The return is at
+426:1.
+
+The release, development and kasan builds agree on the service
+constants, the 0xb re-entry reason, the 0xff7fffff AST mask and the
+VM-reference handling.  The kasan `hv_vm_t` places `host_vm_id` at
+0x28 (its layout is 8 bytes larger than the release object, whose
+host_vm_id is at 0x20); the reconstruction follows the release layout.
+
+The patch series now has 57 entries; 82 explicit stubs remain.
