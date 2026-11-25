@@ -1,0 +1,153 @@
+From 9abf239d014830d11ae725c17f0e1a6004e11fc8 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 02:25:14 +0000
+Subject: [PATCH 07/13] Recover RBBR window getters and the production-fused
+ check
+
+- tcp_rbbr_get_rlwin: honor skip_rwnd_restrict, round the RBBR window
+  up to the rcv_scale granularity, and when a window change is pending
+  clear it (recording tcp_now) once the advertised window exceeds
+  t_maxseg + the rounded window.
+- tcp_rbbr_after_idle: preserve rwnd_est and delay_exceeded_seen
+  across a full state reset, reinitialize the initial window when no
+  estimate exists, reset the phase, and schedule the next probe RTT
+  boundary using the 30-second reference interval.
+- ml_device_is_prod_fused: read /chosen
+  certificate-production-status as a 32-bit property, exactly as the
+  reference does.
+
+Remaining explicit stubs: 305.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ bsd/netinet/tcp_rbbr.c             | 71 ++++++++++++++++++++++++++++--
+ osfmk/arm64/machine_routines_nos.c | 16 ++++++-
+ 2 files changed, 81 insertions(+), 6 deletions(-)
+
+diff --git a/bsd/netinet/tcp_rbbr.c b/bsd/netinet/tcp_rbbr.c
+index a5be40a00..0a23f8fe6 100644
+--- a/bsd/netinet/tcp_rbbr.c
++++ b/bsd/netinet/tcp_rbbr.c
+@@ -13,6 +13,13 @@
+ 
+ #define RECON_BSD_NETINET_TCP_RBBR_C 1
+ 
++/*
++ * Values read from the reference image at 0xfffffe0007cbf450 and
++ * 0xfffffe0007cbf44c; kept as globals so the generated code loads them.
++ */
++uint32_t tcp_rbbr_rwnd_init_mss = 10;
++uint32_t tcp_rbbr_probe_rtt_secs = 30;
++
+ /* bsd/netinet/tcp_rbbr.c:245 */
+ uint32_t
+ rbbr_pct(uint32_t val, uint32_t pct)
+@@ -324,16 +331,72 @@ tcp_rbbr_data_rcvd(struct tcpcb * tp, struct tcphdr * th, struct tcpopt * to, ui
+ uint32_t
+ tcp_rbbr_get_rlwin(struct tcpcb * tp)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_rbbr_get_rlwin");
++	struct tcp_rbbr_state *rbbr = tp->t_rbbr_state;
++	uint32_t rlwin;
++	uint32_t scale;
++
++	if (rbbr == NULL || rbbr->skip_rwnd_restrict != 0) {
++		return 0xffffu << tp->rcv_scale;
++	}
++
++	rlwin = rbbr->win;
++	scale = 1u << tp->rcv_scale;
++	if (tp->rcv_scale != 0) {
++		rlwin = (rlwin + scale - 1) & ~(scale - 1);
++	}
++
++	if (rbbr->win_change_pending != 0) {
++		uint32_t avail = tp->rcv_adv - tp->rcv_nxt;
++
++		if ((int32_t)avail < 0) {
++			avail = 0;
++		}
++		if (avail > tp->t_maxseg + rlwin) {
++			rbbr->rwnd_change_ts = tcp_now;
++			rbbr->win_change_pending = 0;
++		}
++	}
++	return rlwin;
+ }
+ 
+ /* bsd/netinet/tcp_rbbr.c:1707 */
+ void
+ tcp_rbbr_after_idle(struct tcpcb * tp)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_rbbr_after_idle");
++	struct tcp_rbbr_state *rbbr = tp->t_rbbr_state;
++	uint32_t now;
++	uint32_t saved_est;
++	uint8_t saved_delay;
++	uint32_t interval;
++
++	if (rbbr == NULL) {
++		return;
++	}
++
++	now = tcp_now;
++	saved_est = rbbr->rwnd_est;
++	saved_delay = rbbr->delay_exceeded_seen;
++	memset(rbbr, 0, sizeof(*rbbr));
++	rbbr->delay_exceeded_seen = saved_delay;
++
++	if (saved_est != 0) {
++		rbbr->rwnd_est = saved_est;
++	} else {
++		uint32_t max_win;
++
++		saved_est = tp->t_maxseg * tcp_rbbr_rwnd_init_mss;
++		rbbr->rwnd_est = saved_est;
++		saved_est = (saved_est + (tp->t_maxseg >> 1)) /
++		    tp->t_maxseg * tp->t_maxseg;
++		max_win = 0xffffu << tp->rcv_scale;
++		rbbr->win = saved_est < max_win ? saved_est : max_win;
++		rbbr->win_change_pending = 1;
++	}
++
++	rbbr->phase = 0;
++	rbbr->phase_start_ts = now;
++	interval = (tcp_rbbr_probe_rtt_secs > 1 ? tcp_rbbr_probe_rtt_secs : 1) * 1000;
++	rbbr->next_probe_rtt_ts = (now / interval + 1) * interval;
+ }
+ 
+ /* bsd/netinet/tcp_rbbr.c:1742 */
+diff --git a/osfmk/arm64/machine_routines_nos.c b/osfmk/arm64/machine_routines_nos.c
+index 208a62add..cc7fe9861 100644
+--- a/osfmk/arm64/machine_routines_nos.c
++++ b/osfmk/arm64/machine_routines_nos.c
+@@ -11,6 +11,7 @@
+ #include <kern/debug.h>
+ #include <kern/zalloc.h>
+ #include <sys/systm.h>
++#include <pexpert/device_tree.h>
+ 
+ #define RECON_OSFMK_ARM64_MACHINE_ROUTINES_NOS_C 1
+ 
+@@ -18,6 +19,17 @@
+ boolean_t
+ ml_device_is_prod_fused(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: ml_device_is_prod_fused");
++	DTEntry entry;
++	void *prop = NULL;
++	uint32_t prop_size = 0;
++
++	if (SecureDTLookupEntry(NULL, "/chosen", &entry) != kSuccess) {
++		return FALSE;
++	}
++	if (SecureDTGetProperty(entry, "certificate-production-status",
++	    &prop, &prop_size) != kSuccess ||
++	    prop_size != sizeof(uint32_t)) {
++		return FALSE;
++	}
++	return *(uint32_t *)prop;
+ }

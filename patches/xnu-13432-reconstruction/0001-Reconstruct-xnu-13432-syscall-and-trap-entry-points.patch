@@ -1,0 +1,1382 @@
+From 7b27b0793516e882b6792effcf1a6293b7dd6198 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 02:11:15 +0000
+Subject: [PATCH 01/13] Reconstruct xnu-13432 syscall and trap entry points
+
+Add the nine syscalls and one Mach trap that the KDK 27.0.1
+kernel.release.vmapple dispatch tables expose beyond the public
+xnu-12377.121.6 tree:
+
+  148 pipe2, 149 dup3, 214 fchflagsat, 215 getumask,
+  246 aio_readv, 247 aio_writev, 249 fsctlat,
+  352 guarded_ftruncate_np, 519 register_uexc_handler,
+  Mach trap 108 thread_set_x86_64_compat_trap.
+
+Handler bodies are reconstructed from the reference kernel's
+disassembly and DWARF, including the dup_internal/close_fp_for_dup
+refactor, ftruncate_internal, fsctlat_internal, and the uexc
+registration path.  makesyscalls.sh output matches the reference
+sysent table (handler, munge, return type, argument bytes).
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ bsd/dev/arm/stubs.c         |  34 ++++
+ bsd/kern/kern_aio.c         |  29 ++++
+ bsd/kern/kern_descrip.c     | 301 ++++++++++++++++++++++++------------
+ bsd/kern/kern_exec.c        |  10 +-
+ bsd/kern/kern_guarded.c     |  19 ++-
+ bsd/kern/posix_sem.c        |   2 +-
+ bsd/kern/sys_pipe.c         |  88 +++++++++++
+ bsd/kern/syscalls.master    |  18 +--
+ bsd/sys/file_internal.h     |  10 +-
+ bsd/vfs/vfs_syscalls.c      | 198 ++++++++++++++++++++----
+ osfmk/arm/task.h            |  17 +-
+ osfmk/arm/thread.h          |   2 +
+ osfmk/arm64/machine_task.c  |   5 +
+ osfmk/arm64/sleh.c          |  86 +++++++++++
+ osfmk/arm64/x86_64_compat.c |  29 +++-
+ osfmk/kern/syscall_sw.c     |   4 +-
+ 16 files changed, 692 insertions(+), 160 deletions(-)
+
+diff --git a/bsd/dev/arm/stubs.c b/bsd/dev/arm/stubs.c
+index 826377782..20114ef2a 100644
+--- a/bsd/dev/arm/stubs.c
++++ b/bsd/dev/arm/stubs.c
+@@ -22,6 +22,8 @@
+ #include <kern/thread.h>
+ #include <vm/vm_map.h>
+ #include <arm/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <IOKit/IOBSD.h>
+ 
+ 
+ /*
+@@ -106,3 +108,35 @@ objc_bp_assist_cfg_np(
+ 
+ 	return ret;
+ }
++
++extern bool configure_uexc_handler(user_addr_t start, user_size_t size,
++    user_addr_t handler, user_addr_t refcon);
++
++int
++register_uexc_handler(proc_t p, struct register_uexc_handler_args *uap,
++    __unused int32_t *retval)
++{
++	int uexc_enable = 0;
++	task_t task;
++
++	PE_parse_boot_argn("-enable_uexc", &uexc_enable, sizeof(uexc_enable));
++	if (!uexc_enable) {
++		return EPERM;
++	}
++
++	task = get_threadtask(current_thread());
++	if (task == kernel_task) {
++		return EPERM;
++	}
++	if (get_bsdtask_info(task) == NULL) {
++		return EPERM;
++	}
++	if (!IOTaskHasEntitlement(task, "com.apple.private.uexc")) {
++		return EPERM;
++	}
++	if (!configure_uexc_handler(uap->start, uap->size, uap->handler,
++	    uap->refcon)) {
++		return EINVAL;
++	}
++	return 0;
++}
+diff --git a/bsd/kern/kern_aio.c b/bsd/kern/kern_aio.c
+index 91b250178..709944d4d 100644
+--- a/bsd/kern/kern_aio.c
++++ b/bsd/kern/kern_aio.c
+@@ -124,6 +124,8 @@ __options_decl(aio_entry_flags_t, uint32_t, {
+ 	AIO_DSYNC       = 0x00000008, /* aio_fsync with op = O_DSYNC (not supported yet) */
+ 	AIO_LIO         = 0x00000010, /* lio_listio generated IO */
+ 	AIO_LIO_WAIT    = 0x00000020, /* lio_listio is waiting on the leader */
++	AIO_READV       = 0x00000040, /* a readv */
++	AIO_WRITEV      = 0x00000080, /* a writev */
+ 
+ 	AIO_COMPLETED   = 0x00000100, /* request has completed */
+ 	AIO_CANCELLED   = 0x00000200, /* request has been cancelled */
+@@ -831,6 +833,22 @@ aio_read(proc_t p, struct aio_read_args *uap, int *retval)
+ }
+ 
+ 
++/* aio_readv - asynchronously read a vector of buffers. */
++int
++aio_readv(proc_t p, struct aio_readv_args *uap, int32_t *retval)
++{
++	int error;
++
++	*retval = 0;
++
++	error = aio_queue_async_request(p, uap->aiocbp, AIO_READV);
++	if (error != 0) {
++		*retval = -1;
++	}
++
++	return error;
++}
++
+ /*
+  * aio_return - return the return status associated with the async IO
+  * request referred to by uap->aiocbp.  The return status is the value
+@@ -1302,6 +1320,17 @@ aio_write(proc_t p, struct aio_write_args *uap, int *retval __unused)
+ }
+ 
+ 
++/* aio_writev - asynchronously write a vector of buffers. */
++int
++aio_writev(proc_t p, struct aio_writev_args *uap, int *retval __unused)
++{
++	int error;
++
++	error = aio_queue_async_request(p, uap->aiocbp, AIO_WRITEV);
++
++	return error;
++}
++
+ static int
+ aio_copy_in_list(proc_t procp, user_addr_t aiocblist, user_addr_t *aiocbpp,
+     int nent)
+diff --git a/bsd/kern/kern_descrip.c b/bsd/kern/kern_descrip.c
+index fac307fcb..567bd3b9f 100644
+--- a/bsd/kern/kern_descrip.c
++++ b/bsd/kern/kern_descrip.c
+@@ -114,6 +114,7 @@
+ #include <kern/ipc_kobject.h>
+ #include <kern/ipc_misc.h>
+ #include <kern/ast.h>
++#include <kern/bits.h>
+ 
+ #include <vm/vm_protos.h>
+ #include <mach/mach_port.h>
+@@ -856,7 +857,7 @@ fdt_exec(proc_t p, kauth_cred_t p_cred, short posix_spawn_flags, thread_t thread
+ 		*flagp = 0; /* clear UF_INHERIT */
+ 
+ 		if (!inherit_file) {
+-			fp_close_and_unlock(p, p_cred, i, fp, 0);
++			fp_close_and_unlock_with_action(p, p_cred, i, fp, 0);
+ 			proc_fdlock(p);
+ 		} else if (in_exec) {
+ 			/* Transfer F_POSIX style lock to new proc */
+@@ -1089,7 +1090,7 @@ fdt_invalidate(proc_t p)
+ 					panic("fdfree: found fp with UF_RESERVED");
+ 				}
+ 				/* proc_ucred_unsafe() is ok: process is terminating */
+-				fp_close_and_unlock(p, p_cred, i, fp, 0);
++				fp_close_and_unlock_with_action(p, p_cred, i, fp, 0);
+ 				proc_fdlock(p);
+ 			}
+ 		}
+@@ -1196,6 +1197,83 @@ fd_check_limit_exceeded(struct filedesc *fdp)
+ }
+ #endif /* CONFIG_PROC_RESOURCE_LIMITS */
+ 
++/*
++ * fd_expand_descr_table_locked
++ *
++ * Description:	Expand the file descriptor table so that file descriptor
++ *		`upto` can be addressed.  The caller must hold proc_fdlock();
++ *		this routine returns with proc_fdlock() held.
++ *
++ * Parameters:	p				Process whose table to grow
++ *		upto				Descriptor that must become valid
++ *		lim				Current descriptor limit
++ *
++ * Returns:	0				Success (table grown or already large enough)
++ *		EBADF				`upto` overflows the table size computation
++ *		EMFILE				The hard limit does not permit growth
++ *		ENOMEM				Allocation failure
++ */
++static int
++fd_expand_descr_table_locked(proc_t p, int upto, int lim)
++{
++	struct filedesc *fdp = &p->p_fd;
++	int numfiles, num_files_to_clean;
++	struct fileproc **newofiles = NULL, **files_to_clean = NULL;
++	char *newofileflags = NULL, *filesflags_to_clean = NULL;
++	int result = 0;
++	int upto_overflow_check;
++
++	if (fdp->fd_nfiles > upto) {
++		return 0;
++	}
++
++	result = MAX(upto, NDEXTENT);
++	if (os_add_overflow(result, 1, &upto_overflow_check)) {
++		return EBADF;
++	}
++	numfiles = (int)MIN((uint64_t)lim, bit_ceiling((uint64_t)result + 1));
++	if (result >= numfiles) {
++		return EMFILE;
++	}
++
++	proc_fdunlock(p);
++	newofiles = kalloc_type(struct fileproc *, numfiles, Z_WAITOK | Z_ZERO);
++	newofileflags = kalloc_data(numfiles, Z_WAITOK | Z_ZERO);
++	proc_fdlock(p);
++
++	if (newofiles == NULL || newofileflags == NULL) {
++		result = ENOMEM;
++		files_to_clean = newofiles;
++		filesflags_to_clean = newofileflags;
++		num_files_to_clean = numfiles;
++		goto out;
++	}
++	if (fdp->fd_nfiles >= numfiles) {
++		result = 0;
++		files_to_clean = newofiles;
++		filesflags_to_clean = newofileflags;
++		num_files_to_clean = numfiles;
++		goto out;
++	}
++
++	num_files_to_clean = fdp->fd_nfiles;
++	memcpy(newofiles, fdp->fd_ofiles,
++	    num_files_to_clean * sizeof(*fdp->fd_ofiles));
++	memcpy(newofileflags, fdp->fd_ofileflags, num_files_to_clean);
++	files_to_clean = fdp->fd_ofiles;
++	filesflags_to_clean = fdp->fd_ofileflags;
++	fdp->fd_ofiles = newofiles;
++	fdp->fd_ofileflags = newofileflags;
++	fdp->fd_nfiles = numfiles;
++
++out:
++	proc_fdunlock(p);
++	kfree_type(struct fileproc *, num_files_to_clean, files_to_clean);
++	kfree_data(filesflags_to_clean, num_files_to_clean);
++	proc_fdlock(p);
++	return result;
++}
++
+ /*
+  * fdalloc
+  *
+@@ -1217,10 +1295,9 @@ fdalloc(proc_t p, int want, int *result)
+ {
+ 	struct filedesc *fdp = &p->p_fd;
+ 	int i;
+-	int last, numfiles, oldnfiles;
+-	struct fileproc **newofiles;
+-	char *newofileflags;
++	int last;
+ 	int lim = proc_limitgetcur_nofile(p);
++	int expand_err;
+ 
+ 	/*
+ 	 * Search for a free descriptor starting at the higher
+@@ -1233,9 +1310,7 @@ fdalloc(proc_t p, int want, int *result)
+ 
+ 	for (;;) {
+ 		last = (int)MIN((unsigned int)fdp->fd_nfiles, (unsigned int)lim);
+-		if ((i = want) < fdp->fd_freefile) {
+-			i = fdp->fd_freefile;
+-		}
++		i = MAX(want, fdp->fd_freefile);
+ 		for (; i < last; i++) {
+ 			if (fdp->fd_ofiles[i] == NULL && !(fdp->fd_ofileflags[i] & UF_RESERVED)) {
+ 				procfdtbl_reservefd(p, i);
+@@ -1257,48 +1332,9 @@ fdalloc(proc_t p, int want, int *result)
+ 		/*
+ 		 * No space in current array.  Expand?
+ 		 */
+-		if ((rlim_t)fdp->fd_nfiles >= lim) {
+-			return EMFILE;
+-		}
+-		if (fdp->fd_nfiles < NDEXTENT) {
+-			numfiles = NDEXTENT;
+-		} else {
+-			numfiles = 2 * fdp->fd_nfiles;
++		if ((expand_err = fd_expand_descr_table_locked(p, want, lim)) != 0) {
++			return expand_err;
+ 		}
+-		/* Enforce lim */
+-		if ((rlim_t)numfiles > lim) {
+-			numfiles = (int)lim;
+-		}
+-		proc_fdunlock(p);
+-		newofiles = kalloc_type(struct fileproc *, numfiles, Z_WAITOK | Z_ZERO);
+-		newofileflags = kalloc_data(numfiles, Z_WAITOK | Z_ZERO);
+-		proc_fdlock(p);
+-		if (newofileflags == NULL || newofiles == NULL) {
+-			kfree_type(struct fileproc *, numfiles, newofiles);
+-			kfree_data(newofileflags, numfiles);
+-			return ENOMEM;
+-		}
+-		if (fdp->fd_nfiles >= numfiles) {
+-			kfree_type(struct fileproc *, numfiles, newofiles);
+-			kfree_data(newofileflags, numfiles);
+-			continue;
+-		}
+-
+-		/*
+-		 * Copy the existing ofile and ofileflags arrays
+-		 * and zero the new portion of each array.
+-		 */
+-		oldnfiles = fdp->fd_nfiles;
+-		memcpy(newofiles, fdp->fd_ofiles,
+-		    oldnfiles * sizeof(*fdp->fd_ofiles));
+-		memcpy(newofileflags, fdp->fd_ofileflags, oldnfiles);
+-
+-		kfree_type(struct fileproc *, oldnfiles, fdp->fd_ofiles);
+-		kfree_data(fdp->fd_ofileflags, oldnfiles);
+-		fdp->fd_ofiles = newofiles;
+-		fdp->fd_ofileflags = newofileflags;
+-		fdp->fd_nfiles = numfiles;
+-		fdexpand++;
+ 	}
+ }
+ 
+@@ -1724,7 +1760,7 @@ fileproc_drain(proc_t p, struct fileproc * fp)
+ 
+ 
+ int
+-fp_close_and_unlock(proc_t p, kauth_cred_t cred, int fd, struct fileproc *fp, int flags)
++fp_close_and_unlock_with_action(proc_t p, kauth_cred_t cred, int fd, struct fileproc *fp, int action)
+ {
+ 	struct filedesc *fdp = &p->p_fd;
+ 	struct fileglob *fg = fp->fp_glob;
+@@ -1811,7 +1847,7 @@ fp_close_and_unlock(proc_t p, kauth_cred_t cred, int fd, struct fileproc *fp, in
+ 
+ 	fileproc_drain(p, fp);
+ 
+-	if (flags & FD_DUP2RESV) {
++	if (action & FD_DUP2RESV) {
+ 		fdp->fd_ofiles[fd] = NULL;
+ 		fdp->fd_ofileflags[fd] &= ~UF_CLOSING;
+ 	} else {
+@@ -2525,12 +2561,94 @@ sys_dup2(proc_t p, struct dup2_args *uap, int32_t *retval)
+ 	return dup2(p, p_cred, uap->from, uap->to, retval);
+ }
+ 
++/*
++ * sys_dup3
++ *
++ * Description:	Duplicate a file descriptor to a particular value, with
++ *		O_CLOEXEC/O_CLOFORK semantics.
++ */
+ int
++sys_dup3(proc_t p, struct dup3_args *uap, int32_t *retval)
++{
++	fileproc_flags_t fp_flags = 0;
++
++	if (uap->from == uap->to) {
++		return EINVAL;
++	}
++	if (uap->flags & ~(O_CLOEXEC | O_CLOFORK)) {
++		return EINVAL;
++	}
++	if (uap->flags & O_CLOEXEC) {
++		fp_flags |= FP_CLOEXEC;
++	}
++	if (uap->flags & O_CLOFORK) {
++		fp_flags |= FP_CLOFORK;
++	}
++	return dup_internal(p, current_cached_proc_cred(p), uap->from, uap->to,
++	           fp_flags, retval);
++}
++
++static inline int
+ dup2(proc_t p, kauth_cred_t p_cred, int old, int new, int *retval)
++{
++	return dup_internal(p, p_cred, old, new, 0, retval);
++}
++
++/*
++ * close_fp_for_dup
++ *
++ * Description:	Close the file proc currently occupying `newfd` in
++ *		preparation for a dup.  The caller holds proc_fdlock();
++ *		this routine drops it and returns with it reacquired.
++ *
++ * Returns:	0			Success
++ *		EPERM			The target is guarded against close
++ */
++static int
++close_fp_for_dup(proc_t p, int newfd, struct fileproc *nfp,
++    kauth_cred_t p_cred)
++{
++	if (fp_isguarded(nfp, GUARD_CLOSE)) {
++		return fp_guard_exception(p, newfd, nfp, kGUARD_EXC_CLOSE);
++	}
++	(void)fp_close_and_unlock_with_action(p, p_cred, newfd, nfp,
++	    FD_DUP2RESV);
++	proc_fdlock(p);
++	return 0;
++}
++
++/*
++ * dup_internal
++ *
++ * Description:	Common code for dup, dup2, dup3 and fcntl(F_DUPFD).
++ *
++ * Parameters:	p				Process performing the dup
++ *		p_cred				Credentials to use
++ *		old				The fd to dup
++ *		new				The fd to dup it to
++ *		fp_flags			Flags to augment the new fp
++ *		retval				Pointer to the call return area
++ *
++ * Returns:	0				Success
++ *		EBADF
++ *		EMFILE
++ *		ENOMEM
++ *
++ * Implicit returns:
++ *		*retval (modified)		The new descriptor
++ */
++int
++dup_internal(proc_t p, kauth_cred_t p_cred, int old, int new,
++    fileproc_flags_t fp_flags, int *retval)
+ {
+ 	struct filedesc *fdp = &p->p_fd;
+-	struct fileproc *fp, *nfp;
+-	int i, error;
++	struct fileproc *fp = NULL, *nfp = NULL;
++	int error;
++	int lim = proc_limitgetcur_nofile(p);
++
++	if (new < 0 || new >= lim) {
++		return EBADF;
++	}
+ 
+ 	proc_fdlock(p);
+ 
+@@ -2539,73 +2657,52 @@ startover:
+ 		proc_fdunlock(p);
+ 		return error;
+ 	}
+-	if (fp_isguarded(fp, GUARD_DUP)) {
+-		error = fp_guard_exception(p, old, fp, kGUARD_EXC_DUP);
+-		(void) fp_drop(p, old, fp, 1);
+-		proc_fdunlock(p);
+-		return error;
+-	}
+-	if (new < 0 || new >= proc_limitgetcur_nofile(p)) {
+-		fp_drop(p, old, fp, 1);
+-		proc_fdunlock(p);
+-		return EBADF;
+-	}
+ 	if (old == new) {
+ 		fp_drop(p, old, fp, 1);
+ 		*retval = new;
+ 		proc_fdunlock(p);
+ 		return 0;
+ 	}
+-	if (new < 0 || new >= fdp->fd_nfiles) {
+-		if ((error = fdalloc(p, new, &i))) {
++	if (new >= fdp->fd_nfiles) {
++		if ((error = fd_expand_descr_table_locked(p, new, lim)) != 0) {
+ 			fp_drop(p, old, fp, 1);
+ 			proc_fdunlock(p);
+ 			return error;
+ 		}
+-		if (new != i) {
+-			fdrelse(p, i);
+-			goto closeit;
+-		}
+-	} else {
+-closeit:
+-		if ((fdp->fd_ofileflags[new] & UF_RESERVED) == UF_RESERVED) {
+-			fp_drop(p, old, fp, 1);
+-			procfdtbl_waitfd(p, new);
++	}
++	if ((fdp->fd_ofileflags[new] & UF_RESERVED) == UF_RESERVED) {
++		fp_drop(p, old, fp, 1);
++		procfdtbl_waitfd(p, new);
+ #if DIAGNOSTIC
+-			proc_fdlock_assert(p, LCK_MTX_ASSERT_OWNED);
++		proc_fdlock_assert(p, LCK_MTX_ASSERT_OWNED);
+ #endif
+-			goto startover;
+-		}
++		goto startover;
++	}
+ 
+-		if ((nfp = fdp->fd_ofiles[new]) != NULL) {
+-			if (fp_isguarded(nfp, GUARD_CLOSE)) {
+-				fp_drop(p, old, fp, 1);
+-				error = fp_guard_exception(p,
+-				    new, nfp, kGUARD_EXC_CLOSE);
+-				proc_fdunlock(p);
+-				return error;
+-			}
+-			(void)fp_close_and_unlock(p, p_cred, new, nfp, FD_DUP2RESV);
+-			proc_fdlock(p);
+-			assert(fdp->fd_ofileflags[new] & UF_RESERVED);
+-		} else {
+-#if DIAGNOSTIC
+-			if (fdp->fd_ofiles[new] != NULL) {
+-				panic("dup2: no ref on fileproc %d", new);
+-			}
+-#endif
+-			procfdtbl_reservefd(p, new);
++	if (fp_isguarded(fp, GUARD_DUP)) {
++		error = fp_guard_exception(p, old, fp, kGUARD_EXC_DUP);
++		fp_drop(p, old, fp, 1);
++		proc_fdunlock(p);
++		return error;
++	}
++
++	if ((nfp = fdp->fd_ofiles[new]) != NULL) {
++		if ((error = close_fp_for_dup(p, new, nfp, p_cred)) != 0) {
++			fp_drop(p, old, fp, 1);
++			proc_fdunlock(p);
++			return error;
+ 		}
++	} else {
++		procfdtbl_reservefd(p, new);
+ 	}
++	assert(fdp->fd_ofileflags[new] & UF_RESERVED);
+ #if DIAGNOSTIC
+ 	if (fdp->fd_ofiles[new] != 0) {
+-		panic("dup2: overwriting fd_ofiles with new %d", new);
+-	}
+-	if ((fdp->fd_ofileflags[new] & UF_RESERVED) == 0) {
+-		panic("dup2: unreserved fileflags with new %d", new);
++		panic("dup_internal: overwriting fd_ofiles with new %d", new);
+ 	}
+ #endif
+-	error = finishdup(p, p_cred, old, new, 0, retval);
++
++	error = finishdup(p, p_cred, old, new, fp_flags, retval);
+ 	fp_drop(p, old, fp, 1);
+ 	proc_fdunlock(p);
+ 
+@@ -5622,7 +5719,7 @@ close_nocancel(proc_t p, kauth_cred_t p_cred, int fd)
+ 		return error;
+ 	}
+ 
+-	return fp_close_and_unlock(p, p_cred, fd, fp, 0);
++	return fp_close_and_unlock_with_action(p, p_cred, fd, fp, 0);
+ }
+ 
+ 
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 2467b2404..07ae53ef5 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -3614,7 +3614,7 @@ exec_handle_file_actions(struct image_params *imgp, short psa_flags)
+ 			 * it to the right one.
+ 			 */
+ 			AUDIT_SUBCALL_ENTER(DUP2, p, uthread);
+-			error = dup2(p, p_cred, origfd, psfa->psfaa_filedes, ival);
++			error = dup_internal(p, p_cred, origfd, psfa->psfaa_filedes, 0, ival);
+ 			AUDIT_SUBCALL_EXIT(uthread, error);
+ 			if (error) {
+ 				break;
+@@ -3631,8 +3631,8 @@ exec_handle_file_actions(struct image_params *imgp, short psa_flags)
+ 
+ 		case PSFA_DUP2: {
+ 			AUDIT_SUBCALL_ENTER(DUP2, p, uthread);
+-			error = dup2(p, p_cred, psfa->psfaa_filedes,
+-			    psfa->psfaa_dup2args.psfad_newfiledes, ival);
++			error = dup_internal(p, p_cred, psfa->psfaa_filedes,
++			    psfa->psfaa_dup2args.psfad_newfiledes, 0, ival);
+ 			AUDIT_SUBCALL_EXIT(uthread, error);
+ 		}
+ 		break;
+@@ -3666,8 +3666,8 @@ exec_handle_file_actions(struct image_params *imgp, short psa_flags)
+ 			}
+ 
+ 			AUDIT_SUBCALL_ENTER(DUP2, p, uthread);
+-			error = dup2(p, p_cred, origfd,
+-			    psfa->psfaa_dup2args.psfad_newfiledes, ival);
++			error = dup_internal(p, p_cred, origfd,
++			    psfa->psfaa_dup2args.psfad_newfiledes, 0, ival);
+ 			AUDIT_SUBCALL_EXIT(uthread, error);
+ 			if (error) {
+ 				break;
+diff --git a/bsd/kern/kern_guarded.c b/bsd/kern/kern_guarded.c
+index 231dff9ba..65e4b6269 100644
+--- a/bsd/kern/kern_guarded.c
++++ b/bsd/kern/kern_guarded.c
+@@ -443,7 +443,7 @@ guarded_close_np(proc_t p, struct guarded_close_np_args *uap,
+ 	fp_drop(p, fd, fp, 1);
+ 
+ 	p_cred = current_cached_proc_cred(p);
+-	return fp_close_and_unlock(p, p_cred, fd, fp, 0);
++	return fp_close_and_unlock_with_action(p, p_cred, fd, fp, 0);
+ }
+ 
+ /*
+@@ -748,6 +748,23 @@ guarded_writev_np(struct proc *p, struct guarded_writev_np_args *uap, user_ssize
+ 	return writev_uio(p, uap->fd, uap->iovp, uap->iovcnt, 0, 0, &uguard, retval);
+ }
+ 
++/*
++ * int guarded_ftruncate_np(int fd, const guardid_t *guard, off_t length);
++ */
++int
++guarded_ftruncate_np(struct proc *p, struct guarded_ftruncate_np_args *uap,
++    int32_t *retval)
++{
++	int error;
++	guardid_t uguard;
++
++	if ((error = copyin(uap->guard, &uguard, sizeof(uguard))) != 0) {
++		return error;
++	}
++
++	return ftruncate_internal(p, uap->fd, uap->length, &uguard, retval);
++}
++
+ /*
+  * int falloc_guarded(struct proc *p, struct fileproc **fp, int *fd,
+  *     vfs_context_t ctx, const guardid_t *guard, u_int attrs);
+diff --git a/bsd/kern/posix_sem.c b/bsd/kern/posix_sem.c
+index d7188c9ce..71fa3493c 100644
+--- a/bsd/kern/posix_sem.c
++++ b/bsd/kern/posix_sem.c
+@@ -967,7 +967,7 @@ sem_close(proc_t p, struct sem_close_args *uap, __unused int32_t *retval)
+ 	}
+ 
+ 	p_cred = current_cached_proc_cred(p);
+-	return fp_close_and_unlock(p, p_cred, fd, fp, 0);
++	return fp_close_and_unlock_with_action(p, p_cred, fd, fp, 0);
+ }
+ 
+ int
+diff --git a/bsd/kern/sys_pipe.c b/bsd/kern/sys_pipe.c
+index bd682ab6b..571cb2a98 100644
+--- a/bsd/kern/sys_pipe.c
++++ b/bsd/kern/sys_pipe.c
+@@ -452,6 +452,94 @@ freepipes:
+ 	return error;
+ }
+ 
++/*
++ * The pipe2 system call: pipe() with flags.
++ *
++ * Currently supported flags are O_CLOEXEC, O_CLOFORK and O_NONBLOCK.
++ */
++/* ARGSUSED */
++int
++pipe2(proc_t p, struct pipe2_args *uap, int32_t *retval)
++{
++	struct fileproc *rf = NULL, *wf = NULL;
++	struct pipe *rpipe, *wpipe;
++	int error;
++	fileproc_flags_t oflags = 0;
++
++	if (uap->flags & ~(O_CLOEXEC | O_CLOFORK | O_NONBLOCK)) {
++		return EINVAL;
++	}
++
++	error = pipepair_alloc(&rpipe, &wpipe);
++	if (error) {
++		return error;
++	}
++
++	/*
++	 * for now we'll create half-duplex pipes(refer returns section above).
++	 * this is what we've always supported..
++	 */
++
++	error = falloc(p, &rf, &retval[0]);
++	if (error) {
++		goto freepipes;
++	}
++	rf->f_flag = FREAD;
++	rf->f_ops = &pipeops;
++	fp_set_data(rf, rpipe);
++
++	error = falloc(p, &wf, &retval[1]);
++	if (error) {
++		fp_free(p, retval[0], rf);
++		goto freepipes;
++	}
++	wf->f_flag = FWRITE;
++	wf->f_ops = &pipeops;
++	fp_set_data(wf, wpipe);
++
++	if (uap->flags & O_CLOEXEC) {
++		oflags |= FP_CLOEXEC;
++	}
++	if (uap->flags & O_CLOFORK) {
++		oflags |= FP_CLOFORK;
++	}
++	rf->fp_flags |= oflags;
++	wf->fp_flags |= oflags;
++
++	if (uap->flags & O_NONBLOCK) {
++		rf->f_flag |= FNONBLOCK;
++		wf->f_flag |= FNONBLOCK;
++	}
++
++	rpipe->pipe_peer = wpipe;
++	wpipe->pipe_peer = rpipe;
++
++#if CONFIG_MACF
++	/*
++	 * XXXXXXXX SHOULD NOT HOLD FILE_LOCK() XXXXXXXXXXXX
++	 *
++	 * struct pipe represents a pipe endpoint.  The MAC label is shared
++	 * between the connected endpoints.  As a result mac_pipe_label_init() and
++	 * mac_pipe_label_associate() should only be called on one of the endpoints
++	 * after they have been connected.
++	 */
++	mac_pipe_label_init(rpipe);
++	mac_pipe_label_associate(kauth_cred_get(), rpipe);
++#endif
++	proc_fdlock_spin(p);
++	procfdtbl_releasefd(p, retval[0], NULL);
++	procfdtbl_releasefd(p, retval[1], NULL);
++	fp_drop(p, retval[0], rf, 1);
++	fp_drop(p, retval[1], wf, 1);
++	proc_fdunlock(p);
++	return 0;
++
++freepipes:
++	pipeclose(rpipe);
++	pipeclose(wpipe);
++	return error;
++}
++
+ int
+ pipe_stat(struct pipe *cpipe, void *ub, int isstat64)
+ {
+diff --git a/bsd/kern/syscalls.master b/bsd/kern/syscalls.master
+index c08a74c6d..3ebff173a 100644
+--- a/bsd/kern/syscalls.master
++++ b/bsd/kern/syscalls.master
+@@ -229,8 +229,8 @@
+ 145	AUE_NULL	ALL	{ int nosys(void); }   { old setrlimit }
+ 146	AUE_NULL	ALL	{ int nosys(void); }   { old killpg }
+ 147	AUE_SETSID	ALL	{ int setsid(void); }
+-148	AUE_NULL	ALL	{ int nosys(void); }   { old setquota }
+-149	AUE_NULL	ALL	{ int nosys(void); }   { old qquota }
++148	AUE_NULL	ALL	{ int pipe2(user_addr_t fildes, int flags); }
++149	AUE_NULL	ALL	{ int sys_dup3(u_int from, u_int to, int flags); }
+ 150	AUE_NULL	ALL	{ int nosys(void); }   { old getsockname }
+ 151	AUE_GETPGID	ALL	{ int getpgid(pid_t pid); }
+ 152	AUE_SETPRIVEXEC	ALL	{ int setprivexec(int flag); }
+@@ -309,8 +309,8 @@
+ 212	AUE_NULL	ALL	{ int nosys(void); } { old ATgetrsp }
+ 213	AUE_NULL	ALL	{ int nosys(void); } 	{ Reserved for AppleTalk }
+ 
+-214	AUE_NULL	ALL	{ int nosys(void); }
+-215	AUE_NULL	ALL	{ int nosys(void); }
++214	AUE_NULL	ALL	{ int fchflagsat(int fd, user_addr_t path, int flags, int flag); }
++215	AUE_NULL	ALL	{ int getumask(void); }
+ 
+ ; System Calls 216 - 230 are reserved for calls to support HFS/HFS Plus
+ ; file system semantics. Currently, we only use 215-227.  The rest is
+@@ -351,8 +351,8 @@
+ 243	AUE_INITGROUPS	ALL	{ int initgroups(u_int gidsetsize, gid_t *gidset, int gmuid) NO_SYSCALL_STUB; }
+ 244	AUE_POSIX_SPAWN	ALL	{ int posix_spawn(pid_t *pid, const char *path, const struct _posix_spawn_args_desc *adesc, char **argv, char **envp) NO_SYSCALL_STUB; }
+ 245	AUE_FFSCTL	ALL	{ int ffsctl(int fd, u_long cmd, caddr_t data, u_int options); }
+-246	AUE_NULL	ALL	{ int nosys(void); }
+-247	AUE_NULL	ALL	{ int nosys(void); } { old nfsclnt }
++246	AUE_NULL	ALL	{ int aio_readv(user_addr_t aiocbp); }
++247	AUE_NULL	ALL	{ int aio_writev(user_addr_t aiocbp); }
+ 
+ #if NFSSERVER	/* XXX */
+ 248	AUE_FHOPEN	ALL	{ int fhopen(const struct fhandle *u_fhp, int flags); } 
+@@ -360,7 +360,7 @@
+ 248	AUE_NULL	ALL	{ int nosys(void); } 
+ #endif
+ 
+-249	AUE_NULL	ALL	{ int nosys(void); }
++249	AUE_NULL	ALL	{ int fsctlat(int fd, user_addr_t path, user_ulong_t cmd, user_addr_t data, u_int options); }
+ 250	AUE_MINHERIT	ALL	{ int minherit(caddr_ut addr, size_ut len, int inherit); }
+ #if SYSV_SEM
+ 251	AUE_SEMSYS	ALL	{ int semsys(u_int which, int a2, int a3, int a4, int a5) NO_SYSCALL_STUB; }
+@@ -530,7 +530,7 @@
+ 349	AUE_NULL	ALL	{ int __pthread_fchdir(int fd); }
+ 350	AUE_AUDIT	ALL	{ int audit(void *record, int length); }
+ 351	AUE_AUDITON	ALL	{ int auditon(int cmd, void *data, int length); }
+-352	AUE_NULL	ALL	{ int nosys(void); }
++352	AUE_NULL	ALL	{ int guarded_ftruncate_np(int fd, user_addr_t guard, off_t length); }
+ 353	AUE_GETAUID	ALL	{ int getauid(au_id_t *auid); }
+ 354	AUE_SETAUID	ALL	{ int setauid(au_id_t *auid); }
+ 355	AUE_NULL	ALL	{ int nosys(void); }	{ old getaudit }
+@@ -819,7 +819,7 @@
+ 516	AUE_NULL	ALL	{ int sys_ulock_wake(uint32_t operation, void *addr, uint64_t wake_value) NO_SYSCALL_STUB; }
+ 517	AUE_FCLONEFILEAT	ALL     { int fclonefileat(int src_fd, int dst_dirfd, user_addr_t dst, uint32_t flags); }
+ 518	AUE_NULL	ALL     { int fs_snapshot(uint32_t op, int dirfd, user_addr_t name1, user_addr_t name2, user_addr_t data, uint32_t flags) NO_SYSCALL_STUB; }
+-519	AUE_NULL	ALL	{ int enosys(void); }
++519	AUE_NULL	ALL	{ int register_uexc_handler(user_addr_t start, user_size_t size, user_addr_t handler, user_addr_t refcon); }
+ 520	AUE_KILL	ALL	{ int terminate_with_payload(int pid, uint32_t reason_namespace, uint64_t reason_code, void *payload, uint32_t payload_size, const char *reason_string, uint64_t reason_flags) NO_SYSCALL_STUB; }
+ 521	AUE_EXIT	ALL	{ void abort_with_payload(uint32_t reason_namespace, uint64_t reason_code, void *payload, uint32_t payload_size, const char *reason_string, uint64_t reason_flags) NO_SYSCALL_STUB; }
+ #if NECP
+diff --git a/bsd/sys/file_internal.h b/bsd/sys/file_internal.h
+index 19181273a..86f874f11 100644
+--- a/bsd/sys/file_internal.h
++++ b/bsd/sys/file_internal.h
+@@ -486,7 +486,7 @@ extern struct fileproc *
+ fp_get_noref_locked_with_iocount(proc_t p, int fd);
+ 
+ /*!
+- * @function fp_close_and_unlock
++ * @function fp_close_and_unlock_with_action
+  *
+  * @brief
+  * Close the given file descriptor entry.
+@@ -502,7 +502,7 @@ fp_get_noref_locked_with_iocount(proc_t p, int fd);
+  * @param p_cred        The proc's cred for this operation.
+  * @param fd            The file descriptor index being closed.
+  * @param fp            The fileproc entry associated with @c fd.
+- * @param flags         FD_DUP2RESV or 0.
++ * @param action        FD_DUP2RESV or 0.
+  *
+  * @returns
+  * 0            Success
+@@ -510,7 +510,8 @@ fp_get_noref_locked_with_iocount(proc_t p, int fd);
+  * ???          Any error that @c fileops::fo_close can return.
+  */
+ extern int
+-fp_close_and_unlock(proc_t p, kauth_cred_t p_cred, int fd, struct fileproc *fp, int flags);
++fp_close_and_unlock_with_action(proc_t p, kauth_cred_t p_cred, int fd,
++    struct fileproc *fp, int action);
+ 
+ /* wrappers for fp->f_ops->fo_... */
+ int fo_read(struct fileproc *fp, struct uio *uio, int flags, vfs_context_t ctx);
+@@ -562,7 +563,8 @@ fileproc_vflags_t fileproc_get_vflags(struct fileproc *fp);
+ #pragma mark internal version of syscalls
+ 
+ int fileport_makefd(proc_t p, ipc_port_t port, fileproc_flags_t fp_flags, int *fd);
+-int dup2(proc_t p, kauth_cred_t p_cred, int from, int to, int *fd);
++int dup_internal(proc_t p, kauth_cred_t p_cred, int from, int to,
++    fileproc_flags_t fp_flags, int *fd);
+ int close_nocancel(proc_t p, kauth_cred_t p_cred, int fd);
+ int fchdir(proc_t p, vfs_context_t ctx, int fd, bool per_thread);
+ 
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+index 942dc249f..1cd41a904 100644
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -7973,6 +7973,66 @@ chflags(__unused proc_t p, struct chflags_args *uap, __unused int32_t *retval)
+ 	return error;
+ }
+ 
++/*
++ * Change flags of a file given a path relative to a directory fd.
++ */
++static int
++fchflagsat_internal(vfs_context_t ctx, user_addr_t path, int flags,
++    int fd, int flag)
++{
++	vnode_t vp;
++	int error;
++	int follow;
++	struct nameidata nd;
++	uint32_t wantparent = 0;
++
++#if CONFIG_FILE_LEASES
++	wantparent = WANTPARENT;
++#endif
++
++	follow = (flag & (AT_SYMLINK_NOFOLLOW | AT_SYMLINK_NOFOLLOW_ANY)) ?
++	    NOFOLLOW : FOLLOW;
++	NDINIT(&nd, LOOKUP, OP_SETATTR, follow | AUDITVNPATH1 | wantparent,
++	    UIO_USERSPACE, path, ctx);
++	if (flag & AT_SYMLINK_NOFOLLOW_ANY) {
++		nd.ni_flag |= NAMEI_NOFOLLOW_ANY;
++	}
++	if (flag & AT_RESOLVE_BENEATH) {
++		nd.ni_flag |= NAMEI_RESOLVE_BENEATH;
++	}
++	if ((error = nameiat(&nd, fd))) {
++		return error;
++	}
++	vp = nd.ni_vp;
++
++#if CONFIG_FILE_LEASES
++	vnode_breakdirlease(nd.ni_dvp, false, O_WRONLY);
++	vnode_put(nd.ni_dvp);
++#endif
++
++	nameidone(&nd);
++
++	/* we don't vnode_put() here because chflags1 does internally */
++	error = chflags1(vp, flags, ctx);
++	return error;
++}
++
++/* ARGSUSED */
++int
++fchflagsat(__unused proc_t p, struct fchflagsat_args *uap,
++    __unused int32_t *retval)
++{
++	int flag = uap->flag;
++
++	if (flag & ~(AT_SYMLINK_NOFOLLOW | AT_SYMLINK_NOFOLLOW_ANY |
++	    AT_RESOLVE_BENEATH)) {
++		return EINVAL;
++	}
++
++	return fchflagsat_internal(vfs_context_current(), uap->path,
++	           uap->flags, uap->fd, flag);
++}
++
+ /*
+  * Change flags of a file given a file descriptor.
+  */
+@@ -8834,30 +8894,37 @@ truncate(proc_t p, struct truncate_args *uap, __unused int32_t *retval)
+ }
+ 
+ /*
+- * Truncate a file given a file descriptor.
++ * Common truncate-by-fd implementation for ftruncate and guarded_ftruncate_np.
++ *
++ * If puguard is non NULL, the descriptor must have been opened with the
++ * matching guard.
+  */
+-/* ARGSUSED */
+ int
+-ftruncate(proc_t p, struct ftruncate_args *uap, int32_t *retval)
++ftruncate_internal(proc_t p, int fd, off_t length, guardid_t *puguard,
++    int32_t *retval)
+ {
+ 	vnode_t vp = NULLVP;
+ 	struct fileproc *fp;
+ 	bool need_vnode_put = false;
+ 	int error;
+ 
+-	AUDIT_ARG(fd, uap->fd);
++	AUDIT_ARG(fd, fd);
+ 
+-	if ((error = truncate_validate_common(p, uap->length))) {
++	if ((error = truncate_validate_common(p, length))) {
+ 		return error;
+ 	}
+ 
+-	if ((error = fp_lookup(p, uap->fd, &fp, 0))) {
++	if (puguard != NULL) {
++		if ((error = fp_lookup_guarded(p, fd, *puguard, &fp, 0))) {
++			return error;
++		}
++	} else if ((error = fp_lookup(p, fd, &fp, 0))) {
+ 		return error;
+ 	}
+ 
+ 	switch (FILEGLOB_DTYPE(fp->fp_glob)) {
+ 	case DTYPE_PSXSHM:
+-		error = pshm_truncate(p, fp, uap->fd, uap->length, retval);
++		error = pshm_truncate(p, fp, fd, length, retval);
+ 		goto out;
+ 	case DTYPE_VNODE:
+ 		break;
+@@ -8893,7 +8960,7 @@ ftruncate(proc_t p, struct ftruncate_args *uap, int32_t *retval)
+ 
+ 	AUDIT_ARG(vnpath, vp, ARG_VNODE1);
+ 
+-	error = truncate_internal(vp, uap->length, fp->fp_glob->fg_cred,
++	error = truncate_internal(vp, length, fp->fp_glob->fg_cred,
+ 	    vfs_context_current(), false);
+ 	if (!error) {
+ 		fp->fp_glob->fg_flag |= FWASWRITTEN;
+@@ -8904,10 +8971,20 @@ out:
+ 		vnode_put(vp);
+ 	}
+ 
+-	file_drop(uap->fd);
++	file_drop(fd);
+ 	return error;
+ }
+ 
++/*
++ * Truncate a file given a file descriptor.
++ */
++/* ARGSUSED */
++int
++ftruncate(proc_t p, struct ftruncate_args *uap, int32_t *retval)
++{
++	return ftruncate_internal(p, uap->fd, uap->length, NULL, retval);
++}
++
+ 
+ /*
+  * Sync an open file with synchronized I/O _file_ integrity completion
+@@ -11248,6 +11325,16 @@ umask(proc_t p, struct umask_args *uap, int32_t *retval)
+ 	return umask1(p, uap->newmask, UMASK_NOXSECURITY, retval);
+ }
+ 
++/* ARGSUSED */
++int
++getumask(proc_t p, __unused struct getumask_args *uap, int32_t *retval)
++{
++	proc_fdlock(p);
++	*retval = p->p_fd.fd_cmask;
++	proc_fdunlock(p);
++	return 0;
++}
++
+ #define REVOKE_MOUNTED_DEVICE_ENTITLEMENT                               \
+ 	"com.apple.private.vfs.revoke-mounted-device"
+ 
+@@ -13696,58 +13783,90 @@ outdrop:
+ 	return error;
+ }
+ 
+-/* ARGSUSED */
+-int
+-fsctl(proc_t p, struct fsctl_args *uap, __unused int32_t *retval)
++/*
++ * Common path-based fsctl implementation.  If fd is not AT_FDCWD, the path
++ * is resolved relative to the given directory file descriptor.
++ */
++static int
++fsctlat_internal(proc_t p, int fd, user_addr_t path, u_long cmd,
++    user_addr_t data, u_int options)
+ {
+ 	int error;
+ 	struct nameidata nd;
+ 	uint32_t nameiflags;
+-	vnode_t vp = NULL;
++	vnode_t vp = NULLVP;
+ 	vfs_context_t ctx = vfs_context_current();
+ 
+-	AUDIT_ARG(cmd, (int)uap->cmd);
+-	AUDIT_ARG(value32, uap->options);
++	AUDIT_ARG(fd, fd);
++	AUDIT_ARG(cmd, (int)cmd);
++	AUDIT_ARG(value32, options);
++
+ 	/* Get the vnode for the file we are getting info on:  */
+ 	nameiflags = 0;
+-	//
+-	// if we come through fsctl() then the file is by definition not open.
+-	// therefore for the FSIOC_FD_ONLY_OPEN_ONCE selector we return an error
+-	// lest the caller mistakenly thinks the only open is their own (but in
+-	// reality it's someone elses).
+-	//
+-	if (uap->cmd == FSIOC_FD_ONLY_OPEN_ONCE) {
++	/*
++	 * If we come through fsctl() then the file is by definition not open.
++	 * Therefore for the FSIOC_FD_ONLY_OPEN_ONCE selector we return an
++	 * error lest the caller mistakenly thinks the only open is their own
++	 * (but in reality it's someone elses).
++	 */
++	if (cmd == FSIOC_FD_ONLY_OPEN_ONCE) {
+ 		return EINVAL;
+ 	}
+-	if ((uap->options & (FSOPT_NOFOLLOW | FSOPT_NOFOLLOW_ANY)) == 0) {
++	if ((options & (FSOPT_NOFOLLOW | FSOPT_NOFOLLOW_ANY)) == 0) {
+ 		nameiflags |= FOLLOW;
+ 	}
+-	if (uap->cmd == FSIOC_FIRMLINK_CTL) {
++	if (cmd == FSIOC_FIRMLINK_CTL) {
+ 		nameiflags |= (CN_FIRMLINK_NOFOLLOW | NOCACHE);
+ 	}
+ 	NDINIT(&nd, LOOKUP, OP_FSCTL, nameiflags | AUDITVNPATH1,
+-	    UIO_USERSPACE, uap->path, ctx);
+-	if (uap->options & FSOPT_NOFOLLOW_ANY) {
++	    UIO_USERSPACE, path, ctx);
++	if (options & FSOPT_NOFOLLOW_ANY) {
+ 		nd.ni_flag |= NAMEI_NOFOLLOW_ANY;
+ 	}
+-	if (uap->options & FSOPT_UNIQUE) {
++	if (options & FSOPT_RESOLVE_BENEATH) {
++		nd.ni_flag |= NAMEI_RESOLVE_BENEATH;
++	}
++	if (options & FSOPT_UNIQUE) {
+ 		nd.ni_flag |= NAMEI_UNIQUE;
+ 	}
+ 
+-	if ((error = namei(&nd))) {
++	if ((error = nameiat(&nd, fd))) {
+ 		goto done;
+ 	}
+ 	vp = nd.ni_vp;
+-	nameidone(&nd);
++
++	/*
++	 * 13432 authorizes looking the target vnode up as if it were being
++	 * opened, except for one selector (0x40084a47) which only needs
++	 * stat authorization.  See docs/RECONSTRUCTION-NOTES.md.
++	 */
++	if (cmd == 0x40084a47) {
++		error = mac_vnode_check_stat(ctx, NULL, vp);
++		nameidone(&nd);
++		if (error) {
++			goto done;
++		}
++	} else {
++		error = vn_authorize_open_existing(vp, &nd.ni_cnd, FREAD, ctx,
++		    NULL);
++		if (error) {
++			error = vn_authorize_open_existing(vp, &nd.ni_cnd,
++			    vnode_isdir(vp) ? O_SEARCH : FWRITE, ctx, NULL);
++		}
++		nameidone(&nd);
++		if (error) {
++			goto done;
++		}
++	}
+ 
+ #if CONFIG_MACF
+-	error = mac_mount_check_fsctl(ctx, vnode_mount(vp), uap->cmd);
++	error = mac_mount_check_fsctl(ctx, vnode_mount(vp), cmd);
+ 	if (error) {
+ 		goto done;
+ 	}
+ #endif
+ 
+-	error = fsctl_internal(p, &vp, uap->cmd, (user_addr_t)uap->data, uap->options, ctx);
++	error = fsctl_internal(p, &vp, cmd, data, options, ctx);
+ 
+ done:
+ 	if (vp) {
+@@ -13755,6 +13874,23 @@ done:
+ 	}
+ 	return error;
+ }
++
++/* ARGSUSED */
++int
++fsctl(proc_t p, struct fsctl_args *uap, __unused int32_t *retval)
++{
++	return fsctlat_internal(p, AT_FDCWD, uap->path, uap->cmd,
++	           (user_addr_t)uap->data, uap->options);
++}
++
++/* ARGSUSED */
++int
++fsctlat(proc_t p, struct fsctlat_args *uap, __unused int32_t *retval)
++{
++	return fsctlat_internal(p, uap->fd, uap->path, uap->cmd,
++	           (user_addr_t)uap->data, uap->options);
++}
++
+ /* ARGSUSED */
+ int
+ ffsctl(proc_t p, struct ffsctl_args *uap, __unused int32_t *retval)
+diff --git a/osfmk/arm/task.h b/osfmk/arm/task.h
+index 7694a8a18..0803dbfc9 100644
+--- a/osfmk/arm/task.h
++++ b/osfmk/arm/task.h
+@@ -107,7 +107,19 @@ __options_closed_decl(task_sec_policy_t, uint8_t, {
+ 
+ 
+ 
+-#define TASK_ADDITIONS_UEXC uint64_t uexc[4];
++/*
++ * User exception handler region registered with register_uexc_handler().
++ * start/end delimit the user text range the handler is responsible for;
++ * handler is a signed user function pointer and refcon is passed to it.
++ */
++typedef struct {
++	uint64_t start;
++	uint64_t end;
++	void * XNU_PTRAUTH_SIGNED_PTR("arm64_uexc_region.handler") handler;
++	uint64_t refcon;
++} arm64_uexc_region_t;
++
++#define TASK_ADDITIONS_UEXC arm64_uexc_region_t uexc;
+ 
+ #if !__ARM_KERNEL_PROTECT__
+ #define TASK_ADDITIONS_X18 \
+@@ -119,7 +131,8 @@ __options_closed_decl(task_sec_policy_t, uint8_t, {
+ 
+ #define TASK_ADDITIONS_APT
+ 
+-#define TASK_X86_64_COMPAT
++#define TASK_X86_64_COMPAT \
++	bool x86_64_compat_entitled;
+ 
+ #define MACHINE_TASK \
+ 	void * XNU_PTRAUTH_SIGNED_PTR("task.task_debug") task_debug; \
+diff --git a/osfmk/arm/thread.h b/osfmk/arm/thread.h
+index 29ea6d86e..72d03fdbc 100644
+--- a/osfmk/arm/thread.h
++++ b/osfmk/arm/thread.h
+@@ -128,6 +128,8 @@ struct machine_thread {
+ 	};
+ #endif /* HAVE_MACHINE_THREAD_MATRIX_STATE */
+ 
++	uint64_t                  x86_64_compat;             /* thread is running x86_64 compat mode */
++
+ 	uint64_t                  reserved4;
+ 	uint64_t                  recover_far;
+ 
+diff --git a/osfmk/arm64/machine_task.c b/osfmk/arm64/machine_task.c
+index 9e8965e84..accf36df8 100644
+--- a/osfmk/arm64/machine_task.c
++++ b/osfmk/arm64/machine_task.c
+@@ -377,6 +377,11 @@ machine_task_process_signature(
+ 
+ 	task->uses_1ghz_timebase = uses_1ghz_timebase;
+ 
++	bool const x86_64_compat_entitled =
++	    ml_satisfies_x86_64_requirements(^bool (const char * ent) {
++		return IOTaskHasEntitlement(task, ent);
++	});
++	task->x86_64_compat_entitled = x86_64_compat_entitled;
+ 
+ 	return kr;
+ }
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 0554aa802..332725c05 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -183,6 +183,8 @@ static int is_alignment_fault(fault_status_t);
+ 
+ typedef void (*abort_handler_t)(arm_saved_state_t *, uint64_t, vm_offset_t, fault_status_t, vm_prot_t, expected_fault_handler_t);
+ static void handle_user_abort(arm_saved_state_t *, uint64_t, vm_offset_t, fault_status_t, vm_prot_t, expected_fault_handler_t);
++void handle_uexc_fault(arm_saved_state_t *, arm64_uexc_region_t *, uint64_t, vm_offset_t);
++bool configure_uexc_handler(user_addr_t, user_size_t, user_addr_t, user_addr_t);
+ static void handle_kernel_abort(arm_saved_state_t *, uint64_t, vm_offset_t, fault_status_t, vm_prot_t, expected_fault_handler_t);
+ 
+ static void handle_pc_align(arm_saved_state_t *ss) __dead2;
+@@ -1933,6 +1935,16 @@ handle_user_abort(arm_saved_state_t *state, uint64_t esr, vm_offset_t fault_addr
+ 		panic_with_thread_kernel_state("User abort from non-interruptible context", state);
+ 	}
+ 
++	{
++		task_t task = get_threadtask(thread);
++
++		if (task->uexc.start != 0 &&
++		    fault_addr >= task->uexc.start && fault_addr < task->uexc.end) {
++			handle_uexc_fault(state, &task->uexc, esr, fault_addr);
++			return;
++		}
++	}
++
+ 	thread->iotier_override = THROTTLE_LEVEL_NONE; /* Reset IO tier override before handling abort from userspace */
+ 
+ 	if (!is_servicible_fault(fault_code, esr, fault_addr, pmap) &&
+@@ -3432,3 +3444,77 @@ sleh_panic_lockdown_should_initiate_el1_sp0_sync(uint64_t esr, uint64_t elr,
+ }
+ __SECURITY_STACK_DISALLOWED_POP
+ #endif /* CONFIG_SPTM */
++
++/*
++ * arm64 user exception handling (uexc).
++ *
++ * A process may register a user-space handler for a text range; data aborts
++ * that fall inside that range are redirected to the handler instead of
++ * being turned into Mach exceptions.  The handler is entered with a new
++ * stack pointer and a frame describing the fault.
++ */
++
++typedef struct {
++	uint64_t pc;
++	uint64_t sp;
++	uint64_t esr;
++	uint64_t far;
++	uint64_t refcon;
++} arm64_uexc_frame_t;
++
++#define ARM64_UEXC_STACK_RESERVE 0xb0
++#define ARM64_UEXC_USER_ADDR_MAX 0x7ffffe000000ULL
++
++bool
++configure_uexc_handler(user_addr_t start, user_size_t size,
++    user_addr_t handler, user_addr_t refcon)
++{
++	arm64_uexc_region_t region = { 0 };
++	thread_t thread = current_thread();
++	task_t task = get_threadtask(thread);
++	user_addr_t end;
++
++	/* The region must not overflow and must stay in user space. */
++	if (os_add_overflow(start, size, &end)) {
++		return false;
++	}
++	if (end > ARM64_UEXC_USER_ADDR_MAX) {
++		return false;
++	}
++	if (handler == 0 || handler > ARM64_UEXC_USER_ADDR_MAX) {
++		return false;
++	}
++
++	region.start = start;
++	region.end = end;
++	region.handler = (void *)handler;
++	region.refcon = refcon;
++
++	task->uexc = region;
++	return true;
++}
++
++void
++handle_uexc_fault(arm_saved_state_t *ss, arm64_uexc_region_t *region,
++    uint64_t esr, vm_offset_t far)
++{
++	arm64_uexc_frame_t frame = { 0 };
++	void *handler = region->handler;
++	user_addr_t sp;
++
++	if (handler == NULL) {
++		return;
++	}
++
++	frame.pc = (uint64_t)get_saved_state_pc(ss);
++	frame.sp = (uint64_t)get_saved_state_sp(ss);
++	frame.esr = esr;
++	frame.far = far;
++	frame.refcon = region->refcon;
++
++	sp = (user_addr_t)(frame.sp - ARM64_UEXC_STACK_RESERVE);
++	set_saved_state_sp(ss, (register_t)sp);
++	set_saved_state_pc(ss, (register_t)(uintptr_t)handler);
++
++	(void)copyout(&frame, sp, sizeof(frame));
++}
+diff --git a/osfmk/arm64/x86_64_compat.c b/osfmk/arm64/x86_64_compat.c
+index d75169a06..62eea80ea 100644
+--- a/osfmk/arm64/x86_64_compat.c
++++ b/osfmk/arm64/x86_64_compat.c
+@@ -40,9 +40,32 @@
+ 
+ 
+ bool
+-ml_satisfies_x86_64_requirements(ml_entitlement_check __unused check_ent)
++ml_satisfies_x86_64_requirements(ml_entitlement_check check_ent)
+ {
+-	/* Not supported. This cannot be a static inline function, because it's exported. */
+-	return false;
++	/* This cannot be a static inline function, because it's exported. */
++	if (check_ent("com.apple.developer.cross-architecture-support")) {
++		return true;
++	}
++	return check_ent("com.apple.developer.cross-architecture-support-unmanaged");
++}
++
++kern_return_t
++thread_set_x86_64_compat_trap(struct thread_set_x86_64_compat_trap_args *args)
++{
++	thread_t t = current_thread();
++	task_t task = get_threadtask(t);
++	uint32_t enable;
++
++	if (!task->x86_64_compat_entitled) {
++		return KERN_FAILURE;
++	}
++
++	enable = args->enable;
++	if (enable > 1) {
++		return KERN_INVALID_ARGUMENT;
++	}
++
++	t->machine.x86_64_compat = enable;
++	return KERN_SUCCESS;
+ }
+ 
+diff --git a/osfmk/kern/syscall_sw.c b/osfmk/kern/syscall_sw.c
+index c1449f5da..2110fe82e 100644
+--- a/osfmk/kern/syscall_sw.c
++++ b/osfmk/kern/syscall_sw.c
+@@ -220,7 +220,7 @@ const mach_trap_t       mach_trap_table[MACH_TRAP_TABLE_COUNT] = {
+ /* 105 */ MACH_TRAP(kern_invalid, 0, 0, NULL),
+ /* 106 */ MACH_TRAP(kern_invalid, 0, 0, NULL),
+ /* 107 */ MACH_TRAP(kern_invalid, 0, 0, NULL),
+-/* 108 */ MACH_TRAP(kern_invalid, 0, 0, NULL),
++/* 108 */ MACH_TRAP(thread_set_x86_64_compat_trap, 1, 1, munge_w),
+ /* traps 109-127 unused */
+ /* 109 */ MACH_TRAP(kern_invalid, 0, 0, NULL),
+ /* 110 */ MACH_TRAP(kern_invalid, 0, 0, NULL),
+@@ -363,7 +363,7 @@ const char * const mach_syscall_name_table[MACH_TRAP_TABLE_COUNT] = {
+ /* 105 */ "kern_invalid",
+ /* 106 */ "kern_invalid",
+ /* 107 */ "kern_invalid",
+-/* 108 */ "kern_invalid",
++/* 108 */ "thread_set_x86_64_compat_trap",
+ /* traps 109-127 unused */
+ /* 109 */ "kern_invalid",
+ /* 110 */ "kern_invalid",

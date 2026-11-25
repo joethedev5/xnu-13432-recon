@@ -1,0 +1,221 @@
+From 3ffae9fdecf2c467334235e81725e443d5b5318b Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 02:28:14 +0000
+Subject: [PATCH 10/13] Recover rbbr_sender_utilizing_rwnd and sanitize
+ bounds-safety types
+
+- rbbr_sender_utilizing_rwnd: take the RTT median (sorted samples,
+  falling back to median_rtt), derive the expected bytes from
+  win * measure_ms / median, compute utilization from
+  cycle_bytes_rcvd, and report low utilization through tcp_log_bbr
+  with the reference format string and line 825.
+- Sanitize 11 compiler-internal __bounds_safety type names into real C
+  types with __counted_by/__sized_by annotations (u_char *, void *,
+  uint32_t *, bitmap_t *, struct inpcb **).
+- Declare tcp_log_bbr in tcp_log.h.
+
+Remaining explicit stubs: 301.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ bsd/netinet/tcp_ecn.c                 |  2 +-
+ bsd/netinet/tcp_fastopen.c            |  4 +--
+ bsd/netinet/tcp_log.h                 |  1 +
+ bsd/netinet/tcp_options.c             |  2 +-
+ bsd/netinet/tcp_rbbr.c                | 44 ++++++++++++++++++++++++---
+ bsd/netinet/tcp_timer_advanced.c      |  4 +--
+ osfmk/arm64/hv/hv_compat_paranested.c |  2 +-
+ osfmk/arm64/hv/hv_vcpu_paranested.c   |  2 +-
+ 8 files changed, 48 insertions(+), 13 deletions(-)
+
+diff --git a/bsd/netinet/tcp_ecn.c b/bsd/netinet/tcp_ecn.c
+index fc2cde1a5..b31bcaa27 100644
+--- a/bsd/netinet/tcp_ecn.c
++++ b/bsd/netinet/tcp_ecn.c
+@@ -250,7 +250,7 @@ tcp_ecn_set_flags(struct tcpcb * tp, uint16_t thflags, int len, _Bool rxmt)
+ 
+ /* bsd/netinet/tcp_ecn.c:1027 */
+ void
+-tcp_accecn_add_option(struct tcpcb * tp, uint16_t flags, struct __bounds_safety::wide_ptr.indexable lp, uint8_t * optlen)
++tcp_accecn_add_option(struct tcpcb * tp, uint16_t flags, bitmap_t *lp, uint8_t * optlen)
+ {
+ 	/* RECON(13432): body not recovered from the reference kernel yet. */
+ 	panic("reconstructed stub: tcp_accecn_add_option");
+diff --git a/bsd/netinet/tcp_fastopen.c b/bsd/netinet/tcp_fastopen.c
+index 5f4958ff4..dc48b40c5 100644
+--- a/bsd/netinet/tcp_fastopen.c
++++ b/bsd/netinet/tcp_fastopen.c
+@@ -121,7 +121,7 @@ tcp_tfo_check(struct tcpcb * tp, int32_t len)
+ 
+ /* bsd/netinet/tcp_fastopen.c:370 */
+ unsigned int
+-tcp_tfo_write_cookie_rep(struct tcpcb * tp, unsigned int optlen, __bounds_safety::counted_by::optlen + 2 + 8 opt)
++tcp_tfo_write_cookie_rep(struct tcpcb * tp, unsigned int optlen, u_char *opt __counted_by(optlen + 2 + 8))
+ {
+ 	/* RECON(13432): body not recovered from the reference kernel yet. */
+ 	panic("reconstructed stub: tcp_tfo_write_cookie_rep");
+@@ -129,7 +129,7 @@ tcp_tfo_write_cookie_rep(struct tcpcb * tp, unsigned int optlen, __bounds_safety
+ 
+ /* bsd/netinet/tcp_fastopen.c:398 */
+ unsigned int
+-tcp_tfo_write_cookie(struct tcpcb * tp, unsigned int optlen, int32_t len, __bounds_safety::counted_by::40UL opt)
++tcp_tfo_write_cookie(struct tcpcb * tp, unsigned int optlen, int32_t len, u_char *opt __counted_by(40))
+ {
+ 	/* RECON(13432): body not recovered from the reference kernel yet. */
+ 	panic("reconstructed stub: tcp_tfo_write_cookie");
+diff --git a/bsd/netinet/tcp_log.h b/bsd/netinet/tcp_log.h
+index 906e1a3c2..81e4cd2e4 100644
+--- a/bsd/netinet/tcp_log.h
++++ b/bsd/netinet/tcp_log.h
+@@ -105,6 +105,7 @@ extern void tcp_log_message(const char *func_name, int line_no, struct tcpcb *tp
+ extern void tcp_log_fsw_flow(const char *func_name, int line_no, struct tcpcb *tp, const char *format, ...) __printflike(4, 5);
+ extern void tcp_log_state_change(const char *func_name, int line_no, struct tcpcb *tp, int new_state);
+ extern void tcp_log_output(const char *func_name, int line_no, struct tcpcb *tp, const char *format, ...) __printflike(4, 5);
++extern void tcp_log_bbr(const char *func_name, int line_no, struct tcpcb *tp, const char *format, ...) __printflike(4, 5);
+ extern void tcp_log_bind(struct tcpcb *tp, int error);
+ 
+ 
+diff --git a/bsd/netinet/tcp_options.c b/bsd/netinet/tcp_options.c
+index 87e984254..8179a6254 100644
+--- a/bsd/netinet/tcp_options.c
++++ b/bsd/netinet/tcp_options.c
+@@ -14,7 +14,7 @@
+ 
+ /* bsd/netinet/tcp_options.c:79 */
+ void
+-tcp_process_options(struct tcpcb * tp, __bounds_safety::counted_by::cnt0 cp0, int cnt0, struct tcphdr * th, struct tcpopt * to)
++tcp_process_options(struct tcpcb * tp, u_char *cp0 __counted_by(cnt0), int cnt0, struct tcphdr * th, struct tcpopt * to)
+ {
+ 	/* RECON(13432): body not recovered from the reference kernel yet. */
+ 	panic("reconstructed stub: tcp_process_options");
+diff --git a/bsd/netinet/tcp_rbbr.c b/bsd/netinet/tcp_rbbr.c
+index d6a7d5b77..44f6fe549 100644
+--- a/bsd/netinet/tcp_rbbr.c
++++ b/bsd/netinet/tcp_rbbr.c
+@@ -14,6 +14,7 @@
+ #include <netinet/tcp_cc.h>
+ #include <kern/kalloc.h>
+ #include <os/atomic_private.h>
++#include <netinet/tcp_log.h>
+ 
+ #define RECON_BSD_NETINET_TCP_RBBR_C 1
+ 
+@@ -169,7 +170,7 @@ rbbr_log_phase_end(struct tcpcb * tp, const char * phase_name, const char * next
+ 
+ /* bsd/netinet/tcp_rbbr.c:495 */
+ void
+-rbbr_insertion_sort(struct __bounds_safety::wide_ptr.indexable.50 arr, uint16_t n)
++rbbr_insertion_sort(uint32_t *arr __counted_by(n), uint16_t n)
+ {
+ 	/* RECON(13432): body not recovered from the reference kernel yet. */
+ 	panic("reconstructed stub: rbbr_insertion_sort");
+@@ -177,7 +178,7 @@ rbbr_insertion_sort(struct __bounds_safety::wide_ptr.indexable.50 arr, uint16_t
+ 
+ /* bsd/netinet/tcp_rbbr.c:513 */
+ uint32_t
+-rbbr_sorted_median(struct __bounds_safety::wide_ptr.indexable arr, uint16_t n)
++rbbr_sorted_median(uint32_t *arr __counted_by(n), uint16_t n)
+ {
+ 	/* RECON(13432): body not recovered from the reference kernel yet. */
+ 	panic("reconstructed stub: rbbr_sorted_median");
+@@ -201,7 +202,7 @@ rbbr_get_rtt_median(struct tcp_rbbr_state * rbbr)
+ 
+ /* bsd/netinet/tcp_rbbr.c:552 */
+ uint32_t
+-rbbr_median_of_deviations(struct __bounds_safety::wide_ptr.indexable.50 deviations, uint16_t n)
++rbbr_median_of_deviations(uint32_t *deviations __counted_by(n), uint16_t n)
+ {
+ 	/* RECON(13432): body not recovered from the reference kernel yet. */
+ 	panic("reconstructed stub: rbbr_median_of_deviations");
+@@ -251,8 +252,41 @@ rbbr_process_probe_rwnd_cycle(struct tcpcb * tp, _Bool * utilized_out)
+ _Bool
+ rbbr_sender_utilizing_rwnd(struct tcpcb * tp)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: rbbr_sender_utilizing_rwnd");
++	struct tcp_rbbr_state *rbbr = tp->t_rbbr_state;
++	uint32_t now = tcp_now;
++	uint32_t median = rbbr->median_rtt;
++	uint32_t measure_ms;
++	uint64_t expected;
++	uint64_t cycle_rtt;
++	uint64_t utilization_pct;
++
++	if (rbbr->rtt_sample_count != 0) {
++		median = rbbr_get_rtt_median(rbbr);
++		if (median == 0) {
++			median = rbbr->median_rtt;
++		}
++	}
++	if (median == 0 || rbbr->win == 0 || rbbr->cycle_measure_ts == 0) {
++		return false;
++	}
++	measure_ms = now - rbbr->cycle_measure_ts;
++	expected = (uint64_t)rbbr->win * measure_ms;
++	if (expected < median) {
++		return true;
++	}
++	cycle_rtt = expected / median;
++	utilization_pct = rbbr->cycle_bytes_rcvd * 100 / cycle_rtt;
++	if (utilization_pct >= (uint64_t)rbbr_low_utilization_thresh) {
++		return true;
++	}
++	if (tcp_is_log_enabled(tp, TLEF_LOG)) {
++		tcp_log_bbr("rbbr_sender_utilizing_rwnd", 825, tp,
++		    "rbbr: low utilization bytes_rcvd=%llu expected=%llu "
++		    "measure_ms=%u win=%u cycle_rtt=%u median_rtt=%u",
++		    rbbr->cycle_bytes_rcvd, expected, measure_ms, rbbr->win,
++		    (uint32_t)cycle_rtt, median);
++	}
++	return false;
+ }
+ 
+ /* bsd/netinet/tcp_rbbr.c:847 */
+diff --git a/bsd/netinet/tcp_timer_advanced.c b/bsd/netinet/tcp_timer_advanced.c
+index 1ce5d48b6..8f155c4d7 100644
+--- a/bsd/netinet/tcp_timer_advanced.c
++++ b/bsd/netinet/tcp_timer_advanced.c
+@@ -191,7 +191,7 @@ tcp_timer_invoke_handler(struct tcp_timer_entry * te)
+ 
+ /* bsd/netinet/tcp_timer_advanced.c:634 */
+ int
+-tcp_timer_snapshot_if_probes(struct tcp_timer_cpu * per_cpu, u_int16_t probe_if_index, __bounds_safety::counted_by::128 probe_inps)
++tcp_timer_snapshot_if_probes(struct tcp_timer_cpu * per_cpu, u_int16_t probe_if_index, struct inpcb **probe_inps __counted_by(128))
+ {
+ 	/* RECON(13432): body not recovered from the reference kernel yet. */
+ 	panic("reconstructed stub: tcp_timer_snapshot_if_probes");
+@@ -199,7 +199,7 @@ tcp_timer_snapshot_if_probes(struct tcp_timer_cpu * per_cpu, u_int16_t probe_if_
+ 
+ /* bsd/netinet/tcp_timer_advanced.c:687 */
+ void
+-tcp_timer_execute_if_probes(__bounds_safety::counted_by::128 probe_inps, int probe_count)
++tcp_timer_execute_if_probes(struct inpcb **probe_inps __counted_by(128), int probe_count)
+ {
+ 	/* RECON(13432): body not recovered from the reference kernel yet. */
+ 	panic("reconstructed stub: tcp_timer_execute_if_probes");
+diff --git a/osfmk/arm64/hv/hv_compat_paranested.c b/osfmk/arm64/hv/hv_compat_paranested.c
+index c22e8db64..ece7fa26b 100644
+--- a/osfmk/arm64/hv/hv_compat_paranested.c
++++ b/osfmk/arm64/hv/hv_compat_paranested.c
+@@ -64,7 +64,7 @@ hv_guest_has_context_measurement_mismatch(void)
+ 
+ /* osfmk/arm64/hv/hv_compat_paranested.c:223 */
+ void
+-hv_convert_context_from_measurements(__bounds_safety::sized_by::src_size src, size_t src_size, const hv_paranested_measurement_t * src_measurement, __bounds_safety::sized_by::dst_size dst, size_t dst_size, const hv_paranested_measurement_t * dst_measurement, _Bool copy_ro)
++hv_convert_context_from_measurements(void *src __sized_by(src_size), size_t src_size, const hv_paranested_measurement_t * src_measurement, void *dst __sized_by(dst_size), size_t dst_size, const hv_paranested_measurement_t * dst_measurement, _Bool copy_ro)
+ {
+ 	/* RECON(13432): body not recovered from the reference kernel yet. */
+ 	panic("reconstructed stub: hv_convert_context_from_measurements");
+diff --git a/osfmk/arm64/hv/hv_vcpu_paranested.c b/osfmk/arm64/hv/hv_vcpu_paranested.c
+index 12e9e48e4..e83feedd6 100644
+--- a/osfmk/arm64/hv/hv_vcpu_paranested.c
++++ b/osfmk/arm64/hv/hv_vcpu_paranested.c
+@@ -51,7 +51,7 @@ hv_vcpu_destroy(hv_vcpu_t * vcpu)
+ }
+ 
+ /* osfmk/arm64/hv/hv_vcpu_paranested.c:115 */
+-__bounds_safety::sized_by_or_null::context_size
++void *
+ allocate_context(const size_t context_size, _Bool contiguous_context)
+ {
+ 	/* RECON(13432): body not recovered from the reference kernel yet. */

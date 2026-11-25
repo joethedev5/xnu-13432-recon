@@ -1,0 +1,58 @@
+From 38f1cc224173a7b8560aa4954453a06cda89b05a Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 02:28:51 +0000
+Subject: [PATCH 12/13] Recover rbbr_clear_state and use it in the reset paths
+
+The initializer, switch_to and after_idle bodies all zero the full
+tcp_rbbr_state (0x160 bytes) before restoring preserved fields; the
+reference factors this through rbbr_clear_state.  Implement the helper
+and call it from those paths.
+
+Remaining explicit stubs: 296.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ bsd/netinet/tcp_rbbr.c | 9 ++++-----
+ 1 file changed, 4 insertions(+), 5 deletions(-)
+
+diff --git a/bsd/netinet/tcp_rbbr.c b/bsd/netinet/tcp_rbbr.c
+index 686a30930..92b83ca7c 100644
+--- a/bsd/netinet/tcp_rbbr.c
++++ b/bsd/netinet/tcp_rbbr.c
+@@ -84,8 +84,7 @@ rbbr_pct(uint32_t val, uint32_t pct)
+ void
+ rbbr_clear_state(struct tcpcb * tp)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: rbbr_clear_state");
++	memset(tp->t_rbbr_state, 0, sizeof(*tp->t_rbbr_state));
+ }
+ 
+ /* bsd/netinet/tcp_rbbr.c:262 */
+@@ -398,7 +397,7 @@ tcp_rbbr_init(struct tcpcb * tp)
+ 	tp->t_rbbr_state = rbbr;
+ 	os_atomic_inc(&tcp_cc_rbbr.num_sockets, relaxed);
+ 
+-	memset(rbbr, 0, sizeof(*rbbr));
++	rbbr_clear_state(tp);
+ 	rbbr->rwnd_est = tp->t_maxseg * rbbr_rtt_probe_rwnd_mss;
+ 	rbbr->win = (rbbr->rwnd_est + (tp->t_maxseg >> 1)) /
+ 	    tp->t_maxseg * tp->t_maxseg;
+@@ -507,7 +506,7 @@ tcp_rbbr_after_idle(struct tcpcb * tp)
+ 	now = tcp_now;
+ 	saved_est = rbbr->rwnd_est;
+ 	saved_delay = rbbr->delay_exceeded_seen;
+-	memset(rbbr, 0, sizeof(*rbbr));
++	rbbr_clear_state(tp);
+ 	rbbr->delay_exceeded_seen = saved_delay;
+ 
+ 	if (saved_est != 0) {
+@@ -545,7 +544,7 @@ tcp_rbbr_switch_to(struct tcpcb * tp)
+ 	tp->t_rbbr_state = rbbr;
+ 	os_atomic_inc(&tcp_cc_rbbr.num_sockets, relaxed);
+ 
+-	memset(rbbr, 0, sizeof(*rbbr));
++	rbbr_clear_state(tp);
+ 	rbbr->rwnd_est = tp->t_maxseg * rbbr_rtt_probe_rwnd_mss;
+ 	rbbr->win = (rbbr->rwnd_est + (tp->t_maxseg >> 1)) /
+ 	    tp->t_maxseg * tp->t_maxseg;

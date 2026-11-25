@@ -1,0 +1,718 @@
+From 820acab9b5cc1b697d05ec91c3105cd9336347e6 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 02:24:22 +0000
+Subject: [PATCH 06/13] Relocate VM map store types into the 13432 header
+
+Move the packed pointer, tree node/root, reservation and guard-object
+type definitions and their packing macros out of
+vm_map_store_internal.h into vm_map_store_types_internal.h, matching
+the reference declaration file.  The public text is preserved verbatim;
+vm_map_store_internal.h now includes the new header.
+
+Clears the last duplicate-definition delta from the header
+reconstruction.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ osfmk/vm/vm_map_store_internal.h       | 304 +--------------------
+ osfmk/vm/vm_map_store_types_internal.h | 356 +++++++++++++++++++++----
+ 2 files changed, 312 insertions(+), 348 deletions(-)
+
+diff --git a/osfmk/vm/vm_map_store_internal.h b/osfmk/vm/vm_map_store_internal.h
+index 4790a1fe4..28a0915e8 100644
+--- a/osfmk/vm/vm_map_store_internal.h
++++ b/osfmk/vm/vm_map_store_internal.h
+@@ -34,6 +34,7 @@
+ #include <kern/bits.h>
+ #include <os/atomic_private.h>
+ #include <stdint.h>
++#include <vm/vm_map_store_types_internal.h>
+ 
+ __BEGIN_DECLS
+ __exported_push_hidden
+@@ -43,309 +44,6 @@ struct vm_map_entry;
+ struct vm_map_copy;
+ struct vm_map_header;
+ 
+-/*!
+- * @brief
+- * Type for a packed pointer to a VM map store node.
+- */
+-typedef struct {
+-	uint32_t                vmsp_packed __kernel_ptr_semantics;
+-} vm_map_store_node_ptr_t;
+-
+-/*!
+- * @brief
+- * Type for a packed pointer to a VM map store value.
+- */
+-typedef struct {
+-	uint32_t                vmsp_packed : 31 __kernel_ptr_semantics;
+-	uint32_t                vmsp_chunk  : 1;
+-} vm_map_store_val_ptr_t;
+-
+-/*!
+- * @constant VMS_NODE_FANOUT
+- * The fanout for the VM map store B+tree inner nodes.
+- *
+- * @constant VMS_LEAF_FANOUT
+- * The fanout for the VM map store B+tree leaf nodes.
+- */
+-#define VMS_NODE_FANOUT         15
+-#define VMS_LEAF_FANOUT         20
+-
+-/*!
+- * @brief
+- * The type for a VM map store B+tree node.
+- *
+- * @field vmsn_count (any)
+- * The number of slots in use in the node.
+- *
+- * @field vmsn_leaf (any)
+- * Whether the node is a leaf (true) or an internal node (false).
+- *
+- * @field vmsn_next_sibling (inner nodes, leaf nodes)
+- * The packed pointer to the next node at the same level in the B+tree,
+- * or 0 if this is the last.
+- *
+- * @field vmsn_keys (inner nodes), vmsl_keys (leaf nodes)
+- * The B+tree keys for this node.
+- * Unlike a regular B+tree, the minimum key for the tree is held in slot [0].
+- *
+- *              ┌───┬───┬───┬───┬───┐
+- *     keys   = │ 0 │ 1 │...│n-2│n-1│
+- *              └─┬─┴─┬─┴─┬─┴─┬─┴─┬─┴─┐
+- *     values =   │ 0 │ 1 │...│n-2│n-1│
+- *                └───┴───┴───┴───┴───┘
+- *
+- * @field vmsn_ptrs (inner nodes), vmsl_ptrs (leaf nodes)
+- * The B+tree values for each key.
+- * For inner nodes, the value is a packed pointer to another node,
+- * for leaves a packed value pointer.
+- *
+- * @field vmsn_holes (inner nodes)
+- * A bitfield that represents the size classes for which a hole exists
+- * within the subree corresponding to the current slot.
+- *
+- * @field vmsn_padding (any)
+- * Unused
+- */
+-typedef struct vm_map_store_node {
+-	uint16_t                vmsn_count;
+-	uint16_t                vmsn_leaf;      /* bool, but avoids padding */
+-	vm_map_store_node_ptr_t vmsn_next_sibling;
+-	union {
+-		struct {
+-			vm_map_address_t        vmsn_keys[VMS_NODE_FANOUT];
+-			vm_map_store_node_ptr_t vmsn_ptrs[VMS_NODE_FANOUT];
+-			uint32_t                vmsn_holes[VMS_NODE_FANOUT];
+-		};
+-		struct {
+-			vm_map_address_t        vmsl_keys[VMS_LEAF_FANOUT];
+-			vm_map_store_val_ptr_t  vmsl_ptrs[VMS_LEAF_FANOUT];
+-		};
+-	};
+-	uint64_t                vmsn_padding;   /* an OLC lock one day */
+-} *vm_map_store_node_t;
+-
+-/*!
+- * @brief
+- * Represents the root of a VM map store B+tree.
+- *
+- * @field vmsr_root     The packed pointer to the root node of the B+tree
+- * @field vmsr_depth    The depth of the tree (how many layers of inner nodes)
+- * @field vmsr_hint     A cache of the last leaf node that was looked up or NULL
+- */
+-typedef struct vm_map_store_root {
+-	vm_map_store_node_ptr_t vmsr_root;
+-	uint32_t                vmsr_depth;
+-	vm_map_store_node_t     vmsr_hint;
+-} vm_map_store_root_t;
+-
+-
+-/*!
+- * @const VMGO_MAX_SIZE_SHIFT
+- * The log2() of the maximum size for guard object slots that slabs can contain.
+- * Currently 1Tb. Note that it doesn't mean that the address space is large
+- * enough to actually find space for such large guard objects.
+- *
+- * @const VMGO_SIZE_CLASSES
+- * The number of size classes in a slab.
+- * A slot size is always (1) a power of two and (2) at least PAGE_SIZE large.
+- *
+- * @const VMGO_COUNT_SHIFT_BITS
+- * The number of bits for the @c vgoc_count_shift field, which must represents
+- * the shift of @c vgoc_count, which itself has to be any power of two between
+- * 2 and 64.
+- *
+- * @const VMGO_QUARANTINED_BITS
+- * The number of bits for the @c vgoc_quarantined field, which needs to
+- * represent any value from 0 to 15 (64/4 - 1).
+- *
+- * @const VMGO_START_SHIFT
+- * By how many bits to shift @c vgoc_start to compute the practical starting
+- * VA for a guard object chunk. It implies that these are always at least
+- * aligned to a (1u << VMGO_START_SHIFT == 64k) boundary.
+- */
+-#define VMGO_MAX_SIZE_SHIFT     40
+-/*
+- * for some platforms PAGE_SHIFT isn't a constant, fallback to PAGE_MIN_SHIFT,
+- * it only wastes 2 entries in the array.
+- */
+-#define VMGO_SIZE_CLASSES       (VMGO_MAX_SIZE_SHIFT - PAGE_MIN_SHIFT)
+-#define VMGO_COUNT_SHIFT_BITS   3
+-#define VMGO_QUARANTINED_BITS   4
+-#define VMGO_START_SHIFT        16
+-
+-typedef struct vm_guard_object_slab *vm_guard_object_slab_t;
+-
+-/*!
+- * @brief
+- * The type for a guard object chunk.
+- *
+- * @discussion
+- * A guard object chunk is a collection of several slots of the same size,
+- * that are used to return randomly selected allocations, maintaining
+- * a guarantee of 25% density of guards that cause crashes when accessed.
+- *
+- * For a VM managed chunk, these invariants hold:
+- *
+- * - the number of bits set in vgoc_bitmap is equal to (vgoc_quarantined
+- *   + vgoc_available + #guards),
+- *
+- * - slots that are free have no entry covering its corresponding VA range
+- *   in the skiplist.
+- *
+- *
+- * For a user managed chunk, these invariants hold:
+- *
+- * - vgoc_available = 0, vgoc_quarantined = 0, vgoc_count = 64;
+- *
+- * - all the VA of the chunk is covered by entries regardless of the state of
+- *   the slots;
+- *
+- * - guarded slots (slots with their bit set in vgoc_bitmap) have no memory
+- *   entered in the pmap, and trying to access this memory (copy, fault, ...)
+- *   results in a protection failure.
+- *
+- *
+- * @see doc/allocators/guard-objects.md for the rationale.
+- *
+- * Chunk configuration (immutable)
+- * ~~~~~~~~~~~~~~~~~~~
+- *
+- * @field vgoc_slab             The owning slab for VM managed chunks.
+- *
+- * @field vgoc_start            A 32bit representation of the VA start for
+- *                              that chunk in its map, use @c vmgo_chunk_start()
+- *                              to convert into a proper @c vm_map_address_t.
+- *
+- * @field vgoc_granule          The slot size granule as a shift scale,
+- *                              in number of bytes. Meaning that the size
+- *                              of a slot is (1u << vgoc_granule).
+- *
+- * @field vgoc_count            The number of slots in the chunk.
+- *                              (always a power of two smaller or equal to 64).
+- *
+- * @field vgoc_count_shift      The number of slots in the chunk, as a shift.
+- *                              vgoc_count = 1u << vgoc_count_shift.
+- *
+- *
+- * Chunk slot state (serialized by the map interlock)
+- * ~~~~~~~~~~~~~~~~
+- *
+- * @field vgoc_quarantined      The number of quarantined slots
+- *                              (always strictly smaller than vgoc_count / 4)
+- *
+- * @field vgoc_available        The number of allocatable slots
+- *
+- * @field vgoc_bitmap           The bitmap of free/guarded slots
+- *
+- *                              For user managed chunks, the serialization is
+- *                              more subtle: the bitmap is updated atomically,
+- *                              under at least a shared lock on all the entries.
+- *                              Holding an exclusive lock guarantees stability
+- *
+- * @field vgoc_prev, vgoc_next  Linkage used to chain the chunk on its slab
+- *                              size class or the map's guard_object_user list.
+- *
+- * @field vgoc_ptrs             A skiplist of entries this chunk points to.
+- *
+- *
+- * Visually
+- * ~~~~~~~~
+- *
+- * Below is a graphical representation of a chunk for the parameters:
+- * - vgoc_count_shift = 3
+- * - vgoc_count       = 8
+- * - vgoc_bitmap      = 0xe9
+- *
+- *  vmgo_chunk_start()                                          vmgo_chunk_end()
+- *   │                       1 << vgoc_granule                               │
+- *   ▼                           ◀──────▶                                    ▼
+- *   ╔════════╤════════╤════════╤════════╤════════╤════════╤════════╤════════╗
+- *   ║ 0:free │ 1:used │ 2:used │ 3:free │ 4:used │ 5:free │ 6:free │ 7:free ║
+- *   ╚════════╧════════╧════════╧════════╧════════╧════════╧════════╧════════╝
+- *    ◀─────────────────────────────────────────────────────────────────────▶
+- *                               vmgo_chunk_size()
+- *
+- *
+- * For this configuration:
+- * - the chunk has 2 guards (8/4)
+- * - 3 chunks are used/allocated
+- * - because the chunk has enough free slots (more than twice the number of
+- *   guards) it won't have any quarantined slots and vgoc_available is 3.
+- *
+- * See doc/allocators/guard-objects.md for more details.
+- */
+-typedef struct vm_guard_object_chunk {
+-	/* immutable fields */
+-	vm_guard_object_slab_t  vgoc_slab;
+-	uint32_t                vgoc_start;
+-	uint8_t                 vgoc_granule;
+-	uint8_t                 vgoc_count;
+-	uint8_t                 vgoc_count_shift : 4;
+-
+-	/* mutable fields, serialized by the map lock */
+-	uint8_t                 vgoc_quarantined : 4;
+-	uint8_t                 vgoc_available;
+-	bitmap_t                vgoc_bitmap;
+-
+-	vm_map_store_val_ptr_t  vgoc_prev;
+-	vm_map_store_val_ptr_t  vgoc_next;
+-
+-	vm_map_store_val_ptr_t  vgoc_ptrs[8];
+-} *vm_guard_object_chunk_t;
+-
+-
+-/*!
+- * @brief
+- * The type for a guard object slab.
+- *
+- * @discussion
+- * A guard object slab is a series of size-segregated list of guard object
+- * chunks. The @c vgos_full lists contain chunks that have no available slots
+- * (because they are all used or quarantined), and the @c vgos_partial lists
+- * contain chunks that have at least one element available for allocations.
+- * Empty chunks are not kept around, which is why there is no @c vgoc_empty
+- * list.
+- */
+-typedef struct vm_guard_object_slab {
+-	vm_guard_object_chunk_t vgos_partial[VMGO_SIZE_CLASSES];
+-	vm_guard_object_chunk_t vgos_full[VMGO_SIZE_CLASSES];
+-} *vm_guard_object_slab_t;
+-
+-/*!
+- * @brief
+- * A struct holding the information about an allocation reservation.
+- *
+- * @field vmsr_start            The start address for the reservation
+- * @field vmsr_is_chunk         Whether vmsr_value is a chunk or an entry.
+- * @field vmsr_value            (optional) a pointer to the entry right after
+- *                              this reservation, or the chunk containing
+- *                              the reservation.
+- */
+-typedef struct vm_map_store_rsv {
+-	long long               vmsr_start : 63;
+-	bool                    vmsr_is_chunk : 1;
+-	uintptr_t               vmsr_value;
+-} vm_map_store_rsv_t;
+-
+-/*
+- * Packing parameters for VM map store nodes
+- */
+-#define VMN_PACKED_PTR_BITS         32
+-#define VMN_PACKED_PTR_SHIFT        8
+-#define VMN_PACKED_PTR_BASE         ((uintptr_t)VM_MIN_KERNEL_AND_KEXT_ADDRESS)
+-
+-/*
+- * Packing parameters for VM map entries
+- */
+-#define VME_PACKED_PTR_BITS         31
+-#define VME_PACKED_PTR_SHIFT        6
+-#define VME_PACKED_PTR_BASE         ((uintptr_t)VM_MIN_KERNEL_AND_KEXT_ADDRESS)
+-
+-#define VM_MAP_HDR_PAGE_SHIFT(hdr)  ((hdr)->page_shift)
+-#define VM_MAP_HDR_PAGE_SIZE(hdr)   (1 << VM_MAP_HDR_PAGE_SHIFT((hdr)))
+-#define VM_MAP_HDR_PAGE_MASK(hdr)   (VM_MAP_HDR_PAGE_SIZE((hdr)) - 1)
+-
+-
+ #pragma mark vm map store creation/destruction
+ 
+ /*!
+diff --git a/osfmk/vm/vm_map_store_types_internal.h b/osfmk/vm/vm_map_store_types_internal.h
+index a2d7a69bf..36d6e1ae0 100644
+--- a/osfmk/vm/vm_map_store_types_internal.h
++++ b/osfmk/vm/vm_map_store_types_internal.h
+@@ -1,60 +1,326 @@
+ /*
+- * Reconstruction of osfmk/vm/vm_map_store_types_internal.h from the xnu-13432 reference kernel.
++ * Reconstruction of osfmk/vm/vm_map_store_types_internal.h from the
++ * xnu-13432 reference kernel.
+  *
+- * Declarations are derived from the KDK 27.0.1 DWARF.  Include order and
+- * macros used by the original header are not recovered here.
+- *
+- * KNOWN DELTA: the public osfmk/vm/vm_map_store_internal.h still carries
+- * textual definitions of these types; relocating them is pending.
++ * In 13432 the VM map store type definitions moved out of
++ * vm_map_store_internal.h into this header; the text below is relocated
++ * from the public tree.
+  */
+ #ifndef XNU13432_OSFMK_VM_VM_MAP_STORE_TYPES_INTERNAL_H
+ #define XNU13432_OSFMK_VM_VM_MAP_STORE_TYPES_INTERNAL_H
+ 
++#include <mach/shared_region.h>
++#include <mach/vm_param.h>
++#include <kern/bits.h>
++#include <os/atomic_private.h>
++#include <stdint.h>
++
++__BEGIN_DECLS
++__exported_push_hidden
++
++/*!
++ * @brief
++ * Type for a packed pointer to a VM map store node.
++ */
+ typedef struct {
+-	uint32_t vmsp_packed;
++	uint32_t                vmsp_packed __kernel_ptr_semantics;
+ } vm_map_store_node_ptr_t;
++
++/*!
++ * @brief
++ * Type for a packed pointer to a VM map store value.
++ */
+ typedef struct {
+-	uint32_t vmsp_packed : 31;
+-	uint32_t vmsp_chunk : 1;
++	uint32_t                vmsp_packed : 31 __kernel_ptr_semantics;
++	uint32_t                vmsp_chunk  : 1;
+ } vm_map_store_val_ptr_t;
+-struct vm_map_store_node {
+-	uint16_t vmsn_count;
+-	uint16_t vmsn_leaf;
++
++/*!
++ * @constant VMS_NODE_FANOUT
++ * The fanout for the VM map store B+tree inner nodes.
++ *
++ * @constant VMS_LEAF_FANOUT
++ * The fanout for the VM map store B+tree leaf nodes.
++ */
++#define VMS_NODE_FANOUT         15
++#define VMS_LEAF_FANOUT         20
++
++/*!
++ * @brief
++ * The type for a VM map store B+tree node.
++ *
++ * @field vmsn_count (any)
++ * The number of slots in use in the node.
++ *
++ * @field vmsn_leaf (any)
++ * Whether the node is a leaf (true) or an internal node (false).
++ *
++ * @field vmsn_next_sibling (inner nodes, leaf nodes)
++ * The packed pointer to the next node at the same level in the B+tree,
++ * or 0 if this is the last.
++ *
++ * @field vmsn_keys (inner nodes), vmsl_keys (leaf nodes)
++ * The B+tree keys for this node.
++ * Unlike a regular B+tree, the minimum key for the tree is held in slot [0].
++ *
++ *              ┌───┬───┬───┬───┬───┐
++ *     keys   = │ 0 │ 1 │...│n-2│n-1│
++ *              └─┬─┴─┬─┴─┬─┴─┬─┴─┬─┴─┐
++ *     values =   │ 0 │ 1 │...│n-2│n-1│
++ *                └───┴───┴───┴───┴───┘
++ *
++ * @field vmsn_ptrs (inner nodes), vmsl_ptrs (leaf nodes)
++ * The B+tree values for each key.
++ * For inner nodes, the value is a packed pointer to another node,
++ * for leaves a packed value pointer.
++ *
++ * @field vmsn_holes (inner nodes)
++ * A bitfield that represents the size classes for which a hole exists
++ * within the subree corresponding to the current slot.
++ *
++ * @field vmsn_padding (any)
++ * Unused
++ */
++typedef struct vm_map_store_node {
++	uint16_t                vmsn_count;
++	uint16_t                vmsn_leaf;      /* bool, but avoids padding */
+ 	vm_map_store_node_ptr_t vmsn_next_sibling;
+-	/* unresolved anonymous member at offset 8 */
+-	uint64_t vmsn_padding;
+-};
+-typedef struct vm_map_store_node *vm_map_store_node_t;
+-struct vm_map_store_root {
++	union {
++		struct {
++			vm_map_address_t        vmsn_keys[VMS_NODE_FANOUT];
++			vm_map_store_node_ptr_t vmsn_ptrs[VMS_NODE_FANOUT];
++			uint32_t                vmsn_holes[VMS_NODE_FANOUT];
++		};
++		struct {
++			vm_map_address_t        vmsl_keys[VMS_LEAF_FANOUT];
++			vm_map_store_val_ptr_t  vmsl_ptrs[VMS_LEAF_FANOUT];
++		};
++	};
++	uint64_t                vmsn_padding;   /* an OLC lock one day */
++} *vm_map_store_node_t;
++
++/*!
++ * @brief
++ * Represents the root of a VM map store B+tree.
++ *
++ * @field vmsr_root     The packed pointer to the root node of the B+tree
++ * @field vmsr_depth    The depth of the tree (how many layers of inner nodes)
++ * @field vmsr_hint     A cache of the last leaf node that was looked up or NULL
++ */
++typedef struct vm_map_store_root {
+ 	vm_map_store_node_ptr_t vmsr_root;
+-	uint32_t vmsr_depth;
+-	vm_map_store_node_t vmsr_hint;
+-};
+-typedef struct vm_map_store_root vm_map_store_root_t;
++	uint32_t                vmsr_depth;
++	vm_map_store_node_t     vmsr_hint;
++} vm_map_store_root_t;
++
++
++/*!
++ * @const VMGO_MAX_SIZE_SHIFT
++ * The log2() of the maximum size for guard object slots that slabs can contain.
++ * Currently 1Tb. Note that it doesn't mean that the address space is large
++ * enough to actually find space for such large guard objects.
++ *
++ * @const VMGO_SIZE_CLASSES
++ * The number of size classes in a slab.
++ * A slot size is always (1) a power of two and (2) at least PAGE_SIZE large.
++ *
++ * @const VMGO_COUNT_SHIFT_BITS
++ * The number of bits for the @c vgoc_count_shift field, which must represents
++ * the shift of @c vgoc_count, which itself has to be any power of two between
++ * 2 and 64.
++ *
++ * @const VMGO_QUARANTINED_BITS
++ * The number of bits for the @c vgoc_quarantined field, which needs to
++ * represent any value from 0 to 15 (64/4 - 1).
++ *
++ * @const VMGO_START_SHIFT
++ * By how many bits to shift @c vgoc_start to compute the practical starting
++ * VA for a guard object chunk. It implies that these are always at least
++ * aligned to a (1u << VMGO_START_SHIFT == 64k) boundary.
++ */
++#define VMGO_MAX_SIZE_SHIFT     40
++/*
++ * for some platforms PAGE_SHIFT isn't a constant, fallback to PAGE_MIN_SHIFT,
++ * it only wastes 2 entries in the array.
++ */
++#define VMGO_SIZE_CLASSES       (VMGO_MAX_SIZE_SHIFT - PAGE_MIN_SHIFT)
++#define VMGO_COUNT_SHIFT_BITS   3
++#define VMGO_QUARANTINED_BITS   4
++#define VMGO_START_SHIFT        16
++
+ typedef struct vm_guard_object_slab *vm_guard_object_slab_t;
+-struct vm_guard_object_chunk {
+-	uint8_t vgoc_count_shift : 4;
+-	uint8_t vgoc_quarantined : 4;
+-	vm_guard_object_slab_t vgoc_slab;
+-	uint32_t vgoc_start;
+-	uint8_t vgoc_granule;
+-	uint8_t vgoc_count;
+-	uint8_t vgoc_available;
+-	bitmap_t vgoc_bitmap;
+-	vm_map_store_val_ptr_t vgoc_prev;
+-	vm_map_store_val_ptr_t vgoc_next;
+-	vm_map_store_val_ptr_t vgoc_ptrs[8];
+-};
+-typedef struct vm_guard_object_chunk *vm_guard_object_chunk_t;
+-struct vm_guard_object_slab {
+-	vm_guard_object_chunk_t vgos_partial[28];
+-	vm_guard_object_chunk_t vgos_full[28];
+-};
+-struct vm_map_store_rsv {
+-	long long vmsr_start : 63;
+-	_Bool vmsr_is_entry : 1;
+-	uintptr_t vmsr_value;
+-};
+-typedef struct vm_map_store_rsv vm_map_store_rsv_t;
++
++/*!
++ * @brief
++ * The type for a guard object chunk.
++ *
++ * @discussion
++ * A guard object chunk is a collection of several slots of the same size,
++ * that are used to return randomly selected allocations, maintaining
++ * a guarantee of 25% density of guards that cause crashes when accessed.
++ *
++ * For a VM managed chunk, these invariants hold:
++ *
++ * - the number of bits set in vgoc_bitmap is equal to (vgoc_quarantined
++ *   + vgoc_available + #guards),
++ *
++ * - slots that are free have no entry covering its corresponding VA range
++ *   in the skiplist.
++ *
++ *
++ * For a user managed chunk, these invariants hold:
++ *
++ * - vgoc_available = 0, vgoc_quarantined = 0, vgoc_count = 64;
++ *
++ * - all the VA of the chunk is covered by entries regardless of the state of
++ *   the slots;
++ *
++ * - guarded slots (slots with their bit set in vgoc_bitmap) have no memory
++ *   entered in the pmap, and trying to access this memory (copy, fault, ...)
++ *   results in a protection failure.
++ *
++ *
++ * @see doc/allocators/guard-objects.md for the rationale.
++ *
++ * Chunk configuration (immutable)
++ * ~~~~~~~~~~~~~~~~~~~
++ *
++ * @field vgoc_slab             The owning slab for VM managed chunks.
++ *
++ * @field vgoc_start            A 32bit representation of the VA start for
++ *                              that chunk in its map, use @c vmgo_chunk_start()
++ *                              to convert into a proper @c vm_map_address_t.
++ *
++ * @field vgoc_granule          The slot size granule as a shift scale,
++ *                              in number of bytes. Meaning that the size
++ *                              of a slot is (1u << vgoc_granule).
++ *
++ * @field vgoc_count            The number of slots in the chunk.
++ *                              (always a power of two smaller or equal to 64).
++ *
++ * @field vgoc_count_shift      The number of slots in the chunk, as a shift.
++ *                              vgoc_count = 1u << vgoc_count_shift.
++ *
++ *
++ * Chunk slot state (serialized by the map interlock)
++ * ~~~~~~~~~~~~~~~~
++ *
++ * @field vgoc_quarantined      The number of quarantined slots
++ *                              (always strictly smaller than vgoc_count / 4)
++ *
++ * @field vgoc_available        The number of allocatable slots
++ *
++ * @field vgoc_bitmap           The bitmap of free/guarded slots
++ *
++ *                              For user managed chunks, the serialization is
++ *                              more subtle: the bitmap is updated atomically,
++ *                              under at least a shared lock on all the entries.
++ *                              Holding an exclusive lock guarantees stability
++ *
++ * @field vgoc_prev, vgoc_next  Linkage used to chain the chunk on its slab
++ *                              size class or the map's guard_object_user list.
++ *
++ * @field vgoc_ptrs             A skiplist of entries this chunk points to.
++ *
++ *
++ * Visually
++ * ~~~~~~~~
++ *
++ * Below is a graphical representation of a chunk for the parameters:
++ * - vgoc_count_shift = 3
++ * - vgoc_count       = 8
++ * - vgoc_bitmap      = 0xe9
++ *
++ *  vmgo_chunk_start()                                          vmgo_chunk_end()
++ *   │                       1 << vgoc_granule                               │
++ *   ▼                           ◀──────▶                                    ▼
++ *   ╔════════╤════════╤════════╤════════╤════════╤════════╤════════╤════════╗
++ *   ║ 0:free │ 1:used │ 2:used │ 3:free │ 4:used │ 5:free │ 6:free │ 7:free ║
++ *   ╚════════╧════════╧════════╧════════╧════════╧════════╧════════╧════════╝
++ *    ◀─────────────────────────────────────────────────────────────────────▶
++ *                               vmgo_chunk_size()
++ *
++ *
++ * For this configuration:
++ * - the chunk has 2 guards (8/4)
++ * - 3 chunks are used/allocated
++ * - because the chunk has enough free slots (more than twice the number of
++ *   guards) it won't have any quarantined slots and vgoc_available is 3.
++ *
++ * See doc/allocators/guard-objects.md for more details.
++ */
++typedef struct vm_guard_object_chunk {
++	/* immutable fields */
++	vm_guard_object_slab_t  vgoc_slab;
++	uint32_t                vgoc_start;
++	uint8_t                 vgoc_granule;
++	uint8_t                 vgoc_count;
++	uint8_t                 vgoc_count_shift : 4;
++
++	/* mutable fields, serialized by the map lock */
++	uint8_t                 vgoc_quarantined : 4;
++	uint8_t                 vgoc_available;
++	bitmap_t                vgoc_bitmap;
++
++	vm_map_store_val_ptr_t  vgoc_prev;
++	vm_map_store_val_ptr_t  vgoc_next;
++
++	vm_map_store_val_ptr_t  vgoc_ptrs[8];
++} *vm_guard_object_chunk_t;
++
++
++/*!
++ * @brief
++ * The type for a guard object slab.
++ *
++ * @discussion
++ * A guard object slab is a series of size-segregated list of guard object
++ * chunks. The @c vgos_full lists contain chunks that have no available slots
++ * (because they are all used or quarantined), and the @c vgos_partial lists
++ * contain chunks that have at least one element available for allocations.
++ * Empty chunks are not kept around, which is why there is no @c vgoc_empty
++ * list.
++ */
++typedef struct vm_guard_object_slab {
++	vm_guard_object_chunk_t vgos_partial[VMGO_SIZE_CLASSES];
++	vm_guard_object_chunk_t vgos_full[VMGO_SIZE_CLASSES];
++} *vm_guard_object_slab_t;
++
++/*!
++ * @brief
++ * A struct holding the information about an allocation reservation.
++ *
++ * @field vmsr_start            The start address for the reservation
++ * @field vmsr_is_chunk         Whether vmsr_value is a chunk or an entry.
++ * @field vmsr_value            (optional) a pointer to the entry right after
++ *                              this reservation, or the chunk containing
++ *                              the reservation.
++ */
++typedef struct vm_map_store_rsv {
++	long long               vmsr_start : 63;
++	bool                    vmsr_is_chunk : 1;
++	uintptr_t               vmsr_value;
++} vm_map_store_rsv_t;
++
++/*
++ * Packing parameters for VM map store nodes
++ */
++#define VMN_PACKED_PTR_BITS         32
++#define VMN_PACKED_PTR_SHIFT        8
++#define VMN_PACKED_PTR_BASE         ((uintptr_t)VM_MIN_KERNEL_AND_KEXT_ADDRESS)
++
++/*
++ * Packing parameters for VM map entries
++ */
++#define VME_PACKED_PTR_BITS         31
++#define VME_PACKED_PTR_SHIFT        6
++#define VME_PACKED_PTR_BASE         ((uintptr_t)VM_MIN_KERNEL_AND_KEXT_ADDRESS)
++
++#define VM_MAP_HDR_PAGE_SHIFT(hdr)  ((hdr)->page_shift)
++#define VM_MAP_HDR_PAGE_SIZE(hdr)   (1 << VM_MAP_HDR_PAGE_SHIFT((hdr)))
++#define VM_MAP_HDR_PAGE_MASK(hdr)   (VM_MAP_HDR_PAGE_SIZE((hdr)) - 1)
++
++__exported_pop
++__END_DECLS
+ 
+ #endif /* XNU13432_OSFMK_VM_VM_MAP_STORE_TYPES_INTERNAL_H */

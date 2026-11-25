@@ -1,0 +1,60 @@
+From 9bf9d71491f9e4c45d8e34d50755569ea787118e Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 02:26:52 +0000
+Subject: [PATCH 09/13] Restore all RBBR sysctl tunables with reference values
+
+DWARF variable locations map every RBBR tunable to its address in
+0xfffffe0007cbf44c-0x7cbf4c0; the reference image supplies the initial
+values.  Declare all 30 ints (including the shared throttle_be) with
+those values so the reconstructed bodies read the real parameters.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ bsd/netinet/tcp_rbbr.c | 34 +++++++++++++++++++++++++++++++---
+ 1 file changed, 31 insertions(+), 3 deletions(-)
+
+diff --git a/bsd/netinet/tcp_rbbr.c b/bsd/netinet/tcp_rbbr.c
+index c095568c1..d6a7d5b77 100644
+--- a/bsd/netinet/tcp_rbbr.c
++++ b/bsd/netinet/tcp_rbbr.c
+@@ -28,9 +28,37 @@ void tcp_rbbr_switch_to(struct tcpcb *tp);
+ 
+ KALLOC_TYPE_DEFINE(tcp_rbbr_state_zone, struct tcp_rbbr_state, NET_KT_DEFAULT);
+ 
+-/* Sysctl-tunable RBBR parameters; values from the reference image. */
+-uint32_t rbbr_rtt_probe_rwnd_mss = 10;   /* 0xfffffe0007cbf450 */
+-uint32_t rbbr_rtt_probe_period = 30;     /* 0xfffffe0007cbf44c */
++/* Sysctl-tunable RBBR parameters; values read from 0xfffffe0007cbf44c-4c0. */
++int rbbr_rtt_probe_period = 30;
++int rbbr_rtt_probe_rwnd_mss = 10;
++int rbbr_rtt_probe_min_duration = 1000;
++int rbbr_delay_thresh_mad_mult = 2;
++int rbbr_target_delay_ms = 40;
++int rbbr_probe_rwnd_init_gain = 75;
++int rbbr_probe_rwnd_main_gain = 125;
++int rbbr_probe_rwnd_max_cycles = 30;
++int rbbr_probe_cycle_duration = 1000;
++int rbbr_cruise_backoff = 90;
++int rbbr_cruise_backoff_times = 2;
++int rbbr_min_rwnd_mss = 2;
++int rbbr_startup_gain = 200;
++int rbbr_drain_gain = 75;
++int rbbr_drain_probe_rtt_gain = 75;
++int rbbr_low_utilization_thresh = 40;
++int rbbr_queue_detect_increases = 3;
++int rbbr_queue_detect_noise_base_ms = 5;
++int rbbr_queue_detect_noise_mad_mult = 2;
++int rbbr_queue_detect_drop_pct = 30;
++int rbbr_queue_detect_fraction_pct = 50;
++int throttle_be = 1;
++int rbbr_startup_cycle_rtts = 1;
++int rbbr_cycle_rtts = 2;
++int rbbr_rtt_probe_cycle_rtts = 4;
++int rbbr_round_min_ms = 5;
++int rbbr_rtt_probe_max_duration = 5000;
++int rbbr_rtt_probe_plateau_rounds = 2;
++int rbbr_cruise_cycles = 8;
++int rbbr_reprobe_gain = 110;
+ 
+ struct tcp_rcv_cc_algo tcp_cc_rbbr = {
+ 	.name = "rbbr",

@@ -1,0 +1,708 @@
+From 62471825bf61b4ee04fcb9582c363e23ec3d4de3 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 02:18:06 +0000
+Subject: [PATCH 03/13] Recover 64 stub bodies from the reference kernel image
+
+Disassembly-driven reconstruction of the smallest recovered functions:
+
+- 16 immediate-return void bodies and 11 NULL-pointer getters in the
+  PPL/exclaves/APT stubs, plus three zero-returning integer helpers.
+- Five KERN_NOT_SUPPORTED and two KERN_FAILURE returns (exclaves
+  surface root, DRAM ECC, APT external entry points).
+- All 19 sptm_gen3dart_* unsupported paths recover the exact panic
+  format string, function name, file and line (42-60).
+- image4_v2_interface_register: single-assignment interface pointer
+  with the reference "already set" panic at line 13.
+- hv_trap_vm_{map,unmap,protect}: tail calls into
+  hv_space_map_op_nested with selectors 0xc6000015-17.
+- hv_trap_vcpu_sysregs_sync: HV_NO_DEVICE when the current thread has
+  no hv_thread_target.
+- ecc_panic_non_acc and APT no-op/zero-fill helpers.
+
+Remaining explicit stubs: 309 (from 373).
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ libkern/image4_v2/image4_v2.c                |  8 ++-
+ osfmk/arm64/hv/hv_vcpu_paranested.c          | 10 +++-
+ osfmk/arm64/hv/hv_vm_paranested.c            | 12 ++--
+ osfmk/arm64/ppl/nvmeppl.c                    |  3 +-
+ osfmk/arm64/ppl/sart.c                       |  3 +-
+ osfmk/arm64/ppl/sptm_stubs.c                 | 57 ++++++------------
+ osfmk/arm64/ppl/t6000dart.c                  |  6 +-
+ osfmk/arm64/ppl/t8020dart.c                  |  6 +-
+ osfmk/arm64/ppl/t8110dart.c                  | 12 ++--
+ osfmk/arm64/ppl/uat.c                        |  3 +-
+ osfmk/kern/dramecc_error_logging.c           |  6 +-
+ osfmk/kern/exclaves_coreaudio.c              |  3 +-
+ osfmk/kern/exclaves_exsurface.c              | 12 ++--
+ osfmk/kern/task_apt.c                        |  6 +-
+ pexpert/arm/hwtrace/cputrace_apt_interface.c | 62 +++++++-------------
+ 15 files changed, 81 insertions(+), 128 deletions(-)
+
+diff --git a/libkern/image4_v2/image4_v2.c b/libkern/image4_v2/image4_v2.c
+index f92e117ae..3fac56c3c 100644
+--- a/libkern/image4_v2/image4_v2.c
++++ b/libkern/image4_v2/image4_v2.c
+@@ -11,10 +11,14 @@
+ 
+ #define RECON_LIBKERN_IMAGE4_V2_IMAGE4_V2_C 1
+ 
++static const Image4KernelInterface_t *image4_v2_interface;
++
+ /* libkern/image4_v2/image4_v2.c:10 */
+ void
+ image4_v2_interface_register(const Image4KernelInterface_t * interface)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: image4_v2_interface_register");
++	if (image4_v2_interface != NULL) {
++		panic("libImage4_V2 interface already set @%s:%d", "image4_v2.c", 13);
++	}
++	image4_v2_interface = interface;
+ }
+diff --git a/osfmk/arm64/hv/hv_vcpu_paranested.c b/osfmk/arm64/hv/hv_vcpu_paranested.c
+index 19189d3ce..12e9e48e4 100644
+--- a/osfmk/arm64/hv/hv_vcpu_paranested.c
++++ b/osfmk/arm64/hv/hv_vcpu_paranested.c
+@@ -11,9 +11,13 @@
+ #include <kern/debug.h>
+ #include <kern/zalloc.h>
+ #include <sys/systm.h>
++#include <kern/thread.h>
+ 
+ #define RECON_OSFMK_ARM64_HV_HV_VCPU_PARANESTED_C 1
+ 
++/* Hypervisor.framework hv_error.h (not present in the public tree). */
++#define HV_NO_DEVICE 0xfae94006
++
+ /* osfmk/arm64/hv/hv_vcpu_paranested.c:42 */
+ void
+ _hv_free_context(vm_offset_t context_addr, const hv_paranested_measurement_t * measurement)
+@@ -74,8 +78,10 @@ hv_trap_vcpu_destroy(uint64_t arg)
+ hv_return_t
+ hv_trap_vcpu_sysregs_sync(uint64_t arg)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: hv_trap_vcpu_sysregs_sync");
++	if (current_thread()->hv_thread_target == NULL) {
++		return HV_NO_DEVICE;
++	}
++	return 0;
+ }
+ 
+ /* osfmk/arm64/hv/hv_vcpu_paranested.c:332 */
+diff --git a/osfmk/arm64/hv/hv_vm_paranested.c b/osfmk/arm64/hv/hv_vm_paranested.c
+index 948ce2717..b45e32caf 100644
+--- a/osfmk/arm64/hv/hv_vm_paranested.c
++++ b/osfmk/arm64/hv/hv_vm_paranested.c
+@@ -14,6 +14,9 @@
+ 
+ #define RECON_OSFMK_ARM64_HV_HV_VM_PARANESTED_C 1
+ 
++/* Declared in hv_space_paranested.c; prototype omitted from the public tree. */
++extern hv_return_t hv_space_map_op_nested(user_addr_t mip, uint64_t fn);
++
+ /* osfmk/arm64/hv/hv_vm_paranested.c:58 */
+ hv_return_t
+ hv_nested_call(hv_nested_call_params_t * pnv_args)
+@@ -50,24 +53,21 @@ hv_trap_vm_create(uint64_t arg)
+ hv_return_t
+ hv_trap_vm_map(uint64_t arg)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: hv_trap_vm_map");
++	return hv_space_map_op_nested(arg, 0xc6000015);
+ }
+ 
+ /* osfmk/arm64/hv/hv_vm_paranested.c:270 */
+ hv_return_t
+ hv_trap_vm_unmap(uint64_t arg)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: hv_trap_vm_unmap");
++	return hv_space_map_op_nested(arg, 0xc6000016);
+ }
+ 
+ /* osfmk/arm64/hv/hv_vm_paranested.c:276 */
+ hv_return_t
+ hv_trap_vm_protect(uint64_t arg)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: hv_trap_vm_protect");
++	return hv_space_map_op_nested(arg, 0xc6000017);
+ }
+ 
+ /* osfmk/arm64/hv/hv_vm_paranested.c:289 */
+diff --git a/osfmk/arm64/ppl/nvmeppl.c b/osfmk/arm64/ppl/nvmeppl.c
+index ac8d976a3..6cbd55e6e 100644
+--- a/osfmk/arm64/ppl/nvmeppl.c
++++ b/osfmk/arm64/ppl/nvmeppl.c
+@@ -18,6 +18,5 @@
+ const ppl_iommu_desc *
+ nvme_ppl_get_desc(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: nvme_ppl_get_desc");
++	return NULL;
+ }
+diff --git a/osfmk/arm64/ppl/sart.c b/osfmk/arm64/ppl/sart.c
+index 57d294c29..479235a7d 100644
+--- a/osfmk/arm64/ppl/sart.c
++++ b/osfmk/arm64/ppl/sart.c
+@@ -18,6 +18,5 @@
+ const ppl_iommu_desc *
+ sart_get_desc(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: sart_get_desc");
++	return NULL;
+ }
+diff --git a/osfmk/arm64/ppl/sptm_stubs.c b/osfmk/arm64/ppl/sptm_stubs.c
+index 4274be0c1..04d8eca5b 100644
+--- a/osfmk/arm64/ppl/sptm_stubs.c
++++ b/osfmk/arm64/ppl/sptm_stubs.c
+@@ -18,150 +18,131 @@
+ void
+ sptm_gen3dart_init(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: sptm_gen3dart_init");
++	panic("Unsupported function %s @%s:%d", "sptm_gen3dart_init", "sptm_stubs.c", 42);
+ }
+ 
+ /* osfmk/arm64/ppl/sptm_stubs.c:43 */
+ void
+ sptm_gen3dart_map_table(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: sptm_gen3dart_map_table");
++	panic("Unsupported function %s @%s:%d", "sptm_gen3dart_map_table", "sptm_stubs.c", 43);
+ }
+ 
+ /* osfmk/arm64/ppl/sptm_stubs.c:44 */
+ void
+ sptm_gen3dart_unmap_table(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: sptm_gen3dart_unmap_table");
++	panic("Unsupported function %s @%s:%d", "sptm_gen3dart_unmap_table", "sptm_stubs.c", 44);
+ }
+ 
+ /* osfmk/arm64/ppl/sptm_stubs.c:45 */
+ void
+ sptm_gen3dart_map(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: sptm_gen3dart_map");
++	panic("Unsupported function %s @%s:%d", "sptm_gen3dart_map", "sptm_stubs.c", 45);
+ }
+ 
+ /* osfmk/arm64/ppl/sptm_stubs.c:46 */
+ void
+ sptm_gen3dart_unmap(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: sptm_gen3dart_unmap");
++	panic("Unsupported function %s @%s:%d", "sptm_gen3dart_unmap", "sptm_stubs.c", 46);
+ }
+ 
+ /* osfmk/arm64/ppl/sptm_stubs.c:47 */
+ void
+ sptm_gen3dart_powerdown(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: sptm_gen3dart_powerdown");
++	panic("Unsupported function %s @%s:%d", "sptm_gen3dart_powerdown", "sptm_stubs.c", 47);
+ }
+ 
+ /* osfmk/arm64/ppl/sptm_stubs.c:48 */
+ void
+ sptm_gen3dart_powerup(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: sptm_gen3dart_powerup");
++	panic("Unsupported function %s @%s:%d", "sptm_gen3dart_powerup", "sptm_stubs.c", 48);
+ }
+ 
+ /* osfmk/arm64/ppl/sptm_stubs.c:49 */
+ void
+ sptm_gen3dart_disable_translation(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: sptm_gen3dart_disable_translation");
++	panic("Unsupported function %s @%s:%d", "sptm_gen3dart_disable_translation", "sptm_stubs.c", 49);
+ }
+ 
+ /* osfmk/arm64/ppl/sptm_stubs.c:50 */
+ void
+ sptm_gen3dart_enable_translation(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: sptm_gen3dart_enable_translation");
++	panic("Unsupported function %s @%s:%d", "sptm_gen3dart_enable_translation", "sptm_stubs.c", 50);
+ }
+ 
+ /* osfmk/arm64/ppl/sptm_stubs.c:51 */
+ void
+ sptm_gen3dart_clear_err(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: sptm_gen3dart_clear_err");
++	panic("Unsupported function %s @%s:%d", "sptm_gen3dart_clear_err", "sptm_stubs.c", 51);
+ }
+ 
+ /* osfmk/arm64/ppl/sptm_stubs.c:52 */
+ void
+ sptm_gen3dart_clear_perf_interrupts(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: sptm_gen3dart_clear_perf_interrupts");
++	panic("Unsupported function %s @%s:%d", "sptm_gen3dart_clear_perf_interrupts", "sptm_stubs.c", 52);
+ }
+ 
+ /* osfmk/arm64/ppl/sptm_stubs.c:53 */
+ void
+ sptm_gen3dart_clear_all_interrupts(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: sptm_gen3dart_clear_all_interrupts");
++	panic("Unsupported function %s @%s:%d", "sptm_gen3dart_clear_all_interrupts", "sptm_stubs.c", 53);
+ }
+ 
+ /* osfmk/arm64/ppl/sptm_stubs.c:54 */
+ void
+ sptm_gen3dart_disable_all_interrupts(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: sptm_gen3dart_disable_all_interrupts");
++	panic("Unsupported function %s @%s:%d", "sptm_gen3dart_disable_all_interrupts", "sptm_stubs.c", 54);
+ }
+ 
+ /* osfmk/arm64/ppl/sptm_stubs.c:55 */
+ void
+ sptm_gen3dart_clear_exception(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: sptm_gen3dart_clear_exception");
++	panic("Unsupported function %s @%s:%d", "sptm_gen3dart_clear_exception", "sptm_stubs.c", 55);
+ }
+ 
+ /* osfmk/arm64/ppl/sptm_stubs.c:56 */
+ void
+ sptm_gen3dart_query_tlb(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: sptm_gen3dart_query_tlb");
++	panic("Unsupported function %s @%s:%d", "sptm_gen3dart_query_tlb", "sptm_stubs.c", 56);
+ }
+ 
+ /* osfmk/arm64/ppl/sptm_stubs.c:57 */
+ void
+ sptm_gen3dart_set_smmu_window(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: sptm_gen3dart_set_smmu_window");
++	panic("Unsupported function %s @%s:%d", "sptm_gen3dart_set_smmu_window", "sptm_stubs.c", 57);
+ }
+ 
+ /* osfmk/arm64/ppl/sptm_stubs.c:58 */
+ void
+ sptm_gen3dart_read_smmu_stt_index(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: sptm_gen3dart_read_smmu_stt_index");
++	panic("Unsupported function %s @%s:%d", "sptm_gen3dart_read_smmu_stt_index", "sptm_stubs.c", 58);
+ }
+ 
+ /* osfmk/arm64/ppl/sptm_stubs.c:59 */
+ void
+ sptm_gen3dart_clamp_tlimits(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: sptm_gen3dart_clamp_tlimits");
++	panic("Unsupported function %s @%s:%d", "sptm_gen3dart_clamp_tlimits", "sptm_stubs.c", 59);
+ }
+ 
+ /* osfmk/arm64/ppl/sptm_stubs.c:60 */
+ void
+ sptm_gen3dart_test_translation(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: sptm_gen3dart_test_translation");
++	panic("Unsupported function %s @%s:%d", "sptm_gen3dart_test_translation", "sptm_stubs.c", 60);
+ }
+diff --git a/osfmk/arm64/ppl/t6000dart.c b/osfmk/arm64/ppl/t6000dart.c
+index 4beb85964..edb90c942 100644
+--- a/osfmk/arm64/ppl/t6000dart.c
++++ b/osfmk/arm64/ppl/t6000dart.c
+@@ -18,14 +18,12 @@
+ const void *
+ t6000dart_get_desc(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: t6000dart_get_desc");
++	return NULL;
+ }
+ 
+ /* osfmk/arm64/ppl/t6000dart.c:45 */
+ const void *
+ t6000dart_vo_tte(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: t6000dart_vo_tte");
++	return NULL;
+ }
+diff --git a/osfmk/arm64/ppl/t8020dart.c b/osfmk/arm64/ppl/t8020dart.c
+index 5ab71d96f..a3428669a 100644
+--- a/osfmk/arm64/ppl/t8020dart.c
++++ b/osfmk/arm64/ppl/t8020dart.c
+@@ -18,14 +18,12 @@
+ const ppl_iommu_desc *
+ t8020dart_get_desc(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: t8020dart_get_desc");
++	return NULL;
+ }
+ 
+ /* osfmk/arm64/ppl/t8020dart.c:47 */
+ const t8020dart_tte_t *
+ t8020dart_vo_tte(const t8020dart_ppl * state, uint32_t sid, ppnum_t page_offset, unsigned int tt_level)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: t8020dart_vo_tte");
++	return NULL;
+ }
+diff --git a/osfmk/arm64/ppl/t8110dart.c b/osfmk/arm64/ppl/t8110dart.c
+index 8f149d153..cbb223933 100644
+--- a/osfmk/arm64/ppl/t8110dart.c
++++ b/osfmk/arm64/ppl/t8110dart.c
+@@ -18,30 +18,26 @@
+ const void *
+ t8110dart_get_desc(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: t8110dart_get_desc");
++	return NULL;
+ }
+ 
+ /* osfmk/arm64/ppl/t8110dart.c:48 */
+ const void *
+ t8110dart_vo_tte(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: t8110dart_vo_tte");
++	return NULL;
+ }
+ 
+ /* osfmk/arm64/ppl/t8110dart.c:54 */
+ uint32_t
+ t8110dart_vo_tt_index(const void * state, uint32_t sid, uint32_t page_offset, unsigned int table_level, _Bool in_error)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: t8110dart_vo_tt_index");
++	return 0;
+ }
+ 
+ /* osfmk/arm64/ppl/t8110dart.c:60 */
+ unsigned int
+ t8110dart_max_translation_levels(const void * state, uint32_t sid)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: t8110dart_max_translation_levels");
++	return 0;
+ }
+diff --git a/osfmk/arm64/ppl/uat.c b/osfmk/arm64/ppl/uat.c
+index a7771767c..16df1ae96 100644
+--- a/osfmk/arm64/ppl/uat.c
++++ b/osfmk/arm64/ppl/uat.c
+@@ -18,6 +18,5 @@
+ const ppl_iommu_desc *
+ uat_get_desc(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: uat_get_desc");
++	return NULL;
+ }
+diff --git a/osfmk/kern/dramecc_error_logging.c b/osfmk/kern/dramecc_error_logging.c
+index b78cc34b5..364f95707 100644
+--- a/osfmk/kern/dramecc_error_logging.c
++++ b/osfmk/kern/dramecc_error_logging.c
+@@ -18,16 +18,14 @@
+ void
+ ecc_panic_non_acc(uint64_t physical_address)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: ecc_panic_non_acc");
++	panic("ECC panic on a non-ECC capable platform @%s:%d", "dramecc_error_logging.c", 304);
+ }
+ 
+ /* osfmk/kern/dramecc_error_logging.c:308 */
+ kern_return_t
+ ecc_log_memory_error_ue(uint64_t physical_address, ecc_flags_t ecc_flags)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: ecc_log_memory_error_ue");
++	return KERN_NOT_SUPPORTED;
+ }
+ 
+ /* osfmk/kern/dramecc_error_logging.c:315 */
+diff --git a/osfmk/kern/exclaves_coreaudio.c b/osfmk/kern/exclaves_coreaudio.c
+index fc79146a5..1512bc5df 100644
+--- a/osfmk/kern/exclaves_coreaudio.c
++++ b/osfmk/kern/exclaves_coreaudio.c
+@@ -18,6 +18,5 @@
+ void
+ exclaves_coreaudio_register_orchestration_callbacks(struct exclaves_coreaudio_orchestration_callbacks * callbacks)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: exclaves_coreaudio_register_orchestration_callbacks");
++	/* Reference body returns immediately. */
+ }
+diff --git a/osfmk/kern/exclaves_exsurface.c b/osfmk/kern/exclaves_exsurface.c
+index 64046ddf1..1c2b3629a 100644
+--- a/osfmk/kern/exclaves_exsurface.c
++++ b/osfmk/kern/exclaves_exsurface.c
+@@ -18,30 +18,26 @@
+ kern_return_t
+ exclaves_exsurfaceroot_lookup(const char * service_name, uint64_t * exsurfaceroot_id)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: exclaves_exsurfaceroot_lookup");
++	return KERN_NOT_SUPPORTED;
+ }
+ 
+ /* osfmk/kern/exclaves_exsurface.c:369 */
+ kern_return_t
+ exclaves_exsurfaceroot_surface_usecount_update(uint64_t exsurfaceroot_id, uint64_t darwin_id, int64_t usecount_increment_decrement)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: exclaves_exsurfaceroot_surface_usecount_update");
++	return KERN_NOT_SUPPORTED;
+ }
+ 
+ /* osfmk/kern/exclaves_exsurface.c:377 */
+ kern_return_t
+ exclaves_exsurfaceroot_surface_memory_range(uint64_t exsurfaceroot_id, uint64_t darwin_id, size_t * offset_out, size_t * size_out)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: exclaves_exsurfaceroot_surface_memory_range");
++	return KERN_NOT_SUPPORTED;
+ }
+ 
+ /* osfmk/kern/exclaves_exsurface.c:385 */
+ kern_return_t
+ exclaves_exsurfaceroot_backing_surface_memory_range(uint64_t exsurfaceroot_id, size_t * size_out)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: exclaves_exsurfaceroot_backing_surface_memory_range");
++	return KERN_NOT_SUPPORTED;
+ }
+diff --git a/osfmk/kern/task_apt.c b/osfmk/kern/task_apt.c
+index 5ceef7872..ed38ed4d3 100644
+--- a/osfmk/kern/task_apt.c
++++ b/osfmk/kern/task_apt.c
+@@ -18,14 +18,12 @@
+ kern_return_t
+ task_set_apt_enabled_external(mach_port_name_t name, task_apt_token_t * atp)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: task_set_apt_enabled_external");
++	return KERN_FAILURE;
+ }
+ 
+ /* osfmk/kern/task_apt.c:194 */
+ kern_return_t
+ task_set_apt_disabled_external(task_apt_token_t at)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: task_set_apt_disabled_external");
++	return KERN_FAILURE;
+ }
+diff --git a/pexpert/arm/hwtrace/cputrace_apt_interface.c b/pexpert/arm/hwtrace/cputrace_apt_interface.c
+index 77eec9f3a..1fb358b5e 100644
+--- a/pexpert/arm/hwtrace/cputrace_apt_interface.c
++++ b/pexpert/arm/hwtrace/cputrace_apt_interface.c
+@@ -15,8 +15,7 @@
+ void
+ apt_thread_on_cpu_impl(thread_t old, thread_t new)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: apt_thread_on_cpu_impl");
++	(void)__builtin_arm_rsr64("CNTVCT_EL0");
+ }
+ 
+ /* pexpert/arm/hwtrace/cputrace_apt_interface.c:101 */
+@@ -39,150 +38,133 @@ apt_unregister_callback(void)
+ _Bool
+ apt_current_task_traceable(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: apt_current_task_traceable");
++	return 0;
+ }
+ 
+ /* pexpert/arm/hwtrace/cputrace_apt_interface.c:178 */
+ void *
+ apt_get_panic_trace_header(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: apt_get_panic_trace_header");
++	return NULL;
+ }
+ 
+ /* pexpert/arm/hwtrace/cputrace_apt_interface.c:188 */
+ void
+ apt_get_panic_trace_carveout_info(uintptr_t * va, uintptr_t * pa, uint64_t * size)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: apt_get_panic_trace_carveout_info");
++	*va = 0;
++	*pa = 0;
++	*size = 0;
+ }
+ 
+ /* pexpert/arm/hwtrace/cputrace_apt_interface.c:202 */
+ void
+ apt_disable_panic_handler(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: apt_disable_panic_handler");
++	/* Reference body returns immediately. */
+ }
+ 
+ /* pexpert/arm/hwtrace/cputrace_apt_interface.c:210 */
+ void *
+ apt_get_panic_trace(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: apt_get_panic_trace");
++	return NULL;
+ }
+ 
+ /* pexpert/arm/hwtrace/cputrace_apt_interface.c:223 */
+ void
+ sptm_cputrace_is_mode_supported(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: sptm_cputrace_is_mode_supported");
++	/* Reference body returns immediately. */
+ }
+ 
+ /* pexpert/arm/hwtrace/cputrace_apt_interface.c:224 */
+ void
+ sptm_cputrace_get_carveout_addr(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: sptm_cputrace_get_carveout_addr");
++	/* Reference body returns immediately. */
+ }
+ 
+ /* pexpert/arm/hwtrace/cputrace_apt_interface.c:225 */
+ void
+ sptm_cputrace_get_carveout_size(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: sptm_cputrace_get_carveout_size");
++	/* Reference body returns immediately. */
+ }
+ 
+ /* pexpert/arm/hwtrace/cputrace_apt_interface.c:226 */
+ void
+ sptm_cputrace_set_base(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: sptm_cputrace_set_base");
++	/* Reference body returns immediately. */
+ }
+ 
+ /* pexpert/arm/hwtrace/cputrace_apt_interface.c:227 */
+ void
+ sptm_cputrace_start(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: sptm_cputrace_start");
++	/* Reference body returns immediately. */
+ }
+ 
+ /* pexpert/arm/hwtrace/cputrace_apt_interface.c:228 */
+ void
+ sptm_cputrace_stop(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: sptm_cputrace_stop");
++	/* Reference body returns immediately. */
+ }
+ 
+ /* pexpert/arm/hwtrace/cputrace_apt_interface.c:229 */
+ void
+ sptm_cputrace_va_frame_lock(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: sptm_cputrace_va_frame_lock");
++	/* Reference body returns immediately. */
+ }
+ 
+ /* pexpert/arm/hwtrace/cputrace_apt_interface.c:230 */
+ void
+ sptm_cputrace_va_frame_unlock(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: sptm_cputrace_va_frame_unlock");
++	/* Reference body returns immediately. */
+ }
+ 
+ /* pexpert/arm/hwtrace/cputrace_apt_interface.c:231 */
+ void
+ sptm_cputrace_va_init(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: sptm_cputrace_va_init");
++	/* Reference body returns immediately. */
+ }
+ 
+ /* pexpert/arm/hwtrace/cputrace_apt_interface.c:232 */
+ void
+ sptm_cputrace_va_deinit(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: sptm_cputrace_va_deinit");
++	/* Reference body returns immediately. */
+ }
+ 
+ /* pexpert/arm/hwtrace/cputrace_apt_interface.c:233 */
+ void
+ sptm_cputrace_va_set_base(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: sptm_cputrace_va_set_base");
++	/* Reference body returns immediately. */
+ }
+ 
+ /* pexpert/arm/hwtrace/cputrace_apt_interface.c:234 */
+ void
+ sptm_cputrace_va_start(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: sptm_cputrace_va_start");
++	/* Reference body returns immediately. */
+ }
+ 
+ /* pexpert/arm/hwtrace/cputrace_apt_interface.c:235 */
+ void
+ sptm_cputrace_va_stop(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: sptm_cputrace_va_stop");
++	/* Reference body returns immediately. */
+ }
+ 
+ /* pexpert/arm/hwtrace/cputrace_apt_interface.c:236 */
+ void
+ sptm_retype(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: sptm_retype");
++	/* Reference body returns immediately. */
+ }

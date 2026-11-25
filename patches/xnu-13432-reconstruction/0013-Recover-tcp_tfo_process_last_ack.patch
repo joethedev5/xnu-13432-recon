@@ -1,0 +1,36 @@
+From afcd948d693ee855afb658392d2ba025c6e62371 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 02:29:13 +0000
+Subject: [PATCH 13/13] Recover tcp_tfo_process_last_ack
+
+If the received TFO cookie is valid, clear the client-connected flag,
+drop tcp_tfo_halfcnt and VERIFY it did not go negative, then clear
+TFO_F_COOKIE_VALID.  Matches the reference's assfail path
+("tcp_tfo_halfcnt >= 0", line 245).
+
+Remaining explicit stubs: 295.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ bsd/netinet/tcp_fastopen.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/bsd/netinet/tcp_fastopen.c b/bsd/netinet/tcp_fastopen.c
+index dc48b40c5..c8391971d 100644
+--- a/bsd/netinet/tcp_fastopen.c
++++ b/bsd/netinet/tcp_fastopen.c
+@@ -62,8 +62,12 @@ tcp_tfo_synack_faulty_middlebox(struct tcpcb * tp, struct socket * so, struct tc
+ void
+ tcp_tfo_process_last_ack(struct tcpcb * tp, uint8_t * isconnected)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_tfo_process_last_ack");
++	if ((tp->t_tfo_flags & TFO_F_COOKIE_VALID) != 0) {
++		*isconnected = 0;
++		OSDecrementAtomic(&tcp_tfo_halfcnt);
++		VERIFY(tcp_tfo_halfcnt >= 0);
++		tp->t_tfo_flags &= ~TFO_F_COOKIE_VALID;
++	}
+ }
+ 
+ /* bsd/netinet/tcp_fastopen.c:252 */

@@ -1,0 +1,286 @@
+From 7ca91e91c6b678d6bbff7dc6ee0e36f86c44ccd6 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 02:23:59 +0000
+Subject: [PATCH 05/13] Recover tcp_rbbr_rwnd_init and add t_rbbr_state to
+ tcpcb
+
+Disassembly shows the reference computes the initial RBBR window as
+10 * MSS, rounds it down to an MSS multiple, clamps it to the maximum
+window allowed by rcv_scale, and marks the window change pending.
+The multiplier (10) is read from 0xfffffe0007cbf450 in the reference
+image.
+
+Add the missing 13432 tcpcb member t_rbbr_state between t_rlstate and
+rcv_srtt, and include each reconstructed header from its matching new
+source file.
+
+Remaining explicit stubs: 308.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ bsd/kern/kern_exec_security.c                |  1 +
+ bsd/netinet/tcp_ecn.c                        |  1 +
+ bsd/netinet/tcp_fastopen.c                   |  1 +
+ bsd/netinet/tcp_rbbr.c                       | 24 ++++++++++++++++++--
+ bsd/netinet/tcp_recovery.c                   |  1 +
+ bsd/netinet/tcp_rtt.c                        |  1 +
+ bsd/netinet/tcp_segment.c                    |  1 +
+ bsd/netinet/tcp_timer_advanced.c             |  1 +
+ bsd/netinet/tcp_var.h                        |  1 +
+ iokit/Kernel/IOAnalytics.cpp                 |  1 +
+ iokit/Kernel/IOUnifiedAddressTranslator.cpp  |  1 +
+ osfmk/arm64/ppl/t8020dart.c                  |  1 +
+ osfmk/arm64/ppl/uat.c                        |  1 +
+ osfmk/kern/matchmaker.c                      |  1 +
+ osfmk/kern/threadpair.c                      |  1 +
+ osfmk/kern/virtual_env.c                     |  1 +
+ osfmk/vm/vm_page_telemetry.c                 |  1 +
+ pexpert/arm/hwtrace/cputrace_apt_interface.c |  1 +
+ 18 files changed, 39 insertions(+), 2 deletions(-)
+
+diff --git a/bsd/kern/kern_exec_security.c b/bsd/kern/kern_exec_security.c
+index 18e4c1660..e1716872d 100644
+--- a/bsd/kern/kern_exec_security.c
++++ b/bsd/kern/kern_exec_security.c
+@@ -9,6 +9,7 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/kernel.h>
++#include <kern/kern_exec_security.h>
+ 
+ #define RECON_BSD_KERN_KERN_EXEC_SECURITY_C 1
+ 
+diff --git a/bsd/netinet/tcp_ecn.c b/bsd/netinet/tcp_ecn.c
+index 1cbaf8293..fc2cde1a5 100644
+--- a/bsd/netinet/tcp_ecn.c
++++ b/bsd/netinet/tcp_ecn.c
+@@ -9,6 +9,7 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/kernel.h>
++#include <netinet/tcp_ecn.h>
+ 
+ #define RECON_BSD_NETINET_TCP_ECN_C 1
+ 
+diff --git a/bsd/netinet/tcp_fastopen.c b/bsd/netinet/tcp_fastopen.c
+index 7b2103c87..5f4958ff4 100644
+--- a/bsd/netinet/tcp_fastopen.c
++++ b/bsd/netinet/tcp_fastopen.c
+@@ -9,6 +9,7 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/kernel.h>
++#include <netinet/tcp_fastopen.h>
+ 
+ #define RECON_BSD_NETINET_TCP_FASTOPEN_C 1
+ 
+diff --git a/bsd/netinet/tcp_rbbr.c b/bsd/netinet/tcp_rbbr.c
+index a89e70792..a5be40a00 100644
+--- a/bsd/netinet/tcp_rbbr.c
++++ b/bsd/netinet/tcp_rbbr.c
+@@ -9,6 +9,7 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/kernel.h>
++#include <netinet/tcp_rbbr.h>
+ 
+ #define RECON_BSD_NETINET_TCP_RBBR_C 1
+ 
+@@ -288,8 +289,27 @@ tcp_rbbr_cleanup(struct tcpcb * tp)
+ void
+ tcp_rbbr_rwnd_init(struct tcpcb * tp)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_rbbr_rwnd_init");
++	struct tcp_rbbr_state *rbbr = tp->t_rbbr_state;
++	uint32_t rwnd;
++	uint32_t max_win;
++
++	if (rbbr == NULL) {
++		return;
++	}
++
++	/*
++	 * Initial RBBR window: 10 * MSS, rounded down to an MSS multiple
++	 * and clamped to the largest window the receive scale allows.
++	 * The reference image stores the multiplier (10) at
++	 * 0xfffffe0007cbf450.
++	 */
++	rwnd = tp->t_maxseg * 10;
++	rbbr->rwnd_est = rwnd;
++
++	rwnd = (rwnd + (tp->t_maxseg >> 1)) / tp->t_maxseg * tp->t_maxseg;
++	max_win = 0xffffu << tp->rcv_scale;
++	rbbr->win = rwnd < max_win ? rwnd : max_win;
++	rbbr->win_change_pending = 1;
+ }
+ 
+ /* bsd/netinet/tcp_rbbr.c:1577 */
+diff --git a/bsd/netinet/tcp_recovery.c b/bsd/netinet/tcp_recovery.c
+index da7f67d6c..7413c5a31 100644
+--- a/bsd/netinet/tcp_recovery.c
++++ b/bsd/netinet/tcp_recovery.c
+@@ -9,6 +9,7 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/kernel.h>
++#include <netinet/tcp_recovery.h>
+ 
+ #define RECON_BSD_NETINET_TCP_RECOVERY_C 1
+ 
+diff --git a/bsd/netinet/tcp_rtt.c b/bsd/netinet/tcp_rtt.c
+index 72307ad43..209e15a13 100644
+--- a/bsd/netinet/tcp_rtt.c
++++ b/bsd/netinet/tcp_rtt.c
+@@ -9,6 +9,7 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/kernel.h>
++#include <netinet/tcp_rtt.h>
+ 
+ #define RECON_BSD_NETINET_TCP_RTT_C 1
+ 
+diff --git a/bsd/netinet/tcp_segment.c b/bsd/netinet/tcp_segment.c
+index 3e09195be..33275f742 100644
+--- a/bsd/netinet/tcp_segment.c
++++ b/bsd/netinet/tcp_segment.c
+@@ -9,6 +9,7 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/kernel.h>
++#include <netinet/tcp_segment.h>
+ 
+ #define RECON_BSD_NETINET_TCP_SEGMENT_C 1
+ 
+diff --git a/bsd/netinet/tcp_timer_advanced.c b/bsd/netinet/tcp_timer_advanced.c
+index 24978aaeb..1ce5d48b6 100644
+--- a/bsd/netinet/tcp_timer_advanced.c
++++ b/bsd/netinet/tcp_timer_advanced.c
+@@ -9,6 +9,7 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/kernel.h>
++#include <netinet/tcp_timer_advanced.h>
+ 
+ #define RECON_BSD_NETINET_TCP_TIMER_ADVANCED_C 1
+ 
+diff --git a/bsd/netinet/tcp_var.h b/bsd/netinet/tcp_var.h
+index 3abf73aab..0d56ee3f7 100644
+--- a/bsd/netinet/tcp_var.h
++++ b/bsd/netinet/tcp_var.h
+@@ -846,6 +846,7 @@ struct tcpcb {
+ 	tcp_seq rcv_high;                   /* highest sequence number received */
+ 	uint32_t tsv_high;                  /* timestamp value of highest received sequence number */
+ 	struct tcp_rledbat_state t_rlstate; /* State used by rLedbat */
++	struct tcp_rbbr_state *t_rbbr_state; /* State used by RBBR congestion control */
+ 
+ 	uint32_t rcv_srtt;                  /* receiver's SRTT, coarse when Timestamp not supported */
+ 	uint32_t rcv_rtt_est_ts;            /* start of measurement for estimating RTT when Timestamp not supported */
+diff --git a/iokit/Kernel/IOAnalytics.cpp b/iokit/Kernel/IOAnalytics.cpp
+index 71ecff479..38d74ea7a 100644
+--- a/iokit/Kernel/IOAnalytics.cpp
++++ b/iokit/Kernel/IOAnalytics.cpp
+@@ -9,6 +9,7 @@
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOLib.h>
+ #include <sys/systm.h>
++#include <IOKit/IOAnalytics.h>
+ 
+ #define RECON_IOKIT_KERNEL_IOANALYTICS_CPP 1
+ 
+diff --git a/iokit/Kernel/IOUnifiedAddressTranslator.cpp b/iokit/Kernel/IOUnifiedAddressTranslator.cpp
+index f5dd7117e..17e5ff871 100644
+--- a/iokit/Kernel/IOUnifiedAddressTranslator.cpp
++++ b/iokit/Kernel/IOUnifiedAddressTranslator.cpp
+@@ -9,6 +9,7 @@
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOLib.h>
+ #include <sys/systm.h>
++#include <IOKit/IOUnifiedAddressTranslator.h>
+ 
+ #define RECON_IOKIT_KERNEL_IOUNIFIEDADDRESSTRANSLATOR_CPP 1
+ 
+diff --git a/osfmk/arm64/ppl/t8020dart.c b/osfmk/arm64/ppl/t8020dart.c
+index a3428669a..2501b243c 100644
+--- a/osfmk/arm64/ppl/t8020dart.c
++++ b/osfmk/arm64/ppl/t8020dart.c
+@@ -11,6 +11,7 @@
+ #include <kern/debug.h>
+ #include <kern/zalloc.h>
+ #include <sys/systm.h>
++#include <arm64/ppl/t8020dart.h>
+ 
+ #define RECON_OSFMK_ARM64_PPL_T8020DART_C 1
+ 
+diff --git a/osfmk/arm64/ppl/uat.c b/osfmk/arm64/ppl/uat.c
+index 16df1ae96..57a620d7f 100644
+--- a/osfmk/arm64/ppl/uat.c
++++ b/osfmk/arm64/ppl/uat.c
+@@ -11,6 +11,7 @@
+ #include <kern/debug.h>
+ #include <kern/zalloc.h>
+ #include <sys/systm.h>
++#include <arm64/ppl/uat.h>
+ 
+ #define RECON_OSFMK_ARM64_PPL_UAT_C 1
+ 
+diff --git a/osfmk/kern/matchmaker.c b/osfmk/kern/matchmaker.c
+index 1c2588ba3..71603a4ca 100644
+--- a/osfmk/kern/matchmaker.c
++++ b/osfmk/kern/matchmaker.c
+@@ -11,6 +11,7 @@
+ #include <kern/debug.h>
+ #include <kern/zalloc.h>
+ #include <sys/systm.h>
++#include <kern/matchmaker.h>
+ 
+ #define RECON_OSFMK_KERN_MATCHMAKER_C 1
+ 
+diff --git a/osfmk/kern/threadpair.c b/osfmk/kern/threadpair.c
+index fa9df3780..fe978b1f2 100644
+--- a/osfmk/kern/threadpair.c
++++ b/osfmk/kern/threadpair.c
+@@ -11,6 +11,7 @@
+ #include <kern/debug.h>
+ #include <kern/zalloc.h>
+ #include <sys/systm.h>
++#include <kern/threadpair.h>
+ 
+ #define RECON_OSFMK_KERN_THREADPAIR_C 1
+ 
+diff --git a/osfmk/kern/virtual_env.c b/osfmk/kern/virtual_env.c
+index e11ce48ba..702fdc74c 100644
+--- a/osfmk/kern/virtual_env.c
++++ b/osfmk/kern/virtual_env.c
+@@ -11,6 +11,7 @@
+ #include <kern/debug.h>
+ #include <kern/zalloc.h>
+ #include <sys/systm.h>
++#include <kern/virtual_env.h>
+ 
+ #define RECON_OSFMK_KERN_VIRTUAL_ENV_C 1
+ 
+diff --git a/osfmk/vm/vm_page_telemetry.c b/osfmk/vm/vm_page_telemetry.c
+index e8e364164..0eda9a971 100644
+--- a/osfmk/vm/vm_page_telemetry.c
++++ b/osfmk/vm/vm_page_telemetry.c
+@@ -11,6 +11,7 @@
+ #include <kern/debug.h>
+ #include <kern/zalloc.h>
+ #include <sys/systm.h>
++#include <vm/vm_page_telemetry.h>
+ 
+ #define RECON_OSFMK_VM_VM_PAGE_TELEMETRY_C 1
+ 
+diff --git a/pexpert/arm/hwtrace/cputrace_apt_interface.c b/pexpert/arm/hwtrace/cputrace_apt_interface.c
+index 1fb358b5e..dd0f7d5bd 100644
+--- a/pexpert/arm/hwtrace/cputrace_apt_interface.c
++++ b/pexpert/arm/hwtrace/cputrace_apt_interface.c
+@@ -8,6 +8,7 @@
+  */
+ #include <pexpert/pexpert.h>
+ #include <sys/systm.h>
++#include <pexpert/arm64/cputrace_apt_interface.h>
+ 
+ #define RECON_PEXPERT_ARM_HWTRACE_CPUTRACE_APT_INTERFACE_C 1
+ 

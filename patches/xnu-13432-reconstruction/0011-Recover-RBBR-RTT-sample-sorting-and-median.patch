@@ -1,0 +1,87 @@
+From c475a32f74fdf2da9485fa569ace9447aea9e7fd Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 02:28:36 +0000
+Subject: [PATCH 11/13] Recover RBBR RTT sample sorting and median
+
+- rbbr_insertion_sort: in-place insertion sort of the RTT sample array.
+- rbbr_sorted_median: middle element for an odd count, mean of the two
+  middle elements for an even count.
+- rbbr_sort_rtt_samples: sort the connection samples and mark them
+  sorted.
+- rbbr_get_rtt_median: return 0 without samples, sort on demand, then
+  return the median.  Matches the inlined 300-byte reference body.
+
+Remaining explicit stubs: 297.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ bsd/netinet/tcp_rbbr.c | 38 ++++++++++++++++++++++++++++++--------
+ 1 file changed, 30 insertions(+), 8 deletions(-)
+
+diff --git a/bsd/netinet/tcp_rbbr.c b/bsd/netinet/tcp_rbbr.c
+index 44f6fe549..686a30930 100644
+--- a/bsd/netinet/tcp_rbbr.c
++++ b/bsd/netinet/tcp_rbbr.c
+@@ -172,32 +172,54 @@ rbbr_log_phase_end(struct tcpcb * tp, const char * phase_name, const char * next
+ void
+ rbbr_insertion_sort(uint32_t *arr __counted_by(n), uint16_t n)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: rbbr_insertion_sort");
++	uint16_t i;
++	
++	for (i = 1; i < n; i++) {
++		uint32_t v = arr[i];
++		int j = (int)i - 1;
++	
++		while (j >= 0 && arr[j] > v) {
++			arr[j + 1] = arr[j];
++			j--;
++		}
++		arr[j + 1] = v;
++	}
+ }
+ 
+ /* bsd/netinet/tcp_rbbr.c:513 */
+ uint32_t
+ rbbr_sorted_median(uint32_t *arr __counted_by(n), uint16_t n)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: rbbr_sorted_median");
++	if (n == 0) {
++		return 0;
++	}
++	if ((n & 1) != 0) {
++		return arr[n / 2];
++	}
++	return (arr[n / 2 - 1] + arr[n / 2]) / 2;
+ }
+ 
+ /* bsd/netinet/tcp_rbbr.c:525 */
+ void
+ rbbr_sort_rtt_samples(struct tcp_rbbr_state * rbbr)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: rbbr_sort_rtt_samples");
++	rbbr_insertion_sort(rbbr->rtt_samples, rbbr->rtt_sample_count);
++	rbbr->rtt_sorted = 1;
+ }
+ 
+ /* bsd/netinet/tcp_rbbr.c:539 */
+ uint32_t
+ rbbr_get_rtt_median(struct tcp_rbbr_state * rbbr)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: rbbr_get_rtt_median");
++	uint16_t n = rbbr->rtt_sample_count;
++	
++	if (n == 0) {
++		return 0;
++	}
++	if (rbbr->rtt_sorted == 0) {
++		rbbr_sort_rtt_samples(rbbr);
++	}
++	return rbbr_sorted_median(rbbr->rtt_samples, n);
+ }
+ 
+ /* bsd/netinet/tcp_rbbr.c:552 */
