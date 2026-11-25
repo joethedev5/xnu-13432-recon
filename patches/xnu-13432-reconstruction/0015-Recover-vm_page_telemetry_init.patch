@@ -1,0 +1,43 @@
+From 90a1c832c5e22938931cbba09048500611483bc3 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 02:30:26 +0000
+Subject: [PATCH 15/16] Recover vm_page_telemetry_init
+
+Allocate the drain thread call from the reference kalloc-type zone with
+vmpt_drain_thread as the callback and store it in the module's
+vmpt_drain_thread_call global.
+
+Remaining explicit stubs: 293.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ osfmk/vm/vm_page_telemetry.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/osfmk/vm/vm_page_telemetry.c b/osfmk/vm/vm_page_telemetry.c
+index 0eda9a971..72e464088 100644
+--- a/osfmk/vm/vm_page_telemetry.c
++++ b/osfmk/vm/vm_page_telemetry.c
+@@ -12,9 +12,12 @@
+ #include <kern/zalloc.h>
+ #include <sys/systm.h>
+ #include <vm/vm_page_telemetry.h>
++#include <kern/thread_call.h>
+ 
+ #define RECON_OSFMK_VM_VM_PAGE_TELEMETRY_C 1
+ 
++static thread_call_t vmpt_drain_thread_call;
++
+ /* osfmk/vm/vm_page_telemetry.c:168 */
+ uint32_t
+ vmpt_hash(vm_page_telemetry_event_t code, uint64_t subcode, uintptr_t * frames, unsigned int frame_count)
+@@ -67,8 +70,7 @@ vmpt_drain_thread(thread_call_param_t p0, thread_call_param_t p1)
+ void
+ vm_page_telemetry_init(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: vm_page_telemetry_init");
++	vmpt_drain_thread_call = thread_call_allocate(vmpt_drain_thread, NULL);
+ }
+ 
+ /* osfmk/vm/vm_page_telemetry.c:383 */

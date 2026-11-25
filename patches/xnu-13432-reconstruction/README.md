@@ -9,7 +9,7 @@ Apply in numeric order from a clean checkout:
 
 ```
 git checkout xnu-12377.121.6
-git am 0001-*.patch ... 0014-*.patch
+git am 0001-*.patch ... 0016-*.patch
 ```
 
 Contents:
@@ -24,8 +24,9 @@ Contents:
 5. `tcp_rbbr_rwnd_init` and the missing `tcpcb.t_rbbr_state` member.
 6. Relocation of the VM map store types into
    `vm_map_store_types_internal.h`.
-7-14. RBBR state management, tunables, utilization/RTT-median and
-   phase-log code, and `tcp_tfo_process_last_ack`.
+7-16. RBBR state management, tunables, utilization/RTT-median and
+   phase-log code, `tcp_tfo_process_last_ack`, VM page telemetry
+   init, and the receive-window selector.
 
 The patches contain only public xnu text plus original reconstruction;
 no Apple binary, dSYM, SDK payload or extracted proprietary header is

@@ -287,3 +287,13 @@ the phase transition with the reference format and line 483.
 The public patch series now contains 14 patches and has been
 re-applied to a clean `xnu-12377.121.6` worktree with `git am` without
 conflicts. Remaining explicit stubs: 294.
+
+## 2026-11-25: telemetry init and receive-window selector
+
+`vm_page_telemetry_init` allocates the drain thread call with
+`vmpt_drain_thread` as callback and stores it in
+`vmpt_drain_thread_call`. `tcp_calc_rcv_window` caps `rcv_wnd` by the
+window scale, and when timestamps are negotiated uses the selected
+receive-CC algorithm's `get_rlwin`; `tcpcb.t_recv_cc_algo` was added
+(1 = RBBR, 2 = rLedbat). The patch series now has 16 entries and still
+applies cleanly to xnu-12377.121.6. Remaining explicit stubs: 292.

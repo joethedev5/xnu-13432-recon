@@ -1,0 +1,81 @@
+From 05261f645826104e377dae585044aa1fc1e41df8 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 02:31:01 +0000
+Subject: [PATCH 16/16] Recover tcp_calc_rcv_window and the receive-CC selector
+
+Add tcpcb.t_recv_cc_algo between t_adaptive_wtimo and
+t_early_rexmt_count, then reconstruct the window calculation: cap
+rcv_wnd by 0xffff << rcv_scale, and when timestamps are negotiated and
+rcv_bg is set, clamp it by the selected receive algorithm's get_rlwin
+(1 = RBBR, 2 = rLedbat).
+
+Remaining explicit stubs: 292.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ bsd/netinet/tcp_var.h    |  1 +
+ bsd/netinet/tcp_window.c | 34 ++++++++++++++++++++++++++++++++--
+ 2 files changed, 33 insertions(+), 2 deletions(-)
+
+diff --git a/bsd/netinet/tcp_var.h b/bsd/netinet/tcp_var.h
+index 0d56ee3f7..1ed776db5 100644
+--- a/bsd/netinet/tcp_var.h
++++ b/bsd/netinet/tcp_var.h
+@@ -510,6 +510,7 @@ struct tcpcb {
+ 	uint8_t         tcp_cc_index;   /* index of congestion control algorithm */
+ 	uint8_t         t_adaptive_rtimo;       /* Read timeout used as a multiple of RTT */
+ 	uint8_t         t_adaptive_wtimo;       /* Write timeout used as a multiple of RTT */
++	uint8_t         t_recv_cc_algo; /* receive congestion control algorithm */
+ 
+ /* State for limiting early retransmits when SACK is not enabled */
+ 	uint16_t        t_early_rexmt_count; /* count of early rexmts */
+diff --git a/bsd/netinet/tcp_window.c b/bsd/netinet/tcp_window.c
+index 2fd109c64..2f01955fd 100644
+--- a/bsd/netinet/tcp_window.c
++++ b/bsd/netinet/tcp_window.c
+@@ -9,6 +9,7 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/kernel.h>
++#include <netinet/tcp_cc.h>
+ 
+ #define RECON_BSD_NETINET_TCP_WINDOW_C 1
+ 
+@@ -87,6 +88,35 @@ tcp_update_window(struct tcpcb *tp, int thflags, struct tcphdr * th,
+ uint32_t
+ tcp_calc_rcv_window(struct tcpcb * tp, int rcv_bg)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_calc_rcv_window");
++	uint32_t win = MIN(tp->rcv_wnd, 0xffffu << tp->rcv_scale);
++	struct tcp_rcv_cc_algo *algo;
++	uint32_t rlwin;
++
++	if (rcv_bg == 0) {
++		return win;
++	}
++	if ((tp->t_flags & (TF_REQ_TSTMP | TF_RCVD_TSTMP)) !=
++	    (TF_REQ_TSTMP | TF_RCVD_TSTMP)) {
++		return win;
++	}
++
++	switch (tp->t_recv_cc_algo) {
++	case 1:
++		algo = &tcp_cc_rbbr;
++		break;
++	case 2:
++		algo = &tcp_cc_rledbat;
++		break;
++	default:
++		algo = NULL;
++		break;
++	}
++	if (algo == NULL || algo->get_rlwin == NULL) {
++		return win;
++	}
++	rlwin = algo->get_rlwin(tp);
++	if (rlwin == 0) {
++		return win;
++	}
++	return MIN(win, rlwin);
+ }
