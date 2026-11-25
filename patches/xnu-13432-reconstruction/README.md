@@ -9,7 +9,7 @@ Apply in numeric order from a clean checkout:
 
 ```
 git checkout xnu-12377.121.6
-git am 0001-*.patch ... 0058-*.patch
+git am 0001-*.patch ... 0059-*.patch
 ```
 
 Contents:
@@ -186,6 +186,17 @@ Contents:
     and `rollback_map_entries` for the temporary map-entry list, and
     `_hv_nested_space_unmap` with its exact ipa/size lookup and
     VMAPPLE_NESTED_SPACE_UNMAP host call.
+59. The hypervisor nested-space map operation in
+    `osfmk/arm64/hv/hv_space_paranested.c`: the `create_upl_chunk`
+    helper (protection lookup, window bounding, executable and
+    physically contiguous rejection, temporary write protection around
+    `vm_map_create_upl`, first/last page trim), `_hv_nested_space_map`
+    (range alignment, chunk loop, rollback and commit, guest-address
+    advance by the mapped size), `_hv_space_map_op` (item copy-in,
+    asid validation, VM reference and UNMAP/PROTECT/MAP dispatch) and
+    `hv_space_map_op_nested`; plus the reference-only
+    `mach_vm_protect_kernel` helper and its declaration in
+    `osfmk/vm/vm_kern.c` and `vm_kern_xnu.h`.
 
 The patches contain only public xnu text plus original reconstruction;
 no Apple binary, dSYM, SDK payload or extracted proprietary header is

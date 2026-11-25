@@ -1715,42 +1715,87 @@ bookkeeping at the same lines; kasan's larger `hv_vm_t` only moves
 
 The patch series now has 58 entries; 76 explicit stubs remain.
 
-## 2026-11-25: create_upl_chunk (in progress)
+## 2026-11-25: the nested-space map operation and mach_vm_protect_kernel
 
-`create_upl_chunk` (decl 181, parameters at 181-183) resolves the
-mapping window and creates the UPL for one chunk.  The release
-disassembly gives:
+The kasan build keeps a `mach_assert_default` descriptor for every
+assert in `create_upl_chunk`, and each descriptor's expression text is
+the exact source line; the disassembly resolves the rest.
 
-- 185: `map = current_thread()->map`; 186 `prot`; 187 `entry_end`;
-  188 `kr`.
-- The protection lookup is `hv_map_lookup_protection(map,
-  current_uva, &prot, &entry_end)` (inlined; hv_vm.c:377-384); its
-  failure returns HV_ERROR.
+`create_upl_chunk` (decl 181, `static`, parameters at 181-183):
+
+- 185: `map = current_thread()->map`; 186 `prot = VM_PROT_NONE`;
+  187 `entry_end = 0`; 188 `kr = hv_map_lookup_protection(map,
+  current_uva, &prot, &entry_end)`; a nonzero result returns HV_ERROR
+  (189).
 - 198: `assert(entry_end > current_uva)`.
-- 199: `*chunk_mapping_size = MIN(remaining_size, entry_end -
-  current_uva)`.
-- 201:18/20: `*upl_chunk_size = (upl_size_t)MIN(*chunk_mapping_size,
-  UPL_SIZE_MAX)` (the 0xffffc000 mask).
-- 220:6 and 225:6 test two protection/behaviour bits of the vm_map
-  entry's 0x38 word; bit 5 skips the temporary write protection and
-  bit 6 rejects the mapping with HV_ERROR.
-- The `need_protect` path (223/224) raises the protection of the
-  current window with mach_vm_protect_kernel (226/227), the protect
-  size being the entry remainder rounded to a page.
-- 232/233: `upl_flags = UPL_SET_INTERNAL | UPL_SET_IO_WIRE` (0x1040)
-  and `upl_count = 0`; 237 calls vm_map_create_upl(map, current_uva,
-  upl_chunk_size, upl, NULL, &upl_count, &upl_flags,
-  VM_KERN_MEMORY_HV) (tag 0x1c).
-- The asserts at 235/236 (current_uva and the UPL size page-aligned)
-  follow the call, as do 253-255 (`*upl_chunk_size` nonzero, not
-  larger than remaining_size, page-aligned), 264 (`*upl_chunk_size >
-  first_page_offset`), 269 (`*chunk_mapping_size > last_page_trim`)
-  and 273 (`*chunk_mapping_size > 0`).
-- The 242/243 path restores the original protection when
-  `need_protect` was set; 250/257 adjust `*chunk_mapping_size` by the
-  UPL's actual size and trim the last page; 264-273 finalise the two
-  output sizes.
+- 199: `remaining_size = MIN(remaining_size, entry_end - current_uva);`
+  - the parameter is reassigned, and the descriptors at 254
+  (`*upl_chunk_size <= remaining_size`) and the compare at 268 show
+  that all later uses read the bounded value.  The earlier reading of
+  199 as a `*chunk_mapping_size` store was wrong.
+- 201: `*upl_chunk_size = (upl_size_t)MIN(remaining_size,
+  UPL_SIZE_MAX)`, with UPL_SIZE_MAX = `UINT32_MAX & ~PAGE_MASK`
+  (0xffffc000).
+- 220: `if (prot & VM_PROT_EXECUTE) return HV_ERROR;` - an executable
+  range cannot be made writable (226) without breaking its code
+  signature.
+- 223: `need_protect = (prot & VM_PROT_WRITE) == 0`; 224:
+  `const upl_size_t protect_size = *upl_chunk_size`.
+- 225/226: when the range is not writable, `mach_vm_protect_kernel(
+  map, current_uva, protect_size, FALSE, prot | VM_PROT_WRITE)`;
+  failure returns HV_ERROR (227).
+- 232/233: `upl_flags = UPL_SET_INTERNAL | UPL_SET_IO_WIRE` (0x1040),
+  `upl_count = 0`.
+- 235: `assert((current_uva & PAGE_MASK) == 0)`; 236:
+  `assert((*upl_chunk_size & PAGE_MASK) == 0)`.
+- 237: `upl_kr = vm_map_create_upl(map, current_uva, upl_chunk_size,
+  upl, NULL, &upl_count, &upl_flags, VM_KERN_MEMORY_HV)`.
+- 240-247: the previous protection is restored (the same guard);
+  when that fails, the UPL is committed if it was created (243/244)
+  and HV_ERROR is returned.
+- 250/251: a failed UPL creation returns HV_ERROR.
+- 253-255: the descriptors give the exact text:
+  `assert(*upl_chunk_size != 0)`,
+  `assert(*upl_chunk_size <= remaining_size)`,
+  `assert((*upl_chunk_size & PAGE_MASK) == 0)`.
+- 257-259: `if (upl_flags & UPL_PHYS_CONTIG)` - the flags word is
+  rewritten by vm_map_create_upl to the object-kind bits - commits
+  the UPL and returns HV_ERROR; a physically contiguous object has no
+  internal page list to hand to the block mapper.
+- 264: `assert(*upl_chunk_size > first_page_offset)`; 265:
+  `*chunk_mapping_size = *upl_chunk_size - first_page_offset`.
+- 268-270: when `remaining_size == *upl_chunk_size` the window ends
+  inside this chunk, so `assert(*chunk_mapping_size >
+  last_page_trim)` and `*chunk_mapping_size -= last_page_trim`.
+- 273: `assert(*chunk_mapping_size > 0)`; 275 returns KERN_SUCCESS.
 
-The remaining evidence to decode is the exact protect/unprotect call
-arguments and the 250-273 output arithmetic; the function is otherwise
-mapped out.
+`mach_vm_protect_kernel` is a reference-only kernel helper: the
+release DWARF places it at `osfmk/vm/vm_kern.c:1572` with a 136-byte
+body that is the user-side `mach_vm_protect` body moved down -
+`map == VM_MAP_NULL` gives KERN_INVALID_ARGUMENT, a zero size gives
+KERN_SUCCESS, and anything else tail-calls `vm_map_protect` with the
+sanitized end.  The patch adds the body to vm_kern.c next to
+`mach_vm_deallocate_kernel` and its declaration to vm_kern_xnu.h.
+
+`_hv_nested_space_map` (decl 326) is now decoded as well: 330-334
+reject a size that overflows the IPA or is zero, 339-341 compute
+`region_end` with the UVA overflow check, 344/349 align the range,
+350/351 split out `first_page_offset` and `last_page_trim`, 353-357
+initialize the temporary list and the cursor variables.  The loop
+(362) creates the chunk (367, `kr`), rolls back on failure (368-371),
+records the entry (373/376 commit the UPL when the entry cannot be
+allocated), maps the block (384 passes `mi->flags`), accounts the
+guest bytes mapped so far (385), rolls back the mapped range on
+failure, and advances `remaining_aligned_size` and `current_uva` by
+the UPL window (393/394) while advancing `current_ipa` by the size
+actually mapped (395) - the guest range stays contiguous across the
+trimmed page partials - then clears `first_page_offset` (396).
+Success publishes the list with `commit_map_entries`.
+
+`_hv_space_map_op` (decl 436) copies in the 40-byte item (438),
+accepts only asid 0 or UINT64_MAX (447; the latter only with a current
+vCPU), references the VM (452), dispatches UNMAP/PROTECT/MAP at the
+switch on 468 (protect call at 475, map call at 481), panics on an
+unexpected function (486) and releases the VM (488).  `hv_space_map_op_nested` (decl 491) tail-calls it.
+
+The patch series now has 59 entries; 73 explicit stubs remain.

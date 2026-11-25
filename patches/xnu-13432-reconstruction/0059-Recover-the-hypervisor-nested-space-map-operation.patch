@@ -1,0 +1,381 @@
+From 4428eee7ab6ae88a2df1e1953c4342315eb36c08 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 20:28:00 +0000
+Subject: [PATCH] Recover the hypervisor nested-space map operation
+
+_hv_nested_space_map validates the item against IPA/UVA overflow,
+aligns the range to page boundaries, walks it in UPL-sized chunks
+through create_upl_chunk, records each chunk with add_map_entry and
+maps it with nested_space_map_block.  The host address advances by the
+UPL window, the guest address and the rollback byte count by the size
+actually mapped, so the guest range stays contiguous across the page
+partials trimmed at the ends.  Failures roll back the entries and the
+already-mapped guest range through rollback_map_entries; success
+publishes the list with commit_map_entries.
+
+create_upl_chunk looks up the protection of the range, bounds the
+window by the protection entry it starts in, computes the page-aligned
+UPL request, rejects executable ranges (they cannot be made writable
+without breaking code signing) and physically contiguous UPLs (they
+have no internal page list), temporarily makes the range writable
+around vm_map_create_upl and restores its protection, and trims the
+first and last page partials from the mapped size.
+
+mach_vm_protect_kernel is the kernel-side protection entry point the
+UPL creation path calls; it is recovered in vm_kern.c, where it mirrors
+the user-side mach_vm_protect body, together with its declaration.
+
+_hv_space_map_op copies in the 40-byte map item, validates the asid
+(default space 0, current vCPU space UINT64_MAX), references the VM,
+dispatches VMAPPLE_NESTED_SPACE_UNMAP/PROTECT/MAP and panics on an
+unexpected function, then releases the VM.  hv_space_map_op_nested is
+the thin wrapper over it.  The file now has no remaining stubs.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ osfmk/arm64/hv/hv_space_paranested.c | 241 +++++++++++++++++++++++++--
+ osfmk/vm/vm_kern.c                   |  28 ++++
+ osfmk/vm/vm_kern_xnu.h               |   8 +
+ 3 files changed, 267 insertions(+), 10 deletions(-)
+
+diff --git a/osfmk/arm64/hv/hv_space_paranested.c b/osfmk/arm64/hv/hv_space_paranested.c
+index ace432cc9..6e1cbc613 100644
+--- a/osfmk/arm64/hv/hv_space_paranested.c
++++ b/osfmk/arm64/hv/hv_space_paranested.c
+@@ -125,12 +125,112 @@ nested_space_map_block(uint64_t * size, uint64_t start_offset, upl_page_info_t *
+ 	return HV_SUCCESS;
+ }
+ 
++/*
++ * Create a UPL covering one page-aligned chunk of a user range.
++ *
++ * The chunk stops at the end of the protection entry the range starts
++ * in and at the end of the caller's remaining window.  Only the first
++ * and the last chunk of a mapping are page-inexact: first_page_offset
++ * bytes at the front and last_page_trim bytes at the back do not belong
++ * to the requested range and are trimmed from the size handed to the
++ * host.
++ *
++ * The pages must be writable while the UPL is created; when the range
++ * is not writable already, it is made writable for the duration of the
++ * UPL creation and its previous protection is restored afterwards.
++ * Executable ranges cannot be made writable without invalidating their
++ * code signature, and physically contiguous objects have no internal
++ * page list to walk, so neither can be mapped into a guest.
++ *
++ * On success the UPL is returned through *upl, the size to hand to the
++ * host through *chunk_mapping_size, and the UPL's page window through
++ * *upl_chunk_size.
++ */
+ /* osfmk/arm64/hv/hv_space_paranested.c:181 */
+-kern_return_t
+-create_upl_chunk(uint64_t current_uva, uint64_t remaining_size, uint64_t first_page_offset, uint64_t last_page_trim, struct upl * upl, uint64_t * chunk_mapping_size, upl_size_t * upl_chunk_size)
++static kern_return_t
++create_upl_chunk(uint64_t current_uva, uint64_t remaining_size, uint64_t first_page_offset, uint64_t last_page_trim, upl_t * upl, uint64_t * chunk_mapping_size, upl_size_t * upl_chunk_size)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: create_upl_chunk");
++	vm_map_t map = current_thread()->map;
++	vm_prot_t prot = VM_PROT_NONE;
++	vm_map_offset_t entry_end = 0;
++	kern_return_t kr = hv_map_lookup_protection(map, current_uva, &prot, &entry_end);
++	if (kr != KERN_SUCCESS) {
++		return HV_ERROR;
++	}
++
++	/*
++	 * The window cannot extend past the protection entry the range
++	 * starts in.
++	 */
++	assert(entry_end > current_uva);
++	remaining_size = MIN(remaining_size, entry_end - current_uva);
++	*upl_chunk_size = (upl_size_t)MIN(remaining_size, UPL_SIZE_MAX);
++
++	/*
++	 * A UPL over an executable range would have to be made writable,
++	 * which would invalidate the code signature of its pages; such a
++	 * range cannot be shared with a guest.
++	 */
++	if (prot & VM_PROT_EXECUTE) {
++		return HV_ERROR;
++	}
++
++	_Bool need_protect = (prot & VM_PROT_WRITE) == 0;
++	const upl_size_t protect_size = *upl_chunk_size;
++	if (need_protect) {
++		kr = mach_vm_protect_kernel(map, current_uva, protect_size, FALSE, prot | VM_PROT_WRITE);
++		if (kr != KERN_SUCCESS) {
++			return HV_ERROR;
++		}
++	}
++
++	upl_control_flags_t upl_flags = UPL_SET_INTERNAL | UPL_SET_IO_WIRE;
++	unsigned int upl_count = 0;
++
++	assert((current_uva & PAGE_MASK) == 0);
++	assert((*upl_chunk_size & PAGE_MASK) == 0);
++	kern_return_t upl_kr = vm_map_create_upl(map, current_uva, upl_chunk_size, upl,
++	    NULL, &upl_count, &upl_flags, VM_KERN_MEMORY_HV);
++
++	if (need_protect) {
++		kr = mach_vm_protect_kernel(map, current_uva, protect_size, FALSE, prot);
++		if (kr != KERN_SUCCESS) {
++			if (upl_kr == KERN_SUCCESS) {
++				ubc_upl_commit(*upl);
++			}
++			return HV_ERROR;
++		}
++	}
++
++	if (upl_kr != KERN_SUCCESS) {
++		return HV_ERROR;
++	}
++
++	assert(*upl_chunk_size != 0);
++	assert(*upl_chunk_size <= remaining_size);
++	assert((*upl_chunk_size & PAGE_MASK) == 0);
++
++	/*
++	 * A UPL over a physically contiguous object has no internal page
++	 * list to walk; it cannot be handed to the host block mapper.
++	 */
++	if (upl_flags & UPL_PHYS_CONTIG) {
++		ubc_upl_commit(*upl);
++		return HV_ERROR;
++	}
++
++	assert(*upl_chunk_size > first_page_offset);
++	*chunk_mapping_size = *upl_chunk_size - first_page_offset;
++
++	/* The window ends inside this chunk: trim its tail pages. */
++	if (remaining_size == *upl_chunk_size) {
++		assert(*chunk_mapping_size > last_page_trim);
++		*chunk_mapping_size -= last_page_trim;
++	}
++
++	assert(*chunk_mapping_size > 0);
++
++	return KERN_SUCCESS;
+ }
+ 
+ /*
+@@ -196,12 +296,87 @@ rollback_map_entries(hv_vm_t * vm, uint64_t ipa, uint64_t guest_bytes_processed,
+ 	}
+ }
+ 
++/*
++ * Map a user range into the guest in UPL-sized chunks.
++ *
++ * The range is aligned out to page boundaries; each chunk is backed by
++ * a UPL and handed to the host as one or more physically contiguous
++ * blocks.  The guest addresses of the chunks follow the user range.
++ * Any failure rolls back the mappings already made.
++ */
+ /* osfmk/arm64/hv/hv_space_paranested.c:326 */
+ hv_return_t
+ _hv_nested_space_map(hv_vm_t * vm, const hv_vm_map_item_t * mi)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: _hv_nested_space_map");
++	uint64_t overflow;
++
++	if (mi->size == 0) {
++		return HV_SUCCESS;
++	}
++
++	if (__builtin_add_overflow(mi->ipa, mi->size, &overflow)) {
++		return HV_BAD_ARGUMENT;
++	}
++
++	uint64_t region_start = mi->uva;
++	uint64_t region_end;
++	if (__builtin_add_overflow(region_start, mi->size, &region_end) || __builtin_add_overflow(region_end, PAGE_MASK, &overflow)) {
++		return HV_BAD_ARGUMENT;
++	}
++
++	uint64_t aligned_start = region_start & ~PAGE_MASK;
++	uint64_t aligned_end = (region_end + PAGE_MASK) & ~PAGE_MASK;
++	uint64_t first_page_offset = region_start & PAGE_MASK;
++	uint64_t last_page_trim = aligned_end - region_end;
++
++	hv_map_list_t tmp_list_head = LIST_HEAD_INITIALIZER(tmp_list_head);
++	uint64_t guest_bytes_processed = 0;
++	uint64_t current_uva = aligned_start;
++	uint64_t current_ipa = mi->ipa;
++	uint64_t remaining_aligned_size = aligned_end - aligned_start;
++
++	while (remaining_aligned_size > 0) {
++		upl_t upl = NULL;
++		uint64_t chunk_mapping_size = 0;
++		upl_size_t upl_chunk_size = 0;
++
++		kern_return_t kr = create_upl_chunk(current_uva,
++		    remaining_aligned_size, first_page_offset, last_page_trim,
++		    &upl, &chunk_mapping_size, &upl_chunk_size);
++		if (kr != KERN_SUCCESS) {
++			rollback_map_entries(vm, mi->ipa, guest_bytes_processed,
++			    &tmp_list_head);
++			return HV_ERROR;
++		}
++
++		if (!add_map_entry(upl, chunk_mapping_size, current_ipa,
++		    &tmp_list_head)) {
++			ubc_upl_commit(upl);
++			rollback_map_entries(vm, mi->ipa, guest_bytes_processed,
++			    &tmp_list_head);
++			return HV_NO_RESOURCES;
++		}
++
++		hv_return_t ret = nested_space_map_block(&chunk_mapping_size,
++		    first_page_offset, upl_get_internal_page_list(upl), current_ipa,
++		    vm->host_vm_id, mi->flags);
++
++		guest_bytes_processed += chunk_mapping_size;
++
++		if (ret != HV_SUCCESS) {
++			rollback_map_entries(vm, mi->ipa, guest_bytes_processed,
++			    &tmp_list_head);
++			return ret;
++		}
++
++		remaining_aligned_size -= upl_chunk_size;
++		current_uva += upl_chunk_size;
++		current_ipa += chunk_mapping_size;
++		first_page_offset = 0;
++	}
++
++	commit_map_entries(vm, &tmp_list_head);
++	return HV_SUCCESS;
+ }
+ 
+ /*
+@@ -237,18 +412,64 @@ _hv_nested_space_unmap(hv_vm_t * vm, const hv_vm_map_item_t * mi)
+ 	    mi->size, 0, 0, NULL);
+ }
+ 
++/*
++ * Carry out a nested space operation (map, unmap or protect) on the
++ * item copied in from the user.  A zero asid addresses the VM's
++ * default space, UINT64_MAX the current thread's vCPU space; any other
++ * asid is rejected.
++ */
+ /* osfmk/arm64/hv/hv_space_paranested.c:436 */
+ hv_return_t
+ _hv_space_map_op(const user_addr_t mip, uint64_t fn)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: _hv_space_map_op");
++	hv_vm_map_item_t mi;
++
++	if (copyin(mip, &mi, sizeof(mi)) != 0) {
++		return HV_BAD_ARGUMENT;
++	}
++
++	if (mi.asid != 0) {
++		if (mi.asid != UINT64_MAX) {
++			return HV_BAD_ARGUMENT;
++		}
++
++		if (hv_get_vcpu() == NULL) {
++			return HV_BAD_ARGUMENT;
++		}
++	}
++
++	hv_vm_t * vm = hv_get_and_reference_vm();
++	if (vm == NULL) {
++		return HV_BAD_ARGUMENT;
++	}
++
++	hv_return_t ret;
++
++	switch (fn) {
++	case VMAPPLE_NESTED_SPACE_UNMAP:
++		ret = _hv_nested_space_unmap(vm, &mi);
++		break;
++
++	case VMAPPLE_NESTED_SPACE_PROTECT:
++		ret = hv_call(VMAPPLE_NESTED_SPACE_PROTECT, vm->host_vm_id,
++		    mi.ipa, mi.size, mi.flags, 0, NULL);
++		break;
++
++	case VMAPPLE_NESTED_SPACE_MAP:
++		ret = _hv_nested_space_map(vm, &mi);
++		break;
++
++	default:
++		panic("unexpected function: %llx @%s:%d", fn, __FILE__, __LINE__);
++	}
++
++	hv_release_vm(vm);
++	return ret;
+ }
+ 
+ /* osfmk/arm64/hv/hv_space_paranested.c:491 */
+ hv_return_t
+ hv_space_map_op_nested(user_addr_t mip, uint64_t fn)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: hv_space_map_op_nested");
++	return _hv_space_map_op(mip, fn);
+ }
+diff --git a/osfmk/vm/vm_kern.c b/osfmk/vm/vm_kern.c
+index 34de1af71..9d676bd5b 100644
+--- a/osfmk/vm/vm_kern.c
++++ b/osfmk/vm/vm_kern.c
+@@ -1533,6 +1533,34 @@ mach_vm_deallocate_kernel(
+ 	           VM_MAP_REMOVE_NO_FLAGS, KMEM_GUARD_NONE);
+ }
+ 
++/*
++ *	mach_vm_protect_kernel -
++ *	Sets the protection of the specified range in the
++ *	specified map.
++ */
++kern_return_t
++mach_vm_protect_kernel(
++	vm_map_t                map,
++	mach_vm_address_ut      start_u,
++	mach_vm_size_ut         size_u,
++	boolean_t               set_maximum,
++	vm_prot_ut              new_protection_u)
++{
++	if (map == VM_MAP_NULL) {
++		return KERN_INVALID_ARGUMENT;
++	}
++
++	if (VM_SANITIZE_UNSAFE_IS_ZERO(size_u)) {
++		return KERN_SUCCESS;
++	}
++
++	return vm_map_protect(map,
++	           start_u,
++	           vm_sanitize_compute_ut_end(start_u, size_u),
++	           set_maximum,
++	           new_protection_u);
++}
++
+ #pragma mark population
+ 
+ static void
+diff --git a/osfmk/vm/vm_kern_xnu.h b/osfmk/vm/vm_kern_xnu.h
+index f24a0f517..0ab242d52 100644
+--- a/osfmk/vm/vm_kern_xnu.h
++++ b/osfmk/vm/vm_kern_xnu.h
+@@ -1269,6 +1269,14 @@ mach_vm_deallocate_kernel(
+ 	mach_vm_offset_ut       start_u,
+ 	mach_vm_size_ut         size_u);
+ 
++extern kern_return_t
++mach_vm_protect_kernel(
++	vm_map_t                map,
++	mach_vm_address_ut      start_u,
++	mach_vm_size_ut         size_u,
++	boolean_t               set_maximum,
++	vm_prot_ut              new_protection_u);
++
+ #ifdef MACH_KERNEL_PRIVATE
+ #pragma mark - map copyio
+ 
+-- 
+2.47.3
+
