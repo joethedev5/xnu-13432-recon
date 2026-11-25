@@ -9,7 +9,7 @@ Apply in numeric order from a clean checkout:
 
 ```
 git checkout xnu-12377.121.6
-git am 0001-*.patch ... 0062-*.patch
+git am 0001-*.patch ... 0063-*.patch
 ```
 
 Contents:
@@ -232,6 +232,18 @@ Contents:
     line 44 and the three kGUARD_EXC_COW_DEFEATURED_* guard codes (13-15)
     in `osfmk/mach/vm_statistics.h`, moving
     kGUARD_EXC_LARGE_ALLOCATION_TELEMETRY to 16.
+
+63. The OS metric encoder in `libkern/os/metric.c` and the record
+    layout in `libkern/os/metric_types.h`: the dropped-metric counter,
+    the disabled check (`os_log_disabled()` or `ATM_TRACE_OFF`), the
+    record builder (metadata, data, histogram bins, label and dimension
+    blobs with the 1000-byte limit checks), the sender (safe-phase
+    check, 1024-byte context buffer, the metric tracepoint id with the
+    uuid-relative, context-data and subsystem flags, and the payload
+    hand-off to the log queue) and the `os_metric_coprocessor` entry
+    point.  Also adds the `os_metric_context_encode`, `log_payload_init`
+    and `get_os_log_subsystem_id` declarations and the shared
+    `os_log_mem`.
 
 The patches contain only public xnu text plus original reconstruction;
 no Apple binary, dSYM, SDK payload or extracted proprietary header is

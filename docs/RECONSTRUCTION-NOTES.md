@@ -2045,3 +2045,92 @@ The patch compiles with the reference RELEASE flags and applies to the
 series with tree hash 706980d57c2378460e79a8734a6fe3730f763dc5.
 
 The patch series now has 62 entries; 59 explicit stubs remain.
+
+## 2026-11-25: the OS metric encoder
+
+Patch 63 recovers the production half of `libkern/os/metric.c` (five
+functions) and the record layout in `libkern/os/metric_types.h`.
+
+The reference metric.c CU declares `os_log_disabled(void)` at line 50
+(extern, declaration only), `_os_metric_disabled` at 58 (static,
+inlined at every call), `_os_metric_get_bins` at 64 (static),
+`_create_os_metric_from_parts` at 74 (static), `_send_os_metric_to_log_queue`
+at 136 (static) and the external `os_metric_coprocessor` at 187.  The
+kasan image keeps out-of-line copies of `_create` (0x9270ddc) and
+`_send` (0x927156c); the RELEASE image inlines all three statics into
+`os_metric_coprocessor` at 0x7adf830 (1092 bytes).
+
+The record types pin the layout in metric_types.h: the 16-byte
+`_os_metric_metadata_s` (type 0, base_type 1, level 2, unit 3, scale 4,
+bins 5, interval 8, flags 12), the 8-byte value, the 48-byte basic and
+88-byte detail stats, the 32-byte `os_metric_label_s` and the 16-byte
+`os_metric_dimensions_s`.  `_os_metric_get_data_size` is the static
+helper at line 193; its expression is
+`sizeof(value) + level * (sizeof(basic) - sizeof(value))`, which the
+kasan build folds to `umull 40*level; add #8; cmp #3; csel lo`
+with the metric_types.h row at 196:2.
+
+The statement lines follow the kasan line table exactly: locals at
+86-89 (`buffer_size`, `data_size`, `bin_size`, `p`), 121-123 (`dlist`,
+`current`, `size`), `safe` 138, `pubdata` 150, `ctx` 151, `ns` 163,
+`flags` 164, `trace_id` 169, `log` 173; the coprocessor's `buffer`
+189, `buff_size` 190, `sid` 191, asserts 193-195, `_create` call 198
+and `_send` call 201.  The assert descriptors carry the exact
+expressions (`buffer_size + data_size` at 97, `buffer_size + bin_size`
+at 107, `buffer_size + label->blob_size` at 114, `buffer_size + size`
+at 124, `p - (uint8_t *)buffer` at 132, `num_bins != 0` at 67 and
+`metadata`/`data`/`label` at 193-195).
+
+Behaviour recovered from the images:
+
+- `_os_metric_disabled` returns
+  `os_log_disabled() || (atm_get_diagnostic_config() & ATM_TRACE_OFF)`
+  (`tbnz w0,#0` and `tbnz w0,#10` in the kasan copy).
+- `_create_os_metric_from_parts` copies the 16 metadata bytes, then the
+  level-sized data payload, the histogram bins from the bytes that
+  follow the data in the caller's record (only when `bins != 0`, with
+  the `type != histogram` panic), the label blob and each dimension
+  blob, checking every append against `OS_METRIC_MAX_DATA_SIZE`
+  (1000) and finishing with `*buf_size` and the pointer-difference
+  assert.  The panic string is `Metric had multiple bins but was %d
+  NOT a histogram type!` at metric.c:105.
+- `_send_os_metric_to_log_queue` drops the record when the log system
+  is unsafe (`oslog_is_safe()` or startup phase <= 18) or disabled, or
+  when the buffer exceeds 1000 bytes, incrementing
+  `oslog_p_metric_dropped_msgcount`.  It initializes a 1024-byte
+  `OS_METRIC_BUFFER_MAX_SIZE` context, encodes the metric body with
+  `os_metric_context_encode(...,"%s","")`, builds the trace id with
+  namespace 8, the base type in bits 8-15, the flags 0x100a (0x120a
+  once `os_log_subsystem_id_valid(sid)`), the offset in the high word
+  and the code in the low byte, fills a zeroed `log_payload_s`,
+  initializes it for stream 7 with the encoded content size, and hands
+  it to `log_queue_log`.  The context is freed on both exits and the
+  function returns the payload result.
+- `os_metric_coprocessor` asserts metadata/data/label, builds the
+  record in a 1024-byte zeroed stack buffer, sends it with the
+  metadata base type and returns `!ret`, which the release image
+  computes with `eor w19,w20,#1`.
+
+The metric-specific buffer constants are not the public
+`OS_LOG_BUFFER_MAX_SIZE` (256): the reference uses 1024 for the
+context/public buffer and 1000 for the data limit.  The counter
+startup entries are
+`__startup_TUNABLES_entry_scalable_counter_static_boot_mangle_48` and
+`__startup_PERCPU_entry_scalable_counter_static_init_48`, pinning
+`SCALABLE_COUNTER_DEFINE(oslog_p_metric_dropped_msgcount)` at line 48.
+
+The DEVELOPMENT-only unit tests (reference lines 211-750) are not
+reproduced; they are compiled out of the RELEASE kernel and their bodies
+depend on the test harness.
+
+Compiler-version artifacts: Apple clang attributes comparisons to the
+operator column (103:16/21, 120:17, 144:15) while clang 19 attributes
+them to the left operand (103:6, 120:6, 144:6); the inline size helper
+is 196:2 in the reference and 196:6 here, and
+`(char *)data + data_size` is 68:31 versus 68:30.  The source line
+layout itself matches the reference row for row.
+
+The patch compiles with the reference RELEASE flags and applies to
+the series with tree hash 6b4fc9810ec9baff700c0e3cbbeeb4c721cc7e4e.
+
+The patch series now has 63 entries; 54 explicit stubs remain.

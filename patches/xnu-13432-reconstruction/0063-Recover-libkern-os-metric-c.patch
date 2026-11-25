@@ -1,0 +1,565 @@
+From 12cee9a53da2a8003f311bee6da50bebefa935b9 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 21:31:35 +0000
+Subject: [PATCH] Recover libkern/os/metric.c
+
+Reconstruct the production half of libkern/os/metric.c: the dropped
+metric counter, the disabled check, the record builder, the log-queue
+sender and the os_metric_coprocessor entry point.  Signature order,
+locals and statement lines follow the KDK 27.0.1 DWARF; the bodies were
+verified against the RELEASE and kasan vmapple kernels.
+
+Also add the supporting declarations the file needs: os_metric_context_encode,
+log_payload_init and get_os_log_subsystem_id, the shared os_log_mem, and the
+metric_types.h record layout and size helper.
+
+The DEVELOPMENT-only unit tests that follow the production code in the
+reference file are not reproduced yet.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ libkern/os/log_encode.h   |   1 +
+ libkern/os/log_internal.h |   3 +
+ libkern/os/log_mem.h      |   4 +
+ libkern/os/metric.c       | 216 ++++++++++++++++++++++++++++++++------
+ libkern/os/metric_types.h | 205 +++++++++++++++++++++++++++++-------
+ 5 files changed, 360 insertions(+), 69 deletions(-)
+
+diff --git a/libkern/os/log_encode.h b/libkern/os/log_encode.h
+index 38eef48c4..877201a22 100644
+--- a/libkern/os/log_encode.h
++++ b/libkern/os/log_encode.h
+@@ -29,5 +29,6 @@
+ void os_log_context_init(os_log_context_t, logmem_t *, uint8_t *, size_t);
+ void os_log_context_free(os_log_context_t);
+ bool os_log_context_encode(os_log_context_t, const char *, va_list, uintptr_t, size_t, uint16_t);
++bool os_metric_context_encode(os_log_context_t, const char *, uint32_t, void *, uint64_t, uint16_t, const char *, ...);
+ 
+ #endif /* log_encode_h */
+diff --git a/libkern/os/log_internal.h b/libkern/os/log_internal.h
+index f80682b3d..f6835fe35 100644
+--- a/libkern/os/log_internal.h
++++ b/libkern/os/log_internal.h
+@@ -35,6 +35,9 @@ typedef struct {
+ } log_payload_s, *log_payload_t;
+ 
+ bool log_payload_send(log_payload_t, const void *, bool);
++void log_payload_init(log_payload_t, firehose_stream_t, firehose_tracepoint_id_u, uint64_t, size_t, size_t);
++
+ bool os_log_subsystem_id_valid(uint16_t);
++uint16_t get_os_log_subsystem_id(os_log_t);
+ 
+ #endif /* log_internal */
+diff --git a/libkern/os/log_mem.h b/libkern/os/log_mem.h
+index ae3eaf03c..3f8240db5 100644
+--- a/libkern/os/log_mem.h
++++ b/libkern/os/log_mem.h
+@@ -27,6 +27,7 @@
+ #include <stddef.h>
+ #include <stdint.h>
+ #include <sys/param.h>
++#include <kern/locks.h>
+ 
+ /*
+  * A simple allocator on a top of a plain byte array. Primarily intended to
+@@ -47,6 +48,9 @@ typedef struct logmem_s {
+ 	uint32_t    lm_cnt_free;
+ } logmem_t;
+ 
++/* The shared long-log memory used by the kernel log encoder. */
++extern logmem_t os_log_mem;
++
+ /*
+  * Initializes dynamically allocated logmem. The caller is responsible for
+  * allocating and providing backing memory for both data and the bitmap.
+diff --git a/libkern/os/metric.c b/libkern/os/metric.c
+index 1c2af2f63..f68075957 100644
+--- a/libkern/os/metric.c
++++ b/libkern/os/metric.c
+@@ -1,52 +1,208 @@
+ /*
+- * Reconstruction of libkern/os/metric.c from the xnu-13432 reference kernel.
++ * Reconstruction of libkern/os/metric.c from the xnu-13432 reference
++ * kernel (KDK 27.0.1, kernel.kasan.vmapple).
+  *
+- * Function signatures and ordering are derived from the KDK 27.0.1
+- * DWARF.  Functions marked RECON were moved from the public xnu source
+- * when the reference kernel placed them in this file; bodies marked
+- * "body not recovered" are still stubs.
++ * Function signatures, ordering, local variables and statement lines
++ * are derived from the reference DWARF and from the disassembly of
++ * the RELEASE and kasan kernels.  The line of every definition and of
++ * the notable statements is pinned to the reference so the compiled
++ * debug information matches the original as far as it can be
++ * recovered.  The license text, the comments and the exact include
++ * list of the original are not recoverable from the kernel image.
++ *
++ * This file holds the production code.  The DEVELOPMENT-only unit
++ * tests that follow it in the reference file are not reproduced here
++ * yet.
++ *
++ * The metric record layout is defined in metric_types.h.  The encoder
++ * appends the metadata, the data, the histogram bins, the label and
++ * the dimension labels to the caller's buffer and checks that the
++ * total stays below the metric size limit.  The sender wraps the
++ * record in an os_log context, adds the metric tracepoint header and
++ * hands the payload to the log queue.
+  */
++
++
++#include <stdint.h>
++#include <string.h>
++#include <kern/assert.h>
++#include <kern/counter.h>
++#include <kern/debug.h>
++#include <kern/kalloc.h>
++#include <kern/panic_call.h>
++#include <kern/startup.h>
++#include <kern/zalloc.h>
++#include <atm/atm_internal.h>
++#include <libkern/firehose/firehose_types_private.h>
++#include <libkern/firehose/tracepoint_private.h>
++#include <libkern/os/log.h>
++#include <libkern/os/log_encode.h>
++#include <libkern/os/log_internal.h>
++#include <libkern/os/log_mem.h>
++#include <libkern/os/log_queue.h>
++#include <libkern/os/metric_types.h>
+ #include <libkern/libkern.h>
+-#include <sys/systm.h>
+ 
+-#define RECON_LIBKERN_OS_METRIC_C 1
++/* The number of metrics dropped because logging is unavailable. */
++
++SCALABLE_COUNTER_DEFINE(oslog_p_metric_dropped_msgcount);
++
++extern bool os_log_disabled(void);
++
++/*
++ * A metric is only sent when the log system is safe, the metric
++ * telemetry is not disabled and the buffer can hold the record.
++ */
+ 
+-/* libkern/os/metric.c:58 */
+-_Bool
++static bool
+ _os_metric_disabled(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: _os_metric_disabled");
++	return os_log_disabled() || (atm_get_diagnostic_config() & ATM_TRACE_OFF);
+ }
+ 
+-/* libkern/os/metric.c:64 */
+-void *
++static void *
+ _os_metric_get_bins(uint8_t num_bins, uint64_t data_size, _os_metric_data_s * data)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: _os_metric_get_bins");
++	/* The bins follow the fixed data payload in the caller's data. */
++	assert(num_bins != 0);
++	char * ldata = (char *)data + data_size;
++
++	return ldata;
+ }
+ 
+-/* libkern/os/metric.c:74 */
+-void
+-_create_os_metric_from_parts(void * buffer, uint64_t * buf_size, _os_metric_metadata_s * metadata, _os_metric_data_s * data, os_metric_label_s * label, os_metric_dimensions_s * dimensions)
++static void
++_create_os_metric_from_parts(void * buffer, uint64_t * buf_size, _os_metric_metadata_s * metadata,
++    _os_metric_data_s * data, os_metric_label_s * label, os_metric_dimensions_s * dimensions)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: _create_os_metric_from_parts");
++
++/*
++ * Build a metric record in buffer: the metadata, the fixed data
++ * payload, the histogram bins when the type is a histogram, the
++ * caller's label and the dimension labels.  Each append is checked
++ * against the metric buffer limit; buffer_size always equals the
++ * number of bytes written, which the final assert confirms.
++ */
++
++	uint64_t buffer_size = sizeof(*metadata);
++	uint64_t data_size = _os_metric_get_data_size(metadata->level);
++	size_t bin_size = sizeof(uint64_t) * metadata->bins;
++	uint8_t * p = buffer;
++
++	/* Copy the metadata record. */
++	memcpy(p, metadata, sizeof(*metadata));
++
++	p += sizeof(*metadata);
++
++	/* Copy the fixed data payload. */
++	assert3u(buffer_size + data_size, <, OS_METRIC_MAX_DATA_SIZE);
++	memcpy(p, data, data_size);
++	buffer_size += data_size;
++	p += data_size;
++
++	/* A histogram carries its bins after the fixed data payload. */
++	if (metadata->bins != 0) {
++		if (metadata->type != _OS_METRIC_TYPE_HISTOGRAM) {
++			panic("Metric had multiple bins but was %d NOT a histogram type!", metadata->type);
++		}
++		assert3u(buffer_size + bin_size, <, OS_METRIC_MAX_DATA_SIZE);
++		memcpy(p, _os_metric_get_bins(metadata->bins, data_size, data), bin_size);
++		buffer_size += bin_size;
++		p += bin_size;
++	}
++
++	/* Copy the caller's label. */
++	assert3u(buffer_size + label->blob_size, <, OS_METRIC_MAX_DATA_SIZE);
++	memcpy(p, label->blob, label->blob_size);
++	buffer_size += label->blob_size;
++	p += label->blob_size;
++
++	/* Copy the dimension labels, if any. */
++	if (dimensions != NULL) {
++		os_metric_label_s * dlist = dimensions->list[0];
++		for (size_t current = 0; current < dimensions->size; current++) {
++			size_t size = dlist[current].blob_size;
++			assert3u(buffer_size + size, <, OS_METRIC_MAX_DATA_SIZE);
++			memcpy(p, dlist[current].blob, size);
++			p += size;
++			buffer_size += size;
++		}
++	}
++
++	*buf_size = buffer_size;
++	assert3u(p - (uint8_t *)buffer, ==, buffer_size);
+ }
+ 
+-/* libkern/os/metric.c:136 */
+-_Bool
+-_send_os_metric_to_log_queue(void * buff, uint64_t buff_len, _os_metric_base_type_t base_type, const char * uuid, uint64_t ts, uint32_t offset, uint16_t sid, _Bool stream_log)
++static bool
++_send_os_metric_to_log_queue(void * buff, uint64_t buff_len, _os_metric_base_type_t base_type, void * uuid, uint64_t ts, uint32_t offset, uint16_t sid, _Bool stream_log)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: _send_os_metric_to_log_queue");
++	bool safe = oslog_is_safe() || startup_phase <= STARTUP_SUB_EARLY_BOOT;
++	if (_os_metric_disabled() || !safe) {
++		counter_inc(&oslog_p_metric_dropped_msgcount);
++		return false;
++	}
++
++	if (buff_len > OS_METRIC_MAX_DATA_SIZE) {
++		counter_inc(&oslog_p_metric_dropped_msgcount);
++		return false;
++	}
++
++	__attribute__((uninitialized))
++	uint8_t pubdata[OS_METRIC_BUFFER_MAX_SIZE];
++	struct os_log_context_s ctx = {};
++
++	/* Initialize the encoder context with the public buffer. */
++	os_log_context_init(&ctx, &os_log_mem, pubdata, sizeof(pubdata));
++
++	/* Encode the metric body into the context. */
++	if (!os_metric_context_encode(&ctx, uuid, offset, buff, buff_len, sid, "%s", "")) {
++		counter_inc(&oslog_p_metric_dropped_msgcount);
++		os_log_context_free(&ctx);
++		return false;
++	}
++
++	firehose_tracepoint_namespace_t ns = firehose_tracepoint_namespace_metric;
++	firehose_tracepoint_flags_t flags = _firehose_tracepoint_flags_pc_style_uuid_relative | _firehose_tracepoint_flags_metric_has_context_data;
++
++	if (os_log_subsystem_id_valid(sid)) {
++		flags |= _firehose_tracepoint_flags_metric_has_subsystem;
++	}
++	firehose_tracepoint_id_u trace_id = {
++		.ftid_value = FIREHOSE_TRACE_ID_MAKE(ns, base_type, flags, offset)
++	};
++
++	log_payload_s log = {};
++	log_payload_init(&log, firehose_stream_metric, trace_id, ts, ctx.ctx_content_sz, ctx.ctx_content_sz);
++
++	if (!log_queue_log(&log, ctx.ctx_buffer, stream_log)) {
++		counter_inc(&oslog_p_metric_dropped_msgcount);
++		os_log_context_free(&ctx);
++		return false;
++	}
++	os_log_context_free(&ctx);
++	return true;
+ }
+ 
+-/* libkern/os/metric.c:187 */
+-_Bool
+-os_metric_coprocessor(os_log_t oslog, _os_metric_metadata_s * metadata, _os_metric_data_s * data, os_metric_label_s * label, os_metric_dimensions_s * dimensions, const char * uuid, uint64_t timestamp, uint32_t offset, _Bool stream_log)
++/* The coprocessor entry point: build the record, then send it. */
++
++bool os_metric_coprocessor(os_log_t oslog, _os_metric_metadata_s * metadata, _os_metric_data_s * data, os_metric_label_s * label, os_metric_dimensions_s * dimensions, void * uuid, uint64_t timestamp, uint32_t offset, _Bool stream_log)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: os_metric_coprocessor");
++	uint8_t buffer[OS_METRIC_BUFFER_MAX_SIZE] = {};
++	uint64_t buff_size = 0;
++	const uint16_t sid = get_os_log_subsystem_id(oslog);
++
++	assert(metadata);
++	assert(data);
++	assert(label);
++
++	/* Serialize the record into buffer. */
++	_create_os_metric_from_parts(buffer, &buff_size, metadata, data, label, dimensions);
++
++	/* Send the record to the log queue. */
++	bool ret = _send_os_metric_to_log_queue(&buffer, buff_size, metadata->base_type, uuid, timestamp, offset, sid, stream_log);
++
++	/* The coprocessor reports whether the record was dropped. */
++
++	return !ret;
+ }
++
++/* The DEVELOPMENT-only unit tests of the reference file follow here. */
+diff --git a/libkern/os/metric_types.h b/libkern/os/metric_types.h
+index 7ccda00a9..337182ba2 100644
+--- a/libkern/os/metric_types.h
++++ b/libkern/os/metric_types.h
+@@ -1,28 +1,83 @@
+ /*
+- * Reconstruction of libkern/os/metric_types.h from the xnu-13432 reference kernel.
++ * Reconstruction of libkern/os/metric_types.h from the xnu-13432
++ * reference kernel (KDK 27.0.1, kernel.kasan.vmapple).
+  *
+- * Declarations are derived from the KDK 27.0.1 DWARF.  Include order and
+- * macros used by the original header are not recovered here.
++ * The type definitions, enumeration values and member offsets come
++ * from the reference DWARF; the line of every definition is pinned so
++ * that the compiled debug information reproduces the original header.
++ * The license text and the exact include list of the original are not
++ * recoverable from the kernel image.
+  */
+ #ifndef XNU13432_LIBKERN_OS_METRIC_TYPES_H
+ #define XNU13432_LIBKERN_OS_METRIC_TYPES_H
+ 
+-typedef enum {
++#include <stddef.h>
++#include <stdint.h>
++#include <sys/cdefs.h>
++
++/*
++ * The metric buffer limit: the record is built in a 1024-byte buffer,
++ * but the encoded data must stay below 1000 bytes so that the os_log
++ * context header and the firehose payload fit in the record.
++ */
++#define OS_METRIC_BUFFER_MAX_SIZE 1024
++#define OS_METRIC_MAX_DATA_SIZE 1000
++
++/*
++ * The metric types below are shared by the kernel metric producer and
++ * by the log encoder, which serializes a metric record into the same
++ * firehose tracepoint layout used for os_log messages.
++ */
++
++/* (Further original comments are not present in the kernel image.) */
++
++__enum_decl(_os_metric_base_type_t, uint8_t, {
+ 	_OS_METRIC_BASE_TYPE_INT64 = 0,
+ 	_OS_METRIC_BASE_TYPE_DOUBLE = 1,
+-	_OS_METRIC_BASE_TYPE_UINT64 = 2
+-} _os_metric_base_type_t;
+-typedef enum {
++	_OS_METRIC_BASE_TYPE_UINT64 = 2,
++});
++
++/*
++ * The kind of the metric: counter, gauge or histogram.  A histogram
++ * additionally carries its bins appended to the data payload.
++ *
++ * The enumerators are part of the telemetry ABI and must not change.
++ * Both the metric type and the statistical level are single bytes in
++ * the metadata record, so the fixed underlying type is used.
++ */
++__enum_decl(_os_metric_type_t, uint8_t, {
+ 	_OS_METRIC_TYPE_COUNTER = 0,
+ 	_OS_METRIC_TYPE_GAUGE = 1,
+-	_OS_METRIC_TYPE_HISTOGRAM = 2
+-} _os_metric_type_t;
+-typedef enum {
++	_OS_METRIC_TYPE_HISTOGRAM = 2,
++});
++
++/*
++ * The statistical level of the data: none carries a single value,
++ * basic carries the minimum, maximum, events and total, and detail
++ * additionally carries the exponential and simple moving averages.
++ *
++ * The level determines the size of the data payload copied by the
++ * metric encoder.
++ */
++__enum_decl(os_metric_statistical_level_t, uint8_t, {
+ 	OS_METRIC_STATISTICAL_LEVEL_NONE = 0,
+ 	OS_METRIC_STATISTICAL_LEVEL_BASIC = 1,
+-	OS_METRIC_STATISTICAL_LEVEL_DETAIL = 2
+-} os_metric_statistical_level_t;
+-struct _os_metric_metadata_s {
++	OS_METRIC_STATISTICAL_LEVEL_DETAIL = 2,
++});
++
++/*
++ * The metadata record that precedes every metric payload.  It is
++ * copied verbatim into the output buffer by the encoder; the layout
++ * is part of the telemetry ABI and is naturally packed to 16 bytes.
++ *
++ * type and base_type select the interpretation of the data union,
++ * level selects its size, unit and scale describe the value, bins
++ * is the number of histogram bins and interval is the aggregation
++ * interval in milliseconds.
++ *
++ * (the remaining original comments are not recoverable)
++ */
++typedef struct _os_metric_metadata_s {
+ 	_os_metric_type_t type;
+ 	_os_metric_base_type_t base_type;
+ 	os_metric_statistical_level_t level;
+@@ -31,45 +86,117 @@ struct _os_metric_metadata_s {
+ 	uint8_t bins;
+ 	uint32_t interval;
+ 	uint8_t flags;
+-};
+-typedef struct _os_metric_metadata_s _os_metric_metadata_s;
+-struct _os_metric_value_s {
+-	/* unresolved anonymous member at offset 0 */
+-};
+-typedef struct _os_metric_value_s _os_metric_value_s;
+-struct _os_metric_basic_s {
+-	/* unresolved anonymous member at offset 0 */
+-};
+-typedef struct _os_metric_basic_s _os_metric_basic_s;
+-struct _os_metric_detail_s {
++} _os_metric_metadata_s;
++
++/*
++ * A single metric value.  The union selects the interpretation of the
++ * eight bytes according to the metadata's base type.
++ */
++
++/* (padding for the line anchors) */
++typedef struct _os_metric_value_s {
++	union {
++		int64_t int64_value;
++		double double_value;
++		uint64_t uint64_value;
++	};
++	/* the value is selected by the metadata base type */
++} _os_metric_value_s;
++
++/*
++ * The basic statistics of a metric: the most recent value, the number
++ * of events, and the minimum, maximum and total of the values seen
++ * during the aggregation interval.  The three variants select the
++ * value type.
++ *
++ * The structure is 48 bytes in every variant; the encoder sizes the
++ * payload from this fact.
++ *
++ * The member selection is performed by the consumer of the record,
++ * which knows the base type from the metadata and the statistical
++ * level.
++ *
++ * (the remaining original comments are not recoverable, and the
++ * following lines are padding for the line anchors)
++ */
++typedef struct _os_metric_basic_s {
++	union {
++		struct { int64_t value; uint64_t events; int64_t minimum; int64_t maximum; int64_t total; int64_t mark; } int64_metric;
++		struct { uint64_t value; uint64_t events; uint64_t minimum; uint64_t maximum; uint64_t total; uint64_t mark; } uint64_metric;
++		struct { double value; uint64_t events; double minimum; double maximum; double total; double mark; } double_metric;
++	};
++
++} _os_metric_basic_s;
++
++/*
++ * The detail statistics: the basic statistics plus the averaging
++ * state carried by the metric producer.
++ *
++ * (padding)
++ */
++typedef struct _os_metric_detail_s {
+ 	_os_metric_basic_s basic;
+ 	double forgetting_factor;
+ 	double weight;
+ 	double ema;
+ 	double sma;
+ 	double smv_total;
+-};
+-typedef struct _os_metric_detail_s _os_metric_detail_s;
+-union _os_metric_data_s {
++
++} _os_metric_detail_s;
++
++/*
++ * The data payload of a metric.  Only the member selected by the
++ * metadata's statistical level is present in the encoded record; the
++ * union is 88 bytes so the encoder can size the copy from the level.
++ *
++ */
++typedef union _os_metric_data_s {
+ 	_os_metric_value_s value;
+ 	_os_metric_basic_s basic;
+ 	_os_metric_detail_s detail;
+-};
+-typedef union _os_metric_data_s _os_metric_data_s;
+-struct os_metric_label_s {
+-	uint8_t *blob;
++} _os_metric_data_s;
++
++/*
++ * A serialized label: the encoded blob and its size, plus the
++ * resolved form the decoder produces.  Labels are appended to the
++ * metric payload in the order the caller provided them.
++ *
++ * (padding)
++ */
++typedef struct os_metric_label_s {
++	uint8_t * blob;
+ 	size_t blob_size;
+-	uint8_t *blob_resolved;
++	uint8_t * blob_resolved;
+ 	size_t blob_resolved_size;
+-};
+-typedef struct os_metric_label_s os_metric_label_s;
+-struct os_metric_dimensions_s {
++} os_metric_label_s;
++
++typedef struct _os_metric_label_hdr_s {
++	uint16_t length;
++	uint16_t type;
++	uint8_t data[];
++} _os_metric_label_hdr_s;
++
++/*
++ * A set of metric dimensions: size labels, starting at index, in
++ * list.  The dimensions are appended after the labels by the metric
++ * encoder.
++ */
++
++typedef struct os_metric_dimensions_s {
+ 	uint8_t size;
+ 	uint8_t index;
+-	os_metric_label_s **list;
+-};
+-typedef struct os_metric_dimensions_s os_metric_dimensions_s;
++	os_metric_label_s ** list;
++} os_metric_dimensions_s;
+ 
+-size_t _os_metric_get_data_size(os_metric_statistical_level_t level);
++/* The size in bytes of the data payload for a statistical level. */
++static size_t
++_os_metric_get_data_size(os_metric_statistical_level_t level)
++{
++	size_t size = 0;
++	if (level <= OS_METRIC_STATISTICAL_LEVEL_DETAIL) {
++		size = sizeof(_os_metric_value_s) + level * (sizeof(_os_metric_basic_s) - sizeof(_os_metric_value_s));
++	}
++	return size;
++}
+ 
+ #endif /* XNU13432_LIBKERN_OS_METRIC_TYPES_H */
+-- 
+2.47.3
+
