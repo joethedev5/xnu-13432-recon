@@ -1,0 +1,64 @@
+name: xnu-refs
+on:
+  workflow_dispatch:
+jobs:
+  collect:
+    runs-on: xcode-27
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Collect host facts, kernels and SDK headers
+        run: |
+          set -euo pipefail
+          mkdir -p payload
+          { sw_vers; uname -a; sysctl -n kern.version; sysctl -n kern.osversion; } > payload/host.txt 2>&1
+          sysctl -a > payload/sysctl-all.txt 2>&1 || true
+          system_profiler SPSoftwareDataType SPHardwareDataType > payload/system-profiler.txt 2>&1 || true
+          csrutil status > payload/csrutil.txt 2>&1 || true
+          kmutil showloaded --list-only > payload/kmutil-showloaded.txt 2>&1 || true
+          kmutil inspect > payload/kmutil-inspect.txt 2>&1 || true
+          kmutil dumpstate > payload/kmutil-dumpstate.txt 2>&1 || true
+          { ls -la /System/Library/Kernels;
+            find /System/Library/Kernels -maxdepth 1 -type f -exec ls -l {} \; ; } > payload/kernels-ls.txt 2>&1 || true
+          { ls -la /System/Library/KernelCollections;
+            find /System/Library/KernelCollections -maxdepth 1 -type f -exec ls -l {} \; ; } > payload/kc-ls.txt 2>&1 || true
+          find /System/Volumes/Preboot -maxdepth 8 \( -name '*.kc' -o -name 'kernel.release*' \) -exec ls -l {} \; > payload/preboot-kernel-files.txt 2>&1 || true
+          mkdir -p payload/kernels
+          for f in /System/Library/Kernels/*; do
+            [ -f "$f" ] || continue
+            sz=$(stat -f%z "$f")
+            if [ "$sz" -lt 200000000 ]; then cp "$f" payload/kernels/; fi
+          done
+          SDK=$(xcrun --show-sdk-path)
+          echo "$SDK" > payload/sdk-path.txt
+          xcrun --show-sdk-version >> payload/sdk-path.txt 2>&1 || true
+          tar -C "$SDK/usr" -cJf payload/macos-sdk-usr-include.tar.xz include 2>/dev/null || true
+          if [ -d "$SDK/System/Library/Frameworks/Kernel.framework" ]; then
+            tar -C "$SDK/System/Library/Frameworks" -cJf payload/kernel-framework.tar.xz Kernel.framework 2>/dev/null || true
+          fi
+          XCSDK="$(xcode-select -p)/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+          if [ -d "$XCSDK/usr/include" ]; then
+            tar -C "$XCSDK/usr" -cJf payload/xcode-macos-sdk-usr-include.tar.xz include 2>/dev/null || true
+          fi
+          du -sh payload payload/* 2>/dev/null
+
+      - name: Push payload to private refs repo
+        env:
+          REFS_KEY: ${{ secrets.REFS_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "$REFS_KEY" > ~/.ssh/xnu_refs_deploy
+          chmod 600 ~/.ssh/xnu_refs_deploy
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/xnu_refs_deploy -o IdentitiesOnly=yes"
+          git clone git@github.com:joethedev5/xnu-13432-refs.git refs
+          cd refs
+          mkdir -p "hosts/27.0.1-26A434"
+          cp -R ../payload/. "hosts/27.0.1-26A434/"
+          git config user.name xnu-recon-bot
+          git config user.email xnu-recon-bot@users.noreply.github.com
+          git add -A
+          git commit -m "Collect xnu-13432 VMAPPLE reference (macOS 27.0.1 26A434)"
+          git push origin HEAD:main
