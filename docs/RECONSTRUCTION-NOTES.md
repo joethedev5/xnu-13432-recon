@@ -230,3 +230,31 @@ types and their packing macros moved verbatim from
 `vm_map_store_internal.h` into `vm_map_store_types_internal.h`, so the
 header set no longer duplicates live definitions.  Remaining explicit
 stubs: 308.
+
+## 2026-11-25: RBBR receive-window algorithm reconstruction
+
+DWARF variable locations resolved every RBBR tunable to its address
+(`0xfffffe0007cbf44c`-`0x7cbf4c0`) and the reference image supplied the
+initial values, so all 30 `int` parameters are restored by name and
+value (for example `rbbr_rtt_probe_period = 30`,
+`rbbr_rtt_probe_rwnd_mss = 10`, `rbbr_min_rwnd_mss = 2`,
+`rbbr_startup_gain = 200`).
+
+Recovered bodies:
+- `tcp_rbbr_init` / `tcp_rbbr_switch_to` (identical in the reference,
+  which folded them): allocate `tcp_rbbr_state` from the kalloc-type
+  `tcp_rbbr_state_zone`, bump `tcp_cc_rbbr.num_sockets`, initialize the
+  window from `rbbr_rtt_probe_rwnd_mss`, and schedule the next probe
+  boundary from `rbbr_rtt_probe_period`.
+- `tcp_rbbr_cleanup`: decrement the socket count and free the state.
+- `tcp_rbbr_get_rlwin`: skip-restrict and negotiation handling, window
+  rounding to `rcv_scale`, and pending-window-change expiry against
+  `rcv_adv`.
+- `tcp_rbbr_after_idle`: state reset preserving `rwnd_est` and
+  `delay_exceeded_seen`, initial-window fallback, phase reset and probe
+  boundary scheduling.
+- `ml_device_is_prod_fused`: `/chosen`
+  `certificate-production-status` 32-bit property read.
+
+`tcp_cc_rbbr` is declared and initialized in `tcp_cc.h` / `tcp_rbbr.c`.
+Remaining explicit stubs: 302.
