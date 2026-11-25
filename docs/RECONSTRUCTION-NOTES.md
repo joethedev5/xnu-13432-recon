@@ -2239,3 +2239,95 @@ The patch compiles with the reference RELEASE flags (C++2b,
 4db37268bb5a01a17eebf2ed1f4be339e0cee81f.
 
 The patch series now has 64 entries; 49 explicit stubs remain.
+
+## 2026-11-25: the network observability unit
+
+Patch 65 recovers `bsd/net/observability.c` (six functions) from the KDK
+27.0.1 DWARF, the RELEASE and kasan vmapple kernels and the decoded
+string tables.  The file does not exist in the public tree, so the whole
+unit is new source.
+
+Reference layout: `observability_init` at 243 (48 bytes, kasan
+0x840d1d8), `sysctl_privacy_enhancements` at 299 (376 bytes,
+0x840d208), `check_parent_chain` at 102 (616 bytes, 0x840da18),
+`net_check_observability_permission_impl` at 352 (1688 bytes,
+0x840d380), `process_can_see_connections` at 545 (72 bytes, 0x840dc80)
+and `net_observability_should_hide_socket` at 555 (308 bytes,
+0x840dcc8).  The RELEASE image keeps only net_check (0x77376dc, 408
+bytes), check_parent_chain (0x7737874) and the two small callers, which
+are inlined there; observability_init, the privacy sysctls and the four
+debug sysctls are under `#if DEVELOPMENT || DEBUG`.
+
+Types: `parent_chain_result_t` is the 32-bit enum at line 56
+(PARENT_CHAIN_CLEAN 0, PARENT_CHAIN_HAS_UNTRUSTED 1);
+`parent_chain_info_t` is the 44-byte record at 77 with
+`entitled_ancestor` (bool, 0), `untrusted_pid` (pid_t, 4) and
+`untrusted_name` (proc_name_t, 8; 33 bytes, which is the length passed
+to both strbufcpy calls).
+
+check_parent_chain (kasan 0x840da18; RELEASE 0x7737874) starts from
+`proc_ppid(proc)` and `proc_uniqueid(proc)`, loops while
+`ppid >= 2 && depth < 63`, looks the ancestor up with proc_find, and
+stops with HAS_UNTRUSTED when the lookup fails (117) or when the found
+process has the child's uniqueid, the pid-reuse/cycle test at 130 whose
+name copy is at 132.  For each ancestor with a task (138), the
+observer entitlement
+("com.apple.developer.networking.topology-observation") is honored
+only when requested (177/178); a match sets entitled_ancestor and
+returns CLEAN (180-183).  Otherwise a non-platform task (197) must
+have validation category 6 (Developer ID) from
+csproc_get_validation_category (200-202), or the walk returns
+HAS_UNTRUSTED with the name copied at 211/212.  The next ancestor is
+read before proc_rele (224-226), the depth-limited result is computed
+at 228, and the record is copied to `*out_info` at 234; the 44-byte
+memmove confirms the struct size.
+
+net_check (kasan 0x840d380; RELEASE 0x77376dc, 408 bytes): root
+(proc_suser == 0, 361/362) is allowed; lockdown mode
+(get_lockdown_mode_state, 379) allows only platform binaries whose
+chain is clean with honor_entitlement false (380-383), denying
+non-platform binaries and non-clean chains (394); the entitlement is
+then checked on the task (403) and allowed (404-405); a non-Apple
+bundle identity (cs_identity_get at 418, checks 419-422) is classified
+by csproc_get_validation_category (431): Developer ID is allowed
+(434/436), categories 2-5 are logged and fall through (441-443), and
+the unsigned range (< 2 or >= 6) walks the chain with honor_entitlement
+true (450-463) and allows a clean chain (465-467).  Everything else
+reaches the platform-binary check at 495, which denies a non-clean
+chain (513/514) and allows a clean one (520/521), with the final
+non-platform denial at 540.  The 13 log strings and the os_log
+subsystem "com.apple.xnu.net.observability" were decoded from the kasan
+string tables; the release image contains none of them, which is why
+its net_check has no log rows.
+
+process_can_see_connections returns true when
+net_inet_hide_pcb_established is zero and otherwise calls net_check
+with current_proc() and `__FILE_NAME__` ("observability.c" at
+0x70c6000+0x64f).  net_observability_should_hide_socket returns false
+for a null socket or an already-authorized caller, keeps the socket
+visible when last_pid (0x21c) or e_pid (0x344) equals current_pid
+(566), and hides it otherwise (572).
+
+The sysctls are the net.observability node (249), the always-present
+net_rt_filter_cloned_routes and net_inet_hide_pcb_established (256,
+263), and, under the development guard, logging (272),
+filter_cloned_routes (276), hide_pcb_established (280),
+filter_mac_addresses (289, over dlil_lladdr_ckreq) and the
+privacy_enhancements proc node (337).  The handler reads the current
+route switch, calls sysctl_handle_int (308) and returns early on error
+or a read (309-314); a write copies the value to the route, MAC
+address and TCP switches (317-321) and logs the change (323).
+
+Compiler notes: the file compiles with the reference RELEASE flags and
+with DEVELOPMENT+DEBUG defined.  The statement line anchors match the
+KDK line tables; Apple clang attributes some expressions (loop
+conditions, call arguments and the category dispatch) to different
+columns than clang 19, the same compiler-version difference seen in the
+other units, and in the development build Apple clang folds the two
+independent category conditions of lines 434 and 441 into one dispatch
+block attributed to 434.
+
+The patch applies to the series with tree hash
+254718811c56b3c454b71aa0edc6c0e00638f66c.
+
+The patch series now has 65 entries; 45 explicit stubs remain.

@@ -1,0 +1,653 @@
+From 07c34a4b7cff1e361441b18bd23421d35f376a94 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 21:56:01 +0000
+Subject: [PATCH] Recover bsd/net/observability.c
+
+Reconstruct the network observability unit from the KDK 27.0.1 DWARF and
+the RELEASE and kasan vmapple kernels: the parent-chain result enum and
+info record, the development-only log handle, the observability sysctls
+and all six functions of the unit.
+
+check_parent_chain() walks the parent chain from proc_ppid() and
+proc_uniqueid() up to launchd, bounded at 63 levels, and stops at the
+first untrusted ancestor.  It detects pid reuse and cycles by comparing
+the uniqueid of the process found for ppid against the child's uniqueid,
+records the pid and command name of the offending process, honors the
+network observer entitlement when asked (clearing the chain and setting
+entitled_ancestor), and treats platform binaries and Developer ID signed
+third-party binaries as trusted.
+
+net_check_observability_permission_impl() allows root; under lockdown
+mode it allows only platform binaries with a clean chain, without
+honoring the entitlement; otherwise it allows entitled tasks,
+third-party bundles (cs_identity_get(), a non-empty identity containing
+a dot and not prefixed by "com.apple.") with a Developer ID category,
+unsigned third-party bundles with a clean chain (entitlement honored),
+and platform binaries with a clean chain.  Everything else is denied.
+process_can_see_connections() short-circuits on the
+net_inet_hide_pcb_established switch and passes the source file name as
+the log prefix; net_observability_should_hide_socket() keeps a socket
+visible to its current process (last_pid/e_pid) and hides it otherwise.
+
+The sysctls are the net.observability node, the always-present
+net_rt_filter_cloned_routes and net_inet_hide_pcb_established defaults
+(1), the development-only logging switch, the per-filter switches and
+the privacy_enhancements master switch, which writes one value to the
+route filter, MAC address filter and TCP connection-hiding switches
+together.
+
+The file compiles with the reference RELEASE flags and with the
+DEVELOPMENT+DEBUG configuration; the statement line anchors match the
+KDK line tables (Apple clang attributes some comparisons to a different
+column than clang 19, as in the other recovered units).
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ bsd/net/observability.c | 576 ++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 552 insertions(+), 24 deletions(-)
+
+diff --git a/bsd/net/observability.c b/bsd/net/observability.c
+index 15c424531..6af20de60 100644
+--- a/bsd/net/observability.c
++++ b/bsd/net/observability.c
+@@ -1,45 +1,573 @@
+ /*
+- * Reconstruction of bsd/net/observability.c from the xnu-13432 reference kernel.
++ * Reconstruction of bsd/net/observability.c from the xnu-13432 reference
++ * kernel.
+  *
+- * Function signatures and ordering are derived from the KDK 27.0.1
+- * DWARF.  Functions marked RECON were moved from the public xnu source
+- * when the reference kernel placed them in this file; bodies marked
+- * "body not recovered" are still stubs.
++ * The file decides whether a process may observe the sockets and the
++ * connections that belong to other processes.  A process is allowed when
++ * it is root, holds the network observer entitlement, is platform signed
++ * with a clean parent chain, or is a signed third-party application.
++ * The parent walk is shared with the rest of the network stack through
++ * net_check_observability_permission_impl().
++ *
++ * Function signatures, record layouts and statement lines are derived
++ * from the KDK 27.0.1 DWARF and cross-checked against the RELEASE and
++ * kasan vmapple kernels.
+  */
++
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/kernel.h>
++#include <sys/proc.h>
++#include <sys/proc_internal.h>
++#include <sys/proc_private.h>
++#include <sys/socketvar.h>
++#include <sys/sysctl.h>
++#include <sys/ubc.h>
++#include <sys/codesign.h>
++#include <sys/lockdown_mode.h>
++#include <sys/vm.h>
++#include <kern/assert.h>
++#include <kern/task.h>
++#include <libkern/os/log.h>
++#include <IOKit/IOBSD.h>
++#include <string.h>
++
++
++/*
++ * Network observability lets privileged processes inspect the sockets and
++ * connections of other processes.  The policy is deliberately
++ * conservative: a process is trusted only when every ancestor that could
++ * have influenced it is either platform signed or properly signed by a
++ * third-party certificate.  The walk never trusts the immediate parent
++ * alone, because a helper process can be re-parented into a trusted
++ * daemon.
++ *
++ * The result of the walk is one of the two values below.  The details of
++ * the first untrusted ancestor are filled into parent_chain_info_t so the
++ * caller can log them and so the policy can be diagnosed without
++ * inspecting the process hierarchy separately.
++ *
++ * The categories used when validating a signed third-party binary come
++ * from cs_blobs.h.  TestFlight, development, App Store and enterprise
++ * signed binaries are treated as signed; a Developer ID signature is
++ * trusted directly; everything else (ad-hoc or unsigned) is considered
++ * unsigned.
++ */
++typedef enum : uint32_t {
++	PARENT_CHAIN_CLEAN = 0,
++	PARENT_CHAIN_HAS_UNTRUSTED = 1,
++	/* A process in the chain could not be validated. */
++} parent_chain_result_t;
++
++/*
++ * Details about the first ancestor that made the chain untrusted.
++ *
++ * entitled_ancestor is set when the walk stopped at an ancestor that
++ * holds the network observer entitlement; in that case the chain is
++ * considered clean for the purposes of the policy, and the caller only
++ * uses the flag for diagnostics.
++ *
++ * untrusted_pid and untrusted_name describe the process that failed the
++ * validation.  untrusted_name is the process command name, not the
++ * executable path, and is truncated to the size of proc_name_t.  The
++ * structure is copied out by value at the end of the walk, so it must
++ * stay small; proc_name_t is MAXCOMLEN + 1 bytes and the padding is
++ * explicit in the layout below.
++ */
++typedef struct {
++	bool entitled_ancestor;
++	pid_t untrusted_pid;
++	proc_name_t untrusted_name;
++} parent_chain_info_t;
++
++#if DEVELOPMENT || DEBUG
++#define NETOBS_LOG(fmt, ...) \
++	do { \
++		if (net_network_observability_logging && net_observability_log) { \
++			os_log(net_observability_log, fmt, ##__VA_ARGS__); \
++		} \
++	} while (0)
++#else
++#define NETOBS_LOG(fmt, ...) do { } while (0)
++#endif
+ 
+-#define RECON_BSD_NET_OBSERVABILITY_C 1
++/*
++ * The chain is bounded so a cycle in the parent pointers (or a very
++ * deep hierarchy) cannot stall the caller.  The limit is well above any
++ * hierarchy seen in practice.
++ */
++#define MAX_PARENT_CHAIN_DEPTH 63
+ 
+-/* bsd/net/observability.c:102 */
+-parent_chain_result_t
+-check_parent_chain(struct proc * proc, _Bool honor_entitlement, parent_chain_info_t * out_info)
++static parent_chain_result_t
++check_parent_chain(struct proc * proc, bool honor_entitlement,
++    parent_chain_info_t * out_info)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: check_parent_chain");
++	parent_chain_result_t result;
++	int depth;
++	pid_t ppid = proc_ppid(proc);
++	uint64_t ppid_uniqueid = proc_uniqueid(proc);
++	parent_chain_info_t info = {};
++
++	/* Walk up the chain until an ancestor fails validation. */
++
++	for (depth = 0; ppid >= 2 && depth < MAX_PARENT_CHAIN_DEPTH; depth++) {
++		proc_t p = proc_find(ppid);
++		if (p == NULL) {
++			/* The parent exited between the pid lookup and proc_find(). */
++			info.untrusted_pid = ppid;
++			result = PARENT_CHAIN_HAS_UNTRUSTED;
++			goto done;
++		}
++
++		/*
++		 * Guard against pid reuse while the chain is being walked:
++		 * the process found for ppid must not be the process whose
++		 * parent we followed to get here.  If it is, the chain is
++		 * cyclic and cannot be trusted.
++		 *
++		 * The name is recorded for the log message only.
++		 */
++		if (proc_uniqueid(p) == ppid_uniqueid) {
++			info.untrusted_pid = ppid;
++			strbufcpy(info.untrusted_name, sizeof(info.untrusted_name), p->p_comm, sizeof(info.untrusted_name));
++			proc_rele(p);
++			result = PARENT_CHAIN_HAS_UNTRUSTED;
++			goto done;
++		}
++
++		task_t task = proc_task(p);
++
++		/* A process that has no task cannot vouch for anything. */
++		if (task != NULL) {
++			/*
++			 * Entitlement handling.
++			 *
++			 * The network observer entitlement is the primary
++			 * authorization for observing the network.  A process
++			 * that holds it is allowed to see the sockets and
++			 * connections of every other process, regardless of
++			 * how it was launched.
++			 *
++			 * The entitlement is checked on the ancestor's task,
++			 * not on the process that started the walk.  Tasks
++			 * carry the loaded entitlement blob; the BSD process
++			 * does not.  An ancestor that holds the entitlement
++			 * therefore vouches for its descendants.
++			 *
++			 * The caller decides whether the entitlement is
++			 * honored.  The lockdown-mode path passes false,
++			 * because in lockdown mode only platform binaries
++			 * with a clean chain are allowed, and an entitled
++			 * third-party binary must not be able to bypass that
++			 * restriction.
++			 *
++			 * An entitled ancestor ends the walk with a clean
++			 * result.  There is no need to look further up: the
++			 * entitlement is an explicit grant by the system, and
++			 * the processes above the entitled one are, by
++			 * construction, the processes that launched it.
++			 *
++			 * The entitled_ancestor flag is reported to the
++			 * caller so its log messages can mention the reason
++			 * for the decision.  It is not used by the policy
++			 * itself; a clean result is all the caller needs.
++			 *
++			 * End of entitlement notes.
++			 */
++			if (honor_entitlement &&
++			    IOTaskHasEntitlement(task, "com.apple.developer.networking.topology-observation")) {
++				/* The ancestor is entitled: the chain is clean. */
++				info.entitled_ancestor = true;
++				proc_rele(p);
++				result = PARENT_CHAIN_CLEAN;
++				goto done;
++			}
++
++			/*
++			 * Every non-entitled ancestor must be platform
++			 * signed.  A third-party ancestor is acceptable
++			 * only when it holds a Developer ID signature,
++			 * because such a binary has a verifiable identity
++			 * even though it is not part of the platform.
++			 *
++			 * A platform binary is trusted as-is and the walk
++			 * continues with its parent.
++			 *
++			 */
++			if (!task_get_platform_binary(task)) {
++				/* The category is fetched for the process, not the task,
++				 * because codesigning is tracked on the BSD process. */
++				u_int32_t vc = 0;
++				if (csproc_get_validation_category(p, &vc) != 0 ||
++				    vc != CS_VALIDATION_CATEGORY_DEVELOPER_ID) {
++					/*
++					 * The ancestor is neither platform
++					 * signed nor Developer ID signed.
++					 * Record it and stop the walk; the
++					 * caller will deny the observation.
++					 *
++					 * The name is recorded for the log.
++					 */
++					info.untrusted_pid = ppid;
++					strbufcpy(info.untrusted_name, sizeof(info.untrusted_name), p->p_comm, sizeof(info.untrusted_name));
++					proc_rele(p);
++					result = PARENT_CHAIN_HAS_UNTRUSTED;
++					goto done;
++				}
++			}
++		}
++
++		/*
++		 * Move to the next ancestor.  proc_uniqueid() must be read
++		 * before the reference is dropped.
++		 */
++		ppid_uniqueid = proc_uniqueid(p);
++		ppid = proc_ppid(p);
++		proc_rele(p);
++	}
++	result = (depth >= MAX_PARENT_CHAIN_DEPTH) ? PARENT_CHAIN_HAS_UNTRUSTED : PARENT_CHAIN_CLEAN;
++
++	/* The walk finished or stopped early. */
++
++done:
++	/* The caller only needs the details when the chain failed. */
++	*out_info = info;
++
++	return result;
++}
++
++#if DEVELOPMENT || DEBUG
++os_log_t net_observability_log;
++
++void
++observability_init(void)
++{
++	net_observability_log = os_log_create("com.apple.xnu.net.observability", "");
+ }
++#endif /* DEVELOPMENT || DEBUG */
+ 
+-/* bsd/net/observability.c:352 */
+-_Bool
++SYSCTL_NODE(_net, OID_AUTO, observability, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "Network observability");
++
++/*
++ * These two switches are always present.  They are consumed by the route
++ * and TCP code and default to enabled on this platform.
++ */
++
++int net_rt_filter_cloned_routes = 1;
++
++/*
++ * Hide connection attempts and established connections from processes
++ * that are not entitled to observe them.
++ */
++
++int net_inet_hide_pcb_established = 1;
++
++#if DEVELOPMENT || DEBUG
++/*
++ * The rest of the file is only built into development and debug kernels.
++ * The logging switch and the privacy-enhancements master switch are
++ * exposed there for debugging.
++ */
++int net_network_observability_logging = 0;
++SYSCTL_INT(_net_observability, OID_AUTO, logging, CTLFLAG_RW | CTLFLAG_LOCKED, &net_network_observability_logging, 0, "Enable debug logging for network privacy filtering");
++
++/* Individual privacy filtering switches, controlled by the master switch below. */
++
++SYSCTL_INT(_net_observability, OID_AUTO, filter_cloned_routes, CTLFLAG_RW | CTLFLAG_LOCKED, &net_rt_filter_cloned_routes, 0, "Filter cloned routes from non-entitled processes");
++
++/* Hide the connection state of other processes. */
++
++SYSCTL_INT(_net_observability, OID_AUTO, hide_pcb_established, CTLFLAG_RW | CTLFLAG_LOCKED, &net_inet_hide_pcb_established, 0, "Hide connection attempts and established connections from non-entitled processes");
++
++/*
++ * MAC address filtering is implemented in dlil, which owns the variable.
++ * The master sysctl below updates it together with the route and TCP
++ * switches.
++ */
++
++extern int dlil_lladdr_ckreq;
++SYSCTL_INT(_net_observability, OID_AUTO, filter_mac_addresses, CTLFLAG_RW | CTLFLAG_LOCKED, &dlil_lladdr_ckreq, 0, "Enable MAC address filtering");
++
++/*
++ * Master switch for the network privacy enhancements.  Writing a new
++ * value updates all of the individual switches at once so they cannot
++ * be left in an inconsistent state by a partially applied sysctl.
++ *
++ * Reading the sysctl returns the value of the cloned route switch.
++ */
++static int
++sysctl_privacy_enhancements(struct sysctl_oid * oidp, void * arg1, int arg2, struct sysctl_req * req)
++{
++	/* Start from the value of the switch that is currently in force. */
++	int value;
++	int error;
++
++
++	value = net_rt_filter_cloned_routes;
++
++	error = sysctl_handle_int(oidp, &value, 0, req);
++	if (error != 0) {
++		return error;
++	}
++	if (req->newptr == 0) {
++		return error;
++	}
++
++
++	net_rt_filter_cloned_routes = value;
++
++	dlil_lladdr_ckreq = value;
++
++	net_inet_hide_pcb_established = value;
++
++	NETOBS_LOG("privacy_enhancements sysctl changed to %d (filter_cloned_routes=%d, filter_mac_addresses=%d, hide_pcb_established=%d)",
++	    value, net_rt_filter_cloned_routes, dlil_lladdr_ckreq, net_inet_hide_pcb_established);
++
++	/*
++	 * All of the switches have been updated together.  The value
++	 * returned by sysctl_handle_int() is zero here: errors and the
++	 * read-only case returned early above.
++	 *
++	 * One write to privacy_enhancements turns all three filters on or
++	 * off as a unit.
++	 */
++	return error;
++}
++
++SYSCTL_PROC(_net_observability, OID_AUTO, privacy_enhancements, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_privacy_enhancements, "I", "Primary switch for network privacy enhancements (sets filter_cloned_routes, filter_mac_addresses, hide_pcb_established)");
++
++#endif /* DEVELOPMENT || DEBUG */
++
++/*
++ * The permission check shared by the socket and connection listing code.
++ * The caller supplies a short prefix (normally its source file name) that
++ * is prepended to the debug log messages.  The check is ordered from most
++ * to least privileged: root, lockdown mode, the observer entitlement,
++ * signed third-party applications, and finally the platform-binary
++ * parent chain.
++ *
++ * The caller holds a reference on proc for the duration of the call.
++ */
++bool
+ net_check_observability_permission_impl(struct proc * proc, const char * log_prefix)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: net_check_observability_permission_impl");
++	/*
++	 * The root user can always observe the network.
++	 */
++	/*
++	 * proc_suser() returns 0 for the root user and an error for
++	 * everybody else.
++	 */
++	bool is_root = (proc_suser(proc) == 0);
++	if (is_root) {
++		NETOBS_LOG("%s root process, allowing access (proc=%s)\n", log_prefix, proc->p_comm);
++		return true;
++	}
++
++	task_t task = proc_task(proc);
++
++	/*
++	 * In lockdown mode the policy is stricter: only platform signed
++	 * binaries with a clean parent chain are allowed to observe the
++	 * network.  The observer entitlement is deliberately not honored
++	 * here: in lockdown mode a third-party binary must not be able to
++	 * observe the network even when it holds the entitlement.
++	 *
++	 * The chain walk is called with honor_entitlement = false, so an
++	 * entitled ancestor does not make the chain clean.
++	 */
++	if (get_lockdown_mode_state() != 0) {
++		if (task != NULL && task_get_platform_binary(task)) {
++			parent_chain_info_t info = {};
++			parent_chain_result_t chain_result =
++			    check_parent_chain(proc, false, &info);
++
++			if (chain_result == PARENT_CHAIN_CLEAN) {
++				NETOBS_LOG("%s lockdown mode: platform binary with clean parent chain, allowing access (proc=%s)\n", log_prefix, proc->p_comm);
++				return true;
++			}
++
++			NETOBS_LOG("%s lockdown mode: platform binary with non-clean parent chain (result=%d, untrusted=%s pid=%d), denying access (proc=%s)\n", log_prefix, chain_result, info.untrusted_name, info.untrusted_pid, proc->p_comm);
++			return false;
++		}
++
++		return false;
++	}
++
++	/*
++	 * Outside lockdown mode an entitled process is allowed to observe
++	 * the network.  The entitlement is checked on the task because only
++	 * the task carries the loaded entitlement blob.
++	 */
++
++	if (task != NULL && IOTaskHasEntitlement(task, "com.apple.developer.networking.topology-observation")) {
++		NETOBS_LOG("%s process has network observer entitlement, allowing access (proc=%s)\n", log_prefix, proc->p_comm);
++		return true;
++	}
++
++	/*
++	 * Signed third-party applications are allowed to observe the
++	 * network when they have a bundle identifier that does not belong
++	 * to Apple.  The validation category decides whether the
++	 * application is trusted enough to skip the parent chain walk.
++	 *
++	 * A missing identity, an empty identity, an identity without a dot
++	 * or an Apple identity are not third-party: those processes fall
++	 * through to the standard checks below.
++	 */
++	const char * bundle_id = cs_identity_get(proc);
++	bool first_party = (bundle_id != NULL &&
++	    bundle_id[0] != '\0' &&
++	    strchr(bundle_id, '.') != NULL &&
++	    !strprefix(bundle_id, "com.apple."));
++	if (first_party) {
++		/*
++		 * The binary is third party.  Query its validation
++		 * category; an unknown category is treated as unsigned.
++		 */
++
++
++		u_int32_t validation_category = (u_int32_t)-1;
++		bool category_valid = (csproc_get_validation_category(proc, &validation_category) == 0);
++
++		if (category_valid) {
++			if (validation_category == CS_VALIDATION_CATEGORY_DEVELOPER_ID) {
++				/* Developer ID signed binaries are allowed. */
++				NETOBS_LOG("%s Developer ID signed binary, allowing access (proc=%s, bundle_id=%s)\n", log_prefix, proc->p_comm, bundle_id);
++				return true;
++			}
++
++			/* Signed third-party binaries go through the standard checks. */
++			if (validation_category >= CS_VALIDATION_CATEGORY_TESTFLIGHT &&
++			    validation_category < CS_VALIDATION_CATEGORY_DEVELOPER_ID) {
++				NETOBS_LOG("%s third-party signed binary (proc=%s, bundle_id=%s, category=%d), applying standard checks\n", log_prefix, proc->p_comm, bundle_id, validation_category);
++			}
++		}
++
++		/*
++		 * Unsigned binaries are allowed when their parent chain is clean.
++		 */
++		if (validation_category < CS_VALIDATION_CATEGORY_TESTFLIGHT ||
++		    validation_category >= CS_VALIDATION_CATEGORY_DEVELOPER_ID) {
++			/*
++			 * The chain walk is asked to honor the observer
++			 * entitlement, so an entitled ancestor is enough to
++			 * allow the process even when the rest of the chain
++			 * is not platform signed.
++			 *
++			 * A clean chain means every ancestor was platform or
++			 * Developer ID signed (or the chain ended at launchd).
++			 */
++			parent_chain_info_t info = {};
++			parent_chain_result_t chain_result =
++			    check_parent_chain(proc, true, &info);
++
++			if (chain_result == PARENT_CHAIN_CLEAN) {
++				/* The chain is clean: allow the observation. */
++				NETOBS_LOG("%s unsigned third-party app (proc=%s, bundle_id=%s%s), allowing access (vc=%d)\n", log_prefix, proc->p_comm, bundle_id, info.entitled_ancestor ? ", via entitled ancestor" : "", validation_category);
++				return true;
++			} else {
++				/*
++				 * Not clean: apply the standard checks below.
++				 */
++				NETOBS_LOG("%s unsigned binary with non-clean parent chain (result=%d, untrusted=%s pid=%d), applying standard checks (proc=%s)\n", log_prefix, chain_result, info.untrusted_name, info.untrusted_pid, proc->p_comm);
++			}
++
++			/*
++			 * Fall through to the standard checks below.
++			 */
++		}
++	}
++
++	/*
++	 * Standard checks for every process that was not allowed above.
++	 * A platform binary is allowed when its parent chain is clean; a
++	 * non-platform binary is always denied.
++	 *
++	 * These checks apply to:
++	 *   - platform binaries with no entitlement,
++	 *   - third-party binaries with an invalid or unsigned category,
++	 *   - Apple binaries, which are not third-party.
++	 *
++	 * The observer entitlement is honored in the chain walk, so a
++	 * helper spawned by an entitled daemon is allowed here as well.
++	 */
++	if (task != NULL && task_get_platform_binary(task)) {
++		/*
++		 * The platform binary's parent chain must be clean.  The
++		 * chain walk honors the observer entitlement so a helper
++		 * spawned by an entitled daemon is allowed even though its
++		 * ancestors are not platform signed.
++		 *
++		 * A chain that reaches launchd without finding a
++		 * non-platform, non-Developer-ID ancestor is clean.
++		 *
++		 * The walk is bounded by MAX_PARENT_CHAIN_DEPTH, so a very
++		 * deep or cyclic hierarchy is reported as untrusted rather
++		 * than stalling the caller.
++		 */
++		parent_chain_info_t info = {};
++		parent_chain_result_t chain_result =
++		    check_parent_chain(proc, true, &info);
++
++		if (chain_result != PARENT_CHAIN_CLEAN) {
++			NETOBS_LOG("%s platform binary spawned by non-platform parent (result=%d, untrusted=%s pid=%d), denying access (proc=%s)\n", log_prefix, chain_result, info.untrusted_name, info.untrusted_pid, proc->p_comm);
++			return false;
++		}
++
++		/* The chain is clean: allow the observation. */
++
++		NETOBS_LOG("%s platform binary with clean parent chain%s, allowing access (proc=%s)\n", log_prefix, info.entitled_ancestor ? ", via entitled ancestor" : "", proc->p_comm);
++		return true;
++	}
++
++	/*
++	 * The process is not platform signed and did not qualify above:
++	 * deny the observation.
++	 *
++	 * This covers unsigned third-party applications whose parent
++	 * chain was not clean, Apple applications with a non-platform
++	 * signature, and any process without a usable code signature.
++	 *
++	 * The denial is deliberately silent outside development kernels:
++	 * NETOBS_LOG is empty in release builds, so a release kernel only
++	 * returns the boolean and the caller decides how to report it.
++	 *
++	 * This is the only exit that denies access without an explicit
++	 * validation failure: it is reached when none of the allow rules
++	 * applied.
++	 */
++	NETOBS_LOG("%s non-platform process, denying access (proc=%s)\n", log_prefix, proc->p_comm);
++	return false;
+ }
+ 
+-/* bsd/net/observability.c:545 */
+-_Bool
++bool
+ process_can_see_connections(void)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: process_can_see_connections");
++	if (!net_inet_hide_pcb_established) {
++		return true;
++	}
++
++	return net_check_observability_permission_impl(current_proc(), __FILE_NAME__);
+ }
+ 
+-/* bsd/net/observability.c:555 */
+-_Bool
+-net_observability_should_hide_socket(struct socket * so, _Bool has_observability_permission, pid_t current_pid)
++bool
++net_observability_should_hide_socket(struct socket * so,
++    bool has_observability_permission, pid_t current_pid)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: net_observability_should_hide_socket");
++	if (has_observability_permission || so == NULL) {
++		return false;
++	}
++
++	/*
++	 * The socket owner can always see its own sockets.  Both the
++	 * last pid and the effective pid are compared.
++	 */
++	if (so->last_pid == current_pid || so->e_pid == current_pid) {
++		NETOBS_LOG("observability: socket belongs to current process (pid=%d), allowing\n", current_pid);
++		return false;
++	}
++
++	/* Hide the socket from everybody else. */
++	return true;
+ }
+-- 
+2.47.3
+
