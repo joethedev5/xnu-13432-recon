@@ -1,0 +1,53 @@
+From 9394912481d9e07ffe6f266695f67f2998bf0135 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 02:34:52 +0000
+Subject: [PATCH 20/20] Recover tcp_ecn_check_syn_rst_heur
+
+Apply the heuristic only while classic or accurate ECN setup is
+outstanding (setup sent, no SYN-RST seen yet).  Local connections mark
+TE_RCVD_SYN_RST and return the reference reason value 0x02010001;
+remote connections run tcp_heuristic_ecn_synrst.
+
+Remaining explicit stubs: 288.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ bsd/netinet/tcp_ecn.c | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/bsd/netinet/tcp_ecn.c b/bsd/netinet/tcp_ecn.c
+index f2becc8dd..53ff1a5da 100644
+--- a/bsd/netinet/tcp_ecn.c
++++ b/bsd/netinet/tcp_ecn.c
+@@ -12,6 +12,7 @@
+ #include <netinet/tcp_ecn.h>
+ #include <netinet/tcp_var.h>
+ #include <netinet/ip.h>
++#include <net/droptap.h>
+ 
+ #define RECON_BSD_NETINET_TCP_ECN_C 1
+ 
+@@ -356,8 +357,21 @@ tcp_ecn_check_data_rst_heur(struct tcpcb * tp)
+ void
+ tcp_ecn_check_syn_rst_heur(struct tcpcb * tp, drop_reason_t * reason)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: tcp_ecn_check_syn_rst_heur");
++	uint32_t flags = tp->ecn_flags;
++	bool classic_setup = (flags & TE_SETUPSENT) != 0 &&
++	    (flags & TE_RCVD_SYN_RST) == 0;
++	bool accurate_setup = (flags &
++	    (TE_ACE_SETUPSENT | TE_RCVD_SYN_RST)) == TE_ACE_SETUPSENT;
++
++	if (!classic_setup && !accurate_setup) {
++		return;
++	}
++	if ((tp->t_flags & TF_LOCAL) != 0) {
++		tp->ecn_flags |= TE_RCVD_SYN_RST;
++		*reason = (drop_reason_t)0x02010001;
++		return;
++	}
++	tcp_heuristic_ecn_synrst(tp);
+ }
+ 
+ /* bsd/netinet/tcp_ecn.c:1254 */

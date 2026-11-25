@@ -1,7 +1,7 @@
 From afcd948d693ee855afb658392d2ba025c6e62371 Mon Sep 17 00:00:00 2001
 From: joethedev5 <deepsbx1@proton.me>
 Date: Wed, 25 Nov 2026 02:29:13 +0000
-Subject: [PATCH 13/19] Recover tcp_tfo_process_last_ack
+Subject: [PATCH 13/20] Recover tcp_tfo_process_last_ack
 
 If the received TFO cookie is valid, clear the client-connected flag,
 drop tcp_tfo_halfcnt and VERIFY it did not go negative, then clear

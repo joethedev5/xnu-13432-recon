@@ -318,3 +318,11 @@ the SYN-ACK receive-window update; the public rLedbat-only clamp is
 replaced by `tcp_calc_rcv_window(tp, TCP_RECV_BG(so))`. The argument
 matches the `SOF1_TRAFFIC_MGT_TCP_RECVBG` (0x4000) test seen in the
 reference disassembly. Patch series: 19 entries.
+
+## 2026-11-25: ECN SYN-RST heuristic
+
+`tcp_ecn_check_syn_rst_heur` applies only while classic or accurate ECN
+setup is outstanding; local connections mark `TE_RCVD_SYN_RST` and
+return the reference reason value `0x02010001`, while remote
+connections invoke `tcp_heuristic_ecn_synrst`. Patch series: 20
+entries; remaining explicit stubs: 288.
