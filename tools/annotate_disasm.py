@@ -60,7 +60,7 @@ def main():
     fmap = FuncMap(db)
     sf = {(c, i): p for c, i, p in db.execute("SELECT cu_id,idx,path FROM source_file")}
     if args.name_or_addr.startswith("0x"):
-        target = int(args.name_or_addr, 16)
+        target = int(args.name_or_addr, 16) - (1 << 64)
         row = db.execute("SELECT id,cu_id,name,decl_file,decl_line,low_pc,high_pc,type_offset FROM func "
                          "WHERE low_pc<=? AND high_pc>? ORDER BY (high_pc-low_pc) LIMIT 1",
                          (target, target)).fetchone()
@@ -90,12 +90,16 @@ def main():
             continue
         addr = int(m.group(1), 16)
         insn = m.group(2).strip()
-        lr = db.execute("SELECT line FROM line WHERE cu_id=? AND addr<=? AND line>0 AND end_sequence=0 "
+        lr = db.execute("SELECT line,file_idx FROM line WHERE cu_id=? AND addr<=? AND line>0 AND end_sequence=0 "
                         "ORDER BY addr DESC LIMIT 1", (cu, addr - (1 << 64) if addr >= (1 << 63) else addr)).fetchone()
-        srcline = lr[0] if lr else None
+        srcline = None
+        if lr:
+            fpath = sf.get((cu, lr[1])) or ""
+            base = fpath.rsplit("/", 1)[-1]
+            srcline = "%s:%s" % (base, lr[0])
         anno = ""
         if srcline != last_line:
-            anno = "  ; line %s" % srcline
+            anno = "  ; %s" % srcline
             last_line = srcline
         tm = re.search(r"\b(?:bl|b)\s+(0x[0-9a-f]+)", insn)
         callee = ""
