@@ -1041,3 +1041,81 @@ HV_VCPU_MAX bound), and the local harness reproduces the release
 `hv_vm_allowed`/`hv_vm_max_permitted_isa` value ladder.
 
 The patch series now has 48 entries; 106 explicit stubs remain.
+
+## 2026-11-25: hv_vcpu_obj_alloc
+
+`hv_vcpu_obj_alloc` was recovered at `hv_vcpu.c:6079`; the file is large
+in the reference (the allocation lives around line 6080, and the DWARF
+names 6079 as the declaration line).  The kasan companion keeps the
+full locals and line/column tables, and the release image pins the
+control flow:
+
+- The first argument is `hv_vcpu_t **` (the earlier stub had
+  `hv_vcpu_t *`): entry stores zero to `*vcpu`, and the success path
+  stores the allocated address through it.
+- 64-byte vCPU object: `kmem_alloc(kernel_map, &addr, sizeof(hv_vcpu_t),
+  KMA_ZERO, tag)` with `tag = VM_KERN_MEMORY_HV` (0x1c), then
+  `assert(addr)` and `assert((addr & PAGE_MASK) == 0)` (DWARF lines
+  6092/6093).
+- 32 KB shared context: `kmem_alloc_contig(..., 0, 0, 0, KMA_DATA |
+  KMA_ZERO, tag)` when `contiguous_context`, otherwise `kmem_alloc(...,
+  KMA_DATA | KMA_ZERO, tag)`; the flags are 0x8080 in both images.
+  Failure jumps straight to the vCPU free (line 6105 -> 6172), skipping
+  the context free.  Asserts at 6109/6110.
+- Remap: `rw_size`/`ro_size`/`remap_size` are 0x4000/0x4000/0x8000
+  (lines 6116-6118); `user_addr` (6119:19), `remap_cur_prot` and
+  `remap_max_prot` (6120/6121:12).  The first
+  `mach_vm_remap_new_kernel()` maps the whole range read/read at a
+  random address (`vmf_random_addr`, vmk_flags 0x1c000008); asserts
+  6138/6139.  The second remaps the read-write half over the base with
+  `vmf_overwrite` (0x1c004001) and protections 3/3 (6141/6142:17,
+  call 6143:6).
+- Failure layout: the success path returns first (asserts 6162/6163 on
+  the page alignment of `&uif->rw` and `&uif->ro`, then `return ret;`
+  at 6165).  The second-remap failure reaches a `fail_remap`-style
+  label at 6166: `ret = HV_ERROR;` (6167), then
+  `mach_vm_deallocate_kernel(user_map, user_addr, remap_size)` (6168,
+  columns 2/38), which falls into the shared `fail` label (6169) and
+  `kmem_free(kernel_map, shared_guest_context_addr,
+  sizeof(arm_guest_context_t))` (6170:12).  `fail_free_vcpu` (6171)
+  frees the 64-byte object (6172:12) and returns (6173/6174).  The
+  first-remap failure branches directly to 6170, so it keeps the
+  initial HV_NO_RESOURCES; only the second-remap failure becomes
+  HV_ERROR (0xfae94001).
+- The `(*vcpu)->uif = (arm_guest_context_t *)user_addr;` assignment at
+  6161 has its cast at column 17, the `*vcpu` load at column 3 and the
+  store at column 15 relative to the line, which matches the recovered
+  columns 6161:17/3/15 exactly (Apple clang attributes the load to the
+  cast expression start; LLVM 19 reports the operand position instead,
+  so the local `.loc` for the load differs by column only).
+- `kif` is stored at vCPU offset 8 and `uif` at offset 16 (the object
+  layout recovered earlier: vm 0, kif 8, uif 16).
+
+The KDK 27.0.1 `vm_kern_xnu.h` differs from the public 12377 header in
+its inline expanders, which shows up in this function:
+
+- `kmem_alloc_guard()` and `kernel_memory_allocate()` are inlined down
+  to an out-of-line `kmem_alloc_guard_internal(map, size, mask, flags,
+  guard, alloc_pages)` at `vm_kern.c` line 883 (release address
+  0xfffffe0007428f80).
+- `kmem_alloc_contig_guard()` builds a stack block whose invoke is
+  `__kmem_alloc_contig_guard_block_invoke` (release address
+  0xfffffe0007429cb8, i.e. the PAC-signed code pointer stored in the
+  block) and passes it as the `alloc_pages` argument; the contiguous
+  context call therefore reaches the internal function with a sixth
+  argument rather than with the public seven-scalar prototype.
+- `kmem_free_guard()` is inline in the reference and rounds the size to
+  page size: the release frees the 64-byte vCPU object with an end
+  address of `addr + 0x4000` (round_page(0x40)) and the 32 KB context
+  with `addr + 0x8000`, and both calls reach
+  `vm_map_remove_and_iunlock()` at 0xfffffe0007438328.
+
+The source-level calls in `hv_vcpu.c` are the reference ones; the local
+12377-derived header expands them to slightly different call shapes
+because those inline bodies have not been reconstructed yet.  The
+translation unit compiles with its recovered `DW_AT_APPLE_flags`, and
+the generated instruction sequence matches the release control flow
+(allocation sizes and flags, remap flag words, deallocate size, error
+constants and the free order).
+
+The patch series now has 49 entries; 105 explicit stubs remain.

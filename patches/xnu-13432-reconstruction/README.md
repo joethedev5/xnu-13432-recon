@@ -9,7 +9,7 @@ Apply in numeric order from a clean checkout:
 
 ```
 git checkout xnu-12377.121.6
-git am 0001-*.patch ... 0048-*.patch
+git am 0001-*.patch ... 0049-*.patch
 ```
 
 Contents:
@@ -110,6 +110,13 @@ Contents:
     `hv_internal.h` accessors and locks, the `hv_vm_isa_t` and
     `HV_VCPU_MAX` constants, and `vme_protection()` in
     `vm_map_internal.h`.
+49. The hypervisor vCPU object allocation in
+    `osfmk/arm64/hv/hv_vcpu.c`: the zeroed 64-byte vCPU object and the
+    32 KB kernel/user shared guest context, the read-only whole-context
+    remap at a random address and the read-write half remap with
+    overwrite into the owning task, the `HV_ERROR` deallocation path,
+    and the `kif`/`uif` publication with the page-alignment
+    assertions.
 
 The patches contain only public xnu text plus original reconstruction;
 no Apple binary, dSYM, SDK payload or extracted proprietary header is

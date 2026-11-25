@@ -1,0 +1,161 @@
+From 995e6a124265d644f6c70d7fc994ef7fa176a691 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 19:24:00 +0000
+Subject: [PATCH] Recover the hypervisor vCPU object allocation
+
+Reconstruct hv_vcpu_obj_alloc() (hv_vcpu.c:6079) from the reference
+kernel disassembly and full DWARF:
+
+ - allocate the 64-byte vCPU object zeroed with tag VM_KERN_MEMORY_HV
+   and assert it is page aligned;
+ - allocate the 32 KB shared guest context with KMA_DATA | KMA_ZERO,
+   either contiguously or not;
+ - remap the whole context read-only at a random address in the owning
+   task's map, then remap the 16 KB read/write half read-write with
+   overwrite on top of it, deallocating the whole range and returning
+   HV_ERROR when that second remap fails;
+ - publish the vCPU, the kernel-side context (kif) and the user-side
+   context (uif), assert both user halves are page aligned, and return
+   HV_SUCCESS.
+
+The DWARF names the first argument hv_vcpu_t ** (the stub had
+hv_vcpu_t *), matches the reference's local names and line numbers, and
+the eight assertion descriptors match the recovered asserts verbatim.
+The failure handling is laid out as in the reference: the success path
+returns first, and a fail_remap label sets HV_ERROR and deallocates the
+user range before falling into the context and vCPU frees.
+
+The KDK 27.0.1 build implements the kmem guard wrappers differently
+from the public tree: kmem_alloc_contig_guard() builds a stack block
+whose invoke is __kmem_alloc_contig_guard_block_invoke and passes it as
+the alloc_pages argument of kmem_alloc_guard_internal(), and
+kmem_free_guard() rounds the size to page size.  The local
+12377-derived vm_kern_xnu.h therefore expands these calls differently;
+the source-level calls are the reference ones.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ osfmk/arm64/hv/hv_vcpu.c | 103 ++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 90 insertions(+), 13 deletions(-)
+
+diff --git a/osfmk/arm64/hv/hv_vcpu.c b/osfmk/arm64/hv/hv_vcpu.c
+index 2ab041486..8274af333 100644
+--- a/osfmk/arm64/hv/hv_vcpu.c
++++ b/osfmk/arm64/hv/hv_vcpu.c
+@@ -1,23 +1,100 @@
+ /*
+  * Reconstruction of osfmk/arm64/hv/hv_vcpu.c from the xnu-13432 reference kernel.
+  *
+- * Function signatures and ordering are derived from the KDK 27.0.1
+- * DWARF.  Functions marked RECON were moved from the public xnu source
+- * when the reference kernel placed them in this file; bodies marked
+- * "body not recovered" are still stubs.
++ * Function signatures, ordering and bodies are derived from the KDK 27.0.1
++ * DWARF and the disassembly of the reference kernel.
+  */
+-#include <kern/kern_types.h>
++#include <arm64/hv/hv_vcpu.h>
++#include <arm64/hv/hv_objects.h>
+ #include <kern/assert.h>
+-#include <kern/debug.h>
+-#include <kern/zalloc.h>
+-#include <sys/systm.h>
+-
+-#define RECON_OSFMK_ARM64_HV_HV_VCPU_C 1
++#include <mach/boolean.h>
++#include <mach/vm_param.h>
++#include <mach/vm_statistics.h>
++#include <vm/vm_kern.h>
++#include <vm/vm_kern_xnu.h>
+ 
++/*
++ * Allocate a vCPU object and the guest context that is shared between the
++ * kernel and the guest, and map that context into the owning task's address
++ * space.
++ *
++ * The whole context is first mapped read-only at a random address, then the
++ * read-write half is remapped read-write over the base of that mapping; the
++ * read-only half keeps its read-only protection.
++ */
+ /* osfmk/arm64/hv/hv_vcpu.c:6079 */
+ hv_return_t
+-hv_vcpu_obj_alloc(hv_vcpu_t * vcpu, struct _vm_map * user_map, _Bool contiguous_context)
++hv_vcpu_obj_alloc(hv_vcpu_t ** vcpu, struct _vm_map * user_map, _Bool contiguous_context)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: hv_vcpu_obj_alloc");
++	const vm_tag_t tag = VM_KERN_MEMORY_HV;
++	hv_return_t ret = HV_NO_RESOURCES;
++
++	*vcpu = NULL;
++
++	vm_offset_t addr;
++	if (kmem_alloc(kernel_map, &addr, sizeof(hv_vcpu_t), KMA_ZERO, tag) != KERN_SUCCESS) {
++		return ret;
++	}
++	assert(addr);
++	assert((addr & PAGE_MASK) == 0);
++
++	vm_offset_t shared_guest_context_addr;
++	kern_return_t kern_ret;
++	if (contiguous_context) {
++		kern_ret = kmem_alloc_contig(kernel_map, &shared_guest_context_addr,
++		    sizeof(arm_guest_context_t), 0, 0, 0, KMA_DATA | KMA_ZERO, tag);
++	} else {
++		kern_ret = kmem_alloc(kernel_map, &shared_guest_context_addr,
++		    sizeof(arm_guest_context_t), KMA_DATA | KMA_ZERO, tag);
++	}
++
++	if (kern_ret != KERN_SUCCESS) {
++		goto fail_free_vcpu;
++	}
++	assert(shared_guest_context_addr);
++	assert((shared_guest_context_addr & PAGE_MASK) == 0);
++
++	const mach_vm_size_t rw_size = sizeof(arm_guest_rw_context_t);
++	const mach_vm_size_t ro_size = sizeof(arm_guest_ro_context_t);
++	const mach_vm_size_t remap_size = rw_size + ro_size;
++	mach_vm_offset_t user_addr = 0;
++	vm_prot_t remap_cur_prot = VM_PROT_READ;
++	vm_prot_t remap_max_prot = VM_PROT_READ;
++	if (mach_vm_remap_new_kernel(user_map, &user_addr, remap_size, 0,
++	    VM_MAP_KERNEL_FLAGS_ANYWHERE(.vmf_random_addr = true, .vm_tag = tag),
++	    kernel_map, shared_guest_context_addr, FALSE,
++	    &remap_cur_prot, &remap_max_prot, VM_INHERIT_NONE) != KERN_SUCCESS) {
++		goto fail;
++	}
++	assert(user_addr);
++	assert((user_addr & PAGE_MASK) == 0);
++
++	remap_cur_prot = VM_PROT_READ | VM_PROT_WRITE;
++	remap_max_prot = VM_PROT_READ | VM_PROT_WRITE;
++	if (mach_vm_remap_new_kernel(user_map, &user_addr, rw_size, 0,
++	    VM_MAP_KERNEL_FLAGS_FIXED(.vmf_overwrite = true, .vm_tag = tag),
++	    kernel_map, shared_guest_context_addr, FALSE,
++	    &remap_cur_prot, &remap_max_prot, VM_INHERIT_NONE) != KERN_SUCCESS) {
++		goto fail_remap;
++	}
++
++	ret = HV_SUCCESS;
++	*vcpu = (hv_vcpu_t *)addr;
++	(*vcpu)->kif = (arm_guest_context_t *)shared_guest_context_addr;
++	(*vcpu)->uif = (arm_guest_context_t *)user_addr;
++	assert(((uintptr_t)&((*vcpu)->uif->rw) & PAGE_MASK) == 0);
++	assert(((uintptr_t)&((*vcpu)->uif->ro) & PAGE_MASK) == 0);
++
++	return ret;
++
++fail_remap:
++	ret = HV_ERROR;
++	mach_vm_deallocate_kernel(user_map, user_addr, remap_size);
++
++fail:
++	kmem_free(kernel_map, shared_guest_context_addr, sizeof(arm_guest_context_t));
++
++fail_free_vcpu:
++	kmem_free(kernel_map, addr, sizeof(hv_vcpu_t));
++	return ret;
+ }
+-- 
+2.47.3
+
