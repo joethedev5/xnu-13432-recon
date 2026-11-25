@@ -1666,3 +1666,51 @@ VM-reference handling.  The kasan `hv_vm_t` places `host_vm_id` at
 host_vm_id is at 0x20); the reconstruction follows the release layout.
 
 The patch series now has 57 entries; 82 explicit stubs remain.
+
+## 2026-11-25: the nested-space block mapper and map-list helpers
+
+The public tree ships `tests/unit/hypervisor/hv_space_paranested_test.c`,
+which mocks `upl_phys_page`, `vm_map_create_upl`, `hv_call` and
+`ubc_upl_commit` and pins the semantics below; the reference kernel
+agrees with the tests line for line.
+
+`hv_call` (decl 60) enters the host with the service in x0 and the
+five arguments in x1-x5 (the asm is line 63 and `ret_code` is line
+62); the host status is x0 and its second result is stored through
+`ret_val`.
+
+`nested_space_map_block` (decl 108) asserts `size && *size`,
+`start_offset < PAGE_SIZE` and `physical_memory_info` (lines 110-112).
+It reads the first page's pfn at 117, takes the first chunk's physical
+address and guest address at 124/125 and its size as
+`MIN(remaining_size, PAGE_SIZE - start_offset)` at 127.  The loop at
+132 walks `upl_page_index` (131) with `upl_phys_page` (133), rejects a
+zero pfn (134), counts the page index (139), and compares
+`candidate_pa` (142) against the running block end (146): contiguous
+pages extend `contiguous_chunk_size` (148), while a break flushes the
+block with VMAPPLE_NESTED_SPACE_MAP (the inner `ret` at 151, checked
+at 152), advances `mapped_size` (157) and re-bases the next block's
+guest address at 162.  The final block is flushed at 168 and the
+assert at 175 checks that the caller's size was fully mapped.
+
+`add_map_entry` (decl 280) allocates a zeroed `hv_map_entry_t` at 284,
+returns false on allocation failure, stores `upl`, `ipa` and `size` at
+288/289 and inserts the entry at 291.  The caller commits the UPL when
+the entry cannot be recorded.
+
+`commit_map_entries` (decl 297) takes the VM lock at 299 and moves
+every entry from the temporary list to `vm->map_list_head` at
+300-303, then unlocks at 305.  `rollback_map_entries` (decl 310) asks
+the host to unmap the already-processed guest bytes with
+VMAPPLE_NESTED_SPACE_UNMAP at 314 when any were mapped, then commits
+and frees every remaining entry (317-321).
+
+`_hv_nested_space_unmap` (decl 404) searches the VM's map list under
+the lock (417-419, matching the item's exact ipa and size), removes,
+commits and frees the matching entry (425-427), unlocks at 429 and
+returns the VMAPPLE_NESTED_SPACE_UNMAP host status at 430.  A missing
+entry is not an error.  The release and kasan builds place the
+bookkeeping at the same lines; kasan's larger `hv_vm_t` only moves
+`host_vm_id` and `map_list_head` by 8 bytes.
+
+The patch series now has 58 entries; 76 explicit stubs remain.

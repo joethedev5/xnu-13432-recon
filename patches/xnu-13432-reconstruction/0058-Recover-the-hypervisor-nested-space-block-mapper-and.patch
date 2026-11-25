@@ -1,0 +1,272 @@
+From 746af0c4abe3ebe0981bf30eff02bfb6d2e8680f Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 20:25:39 +0000
+Subject: [PATCH] Recover the hypervisor nested-space block mapper and map-list
+ helpers
+
+hv_call enters the host with the service in x0 and the arguments in
+x1-x5, returning the host status and its second result.
+
+nested_space_map_block validates its arguments, coalesces physically
+contiguous UPL pages into single VMAPPLE_NESTED_SPACE_MAP host calls
+and accounts the mapped bytes, leaving the mapped size in *size on
+success and the bytes mapped before a failure otherwise.
+
+add_map_entry, commit_map_entries and rollback_map_entries manage the
+temporary hv_map_entry_t list (allocation, publication under the VM
+lock, and the unmap/commit/free rollback), and _hv_nested_space_unmap
+removes the entry matching the item's ipa and size and returns the
+VMAPPLE_NESTED_SPACE_UNMAP host status.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ osfmk/arm64/hv/hv_space_paranested.c | 187 +++++++++++++++++++++++++--
+ 1 file changed, 173 insertions(+), 14 deletions(-)
+
+diff --git a/osfmk/arm64/hv/hv_space_paranested.c b/osfmk/arm64/hv/hv_space_paranested.c
+index ba76d8f44..ace432cc9 100644
+--- a/osfmk/arm64/hv/hv_space_paranested.c
++++ b/osfmk/arm64/hv/hv_space_paranested.c
+@@ -10,24 +10,119 @@
+ #include <kern/assert.h>
+ #include <kern/debug.h>
+ #include <kern/zalloc.h>
+-#include <sys/systm.h>
++#include <sys/ubc.h>
++#include <mach/memory_object_types.h>
++#include <mach/vm_param.h>
++#include <vm/vm_pageout_xnu.h>
++#include <arm64/hv_hvc.h>
++#include <arm64/hv/hv_internal.h>
++#include <arm64/hv/hv_vm.h>
+ 
+ #define RECON_OSFMK_ARM64_HV_HV_SPACE_PARANESTED_C 1
+ 
++/*
++ * Enter the host hypervisor with a service identifier and five
++ * arguments.  The host returns its status in x0 and a second value in
++ * x1, which is stored through ret_val when the caller asks for it.
++ */
+ /* osfmk/arm64/hv/hv_space_paranested.c:60 */
+ hv_return_t
+ hv_call(uint64_t fn, uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4, uint64_t * ret_val)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: hv_call");
++	uint64_t ret_code;
++
++	register uint64_t x0 asm("x0") = fn;
++	register uint64_t x1 asm("x1") = arg0;
++	register uint64_t x2 asm("x2") = arg1;
++	register uint64_t x3 asm("x3") = arg2;
++	register uint64_t x4 asm("x4") = arg3;
++	register uint64_t x5 asm("x5") = arg4;
++
++	asm volatile("hvc #0"
++	    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5));
++
++	ret_code = x0;
++	if (ret_val != NULL) {
++		*ret_val = x1;
++	}
++
++	return (hv_return_t)ret_code;
+ }
+ 
++/*
++ * Map *size bytes of the physical memory described by a UPL into the
++ * guest at ipa, starting start_offset bytes into the first page.
++ *
++ * Physically contiguous pages are coalesced into one host mapping
++ * call.  On success *size is left at the mapped size; on failure it is
++ * reduced to the number of bytes mapped before the failing block.
++ */
+ /* osfmk/arm64/hv/hv_space_paranested.c:108 */
+ hv_return_t
+ nested_space_map_block(uint64_t * size, uint64_t start_offset, upl_page_info_t * physical_memory_info, uint64_t ipa, uint64_t vmid, uint64_t flags)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: nested_space_map_block");
++	assert(size && *size);
++	assert(start_offset < PAGE_SIZE);
++	assert(physical_memory_info);
++
++	uint64_t remaining_size = *size;
++	uint64_t mapped_size = 0;
++
++	ppnum_t ppnum = upl_phys_page(physical_memory_info, 0);
++	if (ppnum == 0) {
++		*size = mapped_size;
++		return HV_ERROR;
++	}
++
++	uint64_t contiguous_chunk_pa = ptoa(ppnum) + start_offset;
++	uint64_t contiguous_chunk_ipa = ipa;
++
++	uint64_t contiguous_chunk_size = MIN(remaining_size, PAGE_SIZE - start_offset);
++	remaining_size -= contiguous_chunk_size;
++
++	int upl_page_index = 1;
++	while (remaining_size > 0) {
++		ppnum = upl_phys_page(physical_memory_info, upl_page_index);
++		if (ppnum == 0) {
++			*size = mapped_size;
++			return HV_ERROR;
++		}
++
++		uint64_t candidate_pa = ptoa(ppnum);
++		uint64_t page_contribution_size = MIN(remaining_size, PAGE_SIZE);
++
++		if (contiguous_chunk_pa + contiguous_chunk_size == candidate_pa) {
++			contiguous_chunk_size += page_contribution_size;
++		} else {
++			hv_return_t ret = hv_call(VMAPPLE_NESTED_SPACE_MAP, vmid,
++			    contiguous_chunk_pa, contiguous_chunk_ipa,
++			    contiguous_chunk_size, flags, NULL);
++			if (ret != HV_SUCCESS) {
++				*size = mapped_size;
++				return ret;
++			}
++
++			mapped_size += contiguous_chunk_size;
++			contiguous_chunk_pa = candidate_pa;
++			contiguous_chunk_ipa = ipa + mapped_size;
++			contiguous_chunk_size = page_contribution_size;
++		}
++
++		upl_page_index++;
++		remaining_size -= page_contribution_size;
++	}
++
++	hv_return_t ret = hv_call(VMAPPLE_NESTED_SPACE_MAP, vmid,
++	    contiguous_chunk_pa, contiguous_chunk_ipa, contiguous_chunk_size,
++	    flags, NULL);
++	if (ret != HV_SUCCESS) {
++		*size = mapped_size;
++		return ret;
++	}
++
++	mapped_size += contiguous_chunk_size;
++	assert(*size == mapped_size);
++	return HV_SUCCESS;
+ }
+ 
+ /* osfmk/arm64/hv/hv_space_paranested.c:181 */
+@@ -38,28 +133,67 @@ create_upl_chunk(uint64_t current_uva, uint64_t remaining_size, uint64_t first_p
+ 	panic("reconstructed stub: create_upl_chunk");
+ }
+ 
++/*
++ * Record a completed chunk mapping on the temporary list.  The UPL
++ * kept by the entry is committed with the entry; a failed allocation
++ * leaves the UPL to the caller.
++ */
+ /* osfmk/arm64/hv/hv_space_paranested.c:280 */
+ _Bool
+-add_map_entry(struct upl * upl, uint64_t chunk_mapping_size, uint64_t current_ipa, hv_map_list_t * tmp_list_head)
++add_map_entry(upl_t upl, uint64_t chunk_mapping_size, uint64_t current_ipa, hv_map_list_t * tmp_list_head)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: add_map_entry");
++	hv_map_entry_t * entry = kalloc_type(hv_map_entry_t, Z_WAITOK | Z_ZERO);
++	if (entry == NULL) {
++		return false;
++	}
++
++	entry->upl = upl;
++	entry->ipa = current_ipa;
++	entry->size = chunk_mapping_size;
++
++	LIST_INSERT_HEAD(tmp_list_head, entry, entry_link);
++
++	return true;
+ }
+ 
++/*
++ * Publish the temporary map entries on the VM's list under its lock.
++ */
+ /* osfmk/arm64/hv/hv_space_paranested.c:297 */
+ void
+ commit_map_entries(hv_vm_t * vm, hv_map_list_t * tmp_list_head)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: commit_map_entries");
++	hv_vm_lock(vm);
++
++	while (LIST_FIRST(tmp_list_head) != NULL) {
++		hv_map_entry_t * entry = LIST_FIRST(tmp_list_head);
++		LIST_REMOVE(entry, entry_link);
++		LIST_INSERT_HEAD(&vm->map_list_head, entry, entry_link);
++	}
++
++	hv_vm_unlock(vm);
+ }
+ 
++/*
++ * Undo the map entries created for a failed map operation: tell the
++ * host to unmap the portion already mapped into the guest and commit
++ * and free every entry on the temporary list.
++ */
+ /* osfmk/arm64/hv/hv_space_paranested.c:310 */
+ void
+ rollback_map_entries(hv_vm_t * vm, uint64_t ipa, uint64_t guest_bytes_processed, hv_map_list_t * tmp_list_head)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: rollback_map_entries");
++	if (guest_bytes_processed != 0) {
++		hv_call(VMAPPLE_NESTED_SPACE_UNMAP, vm->host_vm_id, ipa,
++		    guest_bytes_processed, 0, 0, NULL);
++	}
++
++	while (LIST_FIRST(tmp_list_head) != NULL) {
++		hv_map_entry_t * entry = LIST_FIRST(tmp_list_head);
++		LIST_REMOVE(entry, entry_link);
++		ubc_upl_commit(entry->upl);
++		kfree_type(hv_map_entry_t, entry);
++	}
+ }
+ 
+ /* osfmk/arm64/hv/hv_space_paranested.c:326 */
+@@ -70,12 +204,37 @@ _hv_nested_space_map(hv_vm_t * vm, const hv_vm_map_item_t * mi)
+ 	panic("reconstructed stub: _hv_nested_space_map");
+ }
+ 
++/*
++ * Unmap a guest range: remove the matching bookkeeping entry (exact
++ * ipa and size) and tell the host to unmap the range.  A missing entry
++ * is not an error.
++ */
+ /* osfmk/arm64/hv/hv_space_paranested.c:404 */
+ hv_return_t
+ _hv_nested_space_unmap(hv_vm_t * vm, const hv_vm_map_item_t * mi)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: _hv_nested_space_unmap");
++	hv_map_entry_t * entry;
++	_Bool found = false;
++
++	hv_vm_lock(vm);
++
++	LIST_FOREACH(entry, &vm->map_list_head, entry_link) {
++		if (entry->ipa == mi->ipa && entry->size == mi->size) {
++			found = true;
++			break;
++		}
++	}
++
++	if (found) {
++		LIST_REMOVE(entry, entry_link);
++		ubc_upl_commit(entry->upl);
++		kfree_type(hv_map_entry_t, entry);
++	}
++
++	hv_vm_unlock(vm);
++
++	return hv_call(VMAPPLE_NESTED_SPACE_UNMAP, vm->host_vm_id, mi->ipa,
++	    mi->size, 0, 0, NULL);
+ }
+ 
+ /* osfmk/arm64/hv/hv_space_paranested.c:436 */
+-- 
+2.47.3
+

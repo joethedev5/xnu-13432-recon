@@ -9,7 +9,7 @@ Apply in numeric order from a clean checkout:
 
 ```
 git checkout xnu-12377.121.6
-git am 0001-*.patch ... 0057-*.patch
+git am 0001-*.patch ... 0058-*.patch
 ```
 
 Contents:
@@ -178,6 +178,14 @@ Contents:
     disabled preemption, and the conversion back) and
     `hv_trap_vcpu_run_cancel` (the vCPU/VM selection with its VM
     reference, host service 0xc6000013 and the conditional VM release).
+58. The hypervisor nested-space block mapper and map-list helpers in
+    `osfmk/arm64/hv/hv_space_paranested.c`: the `hv_call` host-entry
+    wrapper, `nested_space_map_block` (the UPL page walk, physically
+    contiguous block coalescing, VMAPPLE_NESTED_SPACE_MAP calls and
+    mapped-size accounting), `add_map_entry`, `commit_map_entries`
+    and `rollback_map_entries` for the temporary map-entry list, and
+    `_hv_nested_space_unmap` with its exact ipa/size lookup and
+    VMAPPLE_NESTED_SPACE_UNMAP host call.
 
 The patches contain only public xnu text plus original reconstruction;
 no Apple binary, dSYM, SDK payload or extracted proprietary header is
