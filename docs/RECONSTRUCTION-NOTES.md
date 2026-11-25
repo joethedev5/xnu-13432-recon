@@ -2031,13 +2031,17 @@ column 69, which matches the plain text
 correct 35-character identifier.  The recovered source therefore keeps
 `event_old_count <= vm_cow_defeated_soft_report_limit - 1`; it behaves
 identically for every limit except 0, where the reference's uint8_t
-truncation keeps reporting.  The reference RELEASE kernel also keeps
-the line-157 `assert()` active; the current reconstructed release
-headers (and the local assert shim used by `kcc.py`) elide it, so a
-future `assert.h` reconciliation is needed before the local build
-reproduces the trap.
+truncation keeps reporting.
+
+The guard check at line 157 survives in the RELEASE kernel as a trap with its descriptor (`event_idx <
+VM_COW_DEFEATURED_GUARD_COUNT`, file vm_cow_defeatured_telemetry.c,
+line 157), although the translation unit's flags do not define
+MACH_ASSERT and plain assert() therefore compiles away.  The check is
+a release_assert(), which is always active; a local compile reproduces
+the `sub w?,#13; cmp w?,#3; b.hs; adrp/add __desc; brk #0xbffc` shape
+and the descriptor contents.
 
 The patch compiles with the reference RELEASE flags and applies to the
-series with tree hash 6d99fbd77c731e79b95443ce66a1e515ae5de959.
+series with tree hash 706980d57c2378460e79a8734a6fe3730f763dc5.
 
 The patch series now has 62 entries; 59 explicit stubs remain.

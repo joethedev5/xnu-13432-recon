@@ -1,4 +1,4 @@
-From feef0d971b2214b4b589317f67f2119ceb2af903 Mon Sep 17 00:00:00 2001
+From 084de4a7c276c3bf96555481eb9884d61c3c5e86 Mon Sep 17 00:00:00 2001
 From: joethedev5 <deepsbx1@proton.me>
 Date: Wed, 25 Nov 2026 21:15:22 +0000
 Subject: [PATCH] Recover vm_cow_defeatured_telemetry.c
@@ -27,6 +27,11 @@ line 69, the lock group and mutex at lines 74 and 76, the list head at
 line 80 and the three function signatures at lines 88, 120 and 145.
 The report's prototype is added in vm_cow_defeatured_telemetry.h at
 reference line 44, the line vm_map.c sees it at.
+
+The guard check at line 157 is a release_assert(): the RELEASE kernel
+keeps the trap and its descriptor ("event_idx <
+VM_COW_DEFEATURED_GUARD_COUNT") even though MACH_ASSERT is not defined
+for the translation unit, which only release_assert() provides.
 
 Add the three kGUARD_EXC_COW_DEFEATURED_* guard codes to
 vm_statistics.h (13-15), move kGUARD_EXC_LARGE_ALLOCATION_TELEMETRY to
@@ -79,7 +84,7 @@ index d72e25f7d..ac0597109 100644
  static inline bool
  vm_guard_is_mte_policy(uint32_t flavor)
 diff --git a/osfmk/vm/vm_cow_defeatured_telemetry.c b/osfmk/vm/vm_cow_defeatured_telemetry.c
-index e86ddb9d0..d0451fc87 100644
+index e86ddb9d0..002e7365d 100644
 --- a/osfmk/vm/vm_cow_defeatured_telemetry.c
 +++ b/osfmk/vm/vm_cow_defeatured_telemetry.c
 @@ -1,39 +1,184 @@
@@ -260,7 +265,7 @@ index e86ddb9d0..d0451fc87 100644
 +	uint8_t event_old_count;
 +
 +	event_idx = guard_code - kGUARD_EXC_COW_DEFEATURED_FIRST;
-+	assert(event_idx < VM_COW_DEFEATURED_GUARD_COUNT);
++	release_assert(event_idx < VM_COW_DEFEATURED_GUARD_COUNT);
 +
 +	if (!vm_cow_defeatured_get_responsible_map_info(&map, proc_name,
 +	    sizeof(proc_name))) {

@@ -223,8 +223,9 @@ Contents:
     list (proc_name_t name, per-guard-code uint8_t counts), the
     `vm_cow_defeated_get_or_insert_entry` lookup and zeroed allocation,
     `vm_cow_defeated_get_responsible_map_info` (current task's map and
-    best name), and `vm_cow_defeated_soft_mode_report`, which checks the
-    guard code, accounts under `vm_cow_defeated_telemetry_lock` and
+    best name), and `vm_cow_defeated_soft_mode_report`, which
+    release-asserts the guard code, accounts under
+    `vm_cow_defeated_telemetry_lock` and
     calls `vm_map_guard_exception` outside the lock while the
     `vm_cow_defeated_soft_report_limit` tunable (default 10) allows.
     Adds the new `vm_cow_defeatured_telemetry.h` prototype at reference
