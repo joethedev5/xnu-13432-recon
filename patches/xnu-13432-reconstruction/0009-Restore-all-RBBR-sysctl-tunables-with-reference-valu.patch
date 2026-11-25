@@ -1,7 +1,7 @@
 From 9bf9d71491f9e4c45d8e34d50755569ea787118e Mon Sep 17 00:00:00 2001
 From: joethedev5 <deepsbx1@proton.me>
 Date: Wed, 25 Nov 2026 02:26:52 +0000
-Subject: [PATCH 09/13] Restore all RBBR sysctl tunables with reference values
+Subject: [PATCH 09/14] Restore all RBBR sysctl tunables with reference values
 
 DWARF variable locations map every RBBR tunable to its address in
 0xfffffe0007cbf44c-0x7cbf4c0; the reference image supplies the initial

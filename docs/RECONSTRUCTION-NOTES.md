@@ -276,3 +276,14 @@ Remaining explicit stubs: 302.
   `__counted_by`/`__sized_by` annotations.
 
 Remaining explicit stubs: 297.
+
+## 2026-11-25: TFO last-ACK and RBBR phase logging
+
+`tcp_tfo_process_last_ack` clears `TFO_F_COOKIE_VALID`, releases the
+`tcp_tfo_halfcnt` reservation and `VERIFY`s it did not go negative,
+matching the reference assfail at line 245. `rbbr_log_phase_end` logs
+the phase transition with the reference format and line 483.
+
+The public patch series now contains 14 patches and has been
+re-applied to a clean `xnu-12377.121.6` worktree with `git am` without
+conflicts. Remaining explicit stubs: 294.

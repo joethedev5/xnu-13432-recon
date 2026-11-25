@@ -1,0 +1,43 @@
+From cca45307f1c820cadb2b62fa4d5b6d0c60c3de79 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 02:29:51 +0000
+Subject: [PATCH 14/14] Recover rbbr_log_phase_end
+
+Log the phase transition through tcp_log_bbr with the reference format
+("rbbr: exit %s -> %s dur=%ums median_rtt=%u rtt_mad=%u ..."), line 483,
+when logging is enabled.
+
+Remaining explicit stubs: 294.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ bsd/netinet/tcp_rbbr.c | 16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/bsd/netinet/tcp_rbbr.c b/bsd/netinet/tcp_rbbr.c
+index 92b83ca7c..7a28361f6 100644
+--- a/bsd/netinet/tcp_rbbr.c
++++ b/bsd/netinet/tcp_rbbr.c
+@@ -163,8 +163,20 @@ rbbr_action_elapsed(struct tcpcb * tp, uint32_t start_ts, uint32_t now, uint32_t
+ void
+ rbbr_log_phase_end(struct tcpcb * tp, const char * phase_name, const char * next_phase)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: rbbr_log_phase_end");
++	struct tcp_rbbr_state *rbbr = tp->t_rbbr_state;
++	uint32_t now = tcp_now;
++	uint32_t dur = now - rbbr->phase_start_ts;
++
++	if (tcp_is_log_enabled(tp, TLEF_LOG)) {
++		tcp_log_bbr("rbbr_log_phase_end", 483, tp,
++		    "rbbr: exit %s -> %s dur=%ums median_rtt=%u rtt_mad=%u "
++		    "delay_thresh=%u rwnd_est=%u win=%u samples=%u "
++		    "skip_restrict=%u",
++		    phase_name, next_phase, dur, rbbr->median_rtt,
++		    rbbr->rtt_mad, rbbr->delay_threshold, rbbr->rwnd_est,
++		    rbbr->win, rbbr->rtt_sample_count,
++		    rbbr->skip_rwnd_restrict);
++	}
+ }
+ 
+ /* bsd/netinet/tcp_rbbr.c:495 */
