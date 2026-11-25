@@ -595,3 +595,65 @@ and `t_unacksegs == 1`; mode 3 uses the clamped `tcp_sbspace` window,
 and the tcp_input `DELAY_ACK` macro calls `tcp_delay_ack`.
 
 The patch series now has 39 entries; 171 explicit stubs remain.
+
+## 2026-11-25: Exec security configuration
+
+The seven remaining stubs in `kern_exec_security.c` are recovered.  Note
+that the previous count in this file (171 stubs) was off by two: the tree
+actually carried 173 explicit stub bodies before this batch and carries
+166 now.
+
+`imgact_setup_platform_restrictions` (kern_exec_security.c:42) gained a
+13432-only branch before the platform-binary check: when
+`exec_security_get_hardened_browser()` is non-zero the task gets platform
+restrictions version 1; platform binaries still get version 3.  The
+string-entitlement path is unchanged from the public source (parse,
+validate, free, then accept versions 2 through 7), and the integer
+entitlement still selects version 2.
+
+`encode_hardened_browser_entitlement` is the public `encode_HR_entitlement`
+moved here: it ORs the mask into `load_result->hardened_browser` when the
+vnode carries the entitlement.  `imgact_setup_hardened_browser` zeroes the
+field and tests the host/GPU/network/webcontent entitlements with masks
+1/2/4/8.  The reference image's GPU and network strings read
+"com.apple.developer.web-browser-engine.gpu" and "...network", whereas the
+matching KDK's `CodeSignature/Entitlements.h` still says "rendering" and
+"networking"; the recovered source therefore carries its own definitions.
+
+`exec_security_get_hardened_browser` simply returns the field; the DWARF
+also records two dead locals (`_lr`, `_es`) left from a debug aid at
+kern_exec_security.c:160.  `imgact_set_platform_binary_flag` advances the
+state to PLATFORM_BINARY_SETUP and calls
+`task_set_platform_binary(task, load_result->platform_binary)`.
+
+`imgact_setup_ipc_containment` sets or clears the task's IPC containment
+vessel bit; when the binary is a platform binary and its code-signing
+identity begins with "com.apple.WebKit." it sets the new task security
+config `webkit` bit (0x800), otherwise clears it.  The identity is obtained
+with `csvnode_get_blob` + `csblob_get_identity`.  The clear-vessel call is
+in the outer else, so a non-vessel binary returns without touching the
+webkit bit.  `imgact_setup_ipc_security_policy` applies the platform-binary
+flag and disables mach hardening for tasks that may load third-party
+plugins (`IMGPF_3P_PLUGINS`); the reference keeps an always-false local
+`override` in the condition.
+
+`exec_setup_vfs_resolve_flags` reads
+"com.apple.security.hardened-process.vfs.resolve-flags" with
+`IOTaskGetEntitlement`, parses a base-10 value, masks it with 0x7ff, stores
+it in `proc_ro_data.p_fixed_vfs_resolve_flags` through the new
+`proc_set_fixed_vfs_resolve_flags` accessor, and ORs it into the new
+`proc.p_vfs_resolve_flags` field at offset 0x44 (the field is volatile in
+the DWARF).  The entitlement string is released with `kfree_data_addr`.
+
+Supporting reference layout changes recovered here: `load_result_t` gains
+the `is_vm_containment_vessel_cow_defeatured` bit (between `hardened_heap`
+and `is_ipc_containment_vessel`) and the byte-sized `exec_security_state`
+at offset 0x88; `task_security_config` gains
+`vm_containment_vessel_cow_defeatured` (bit 9), `reserved2` (bit 10) and
+`webkit` (bit 11); `proc_ro_data` gains `p_fixed_vfs_resolve_flags` at
+offset 0x18.  `exec_security_advance_state` is a static inline in
+kern_exec_security.h, and `EXEC_LOG` plus the two platform-restriction
+entitlement macros moved to kern_exec_internal.h so the new translation
+unit can use them.
+
+The patch series now has 40 entries; 166 explicit stubs remain.

@@ -9,7 +9,7 @@ Apply in numeric order from a clean checkout:
 
 ```
 git checkout xnu-12377.121.6
-git am 0001-*.patch ... 0039-*.patch
+git am 0001-*.patch ... 0040-*.patch
 ```
 
 Contents:
@@ -67,6 +67,12 @@ Contents:
 38. `struct tcp_context` and `tcp_socket_exists_for_tuple`.
 39. The reference delayed-ACK policy in `tcp_ack.c` and the removal
     of the per-algorithm delay-ack hooks.
+40. The exec security configuration: hardened-browser entitlement
+    parsing, platform restrictions, the platform-binary task flag,
+    IPC containment and WebKit signing-id detection, the IPC security
+    policy hook, and the VFS resolve-flags entitlement, together with
+    the new load-result state byte, task security bits and proc VFS
+    resolve flag fields.
 
 The patches contain only public xnu text plus original reconstruction;
 no Apple binary, dSYM, SDK payload or extracted proprietary header is

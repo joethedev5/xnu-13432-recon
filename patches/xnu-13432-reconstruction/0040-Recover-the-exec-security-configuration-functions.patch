@@ -1,0 +1,566 @@
+From a32e61001ec8fb6eface53202e30fdfaf775b8a5 Mon Sep 17 00:00:00 2001
+From: joethedev5 <deepsbx1@proton.me>
+Date: Wed, 25 Nov 2026 04:23:11 +0000
+Subject: [PATCH 40/40] Recover the exec security configuration functions
+
+Replace the remaining stubs in kern_exec_security.c with bodies recovered
+from the reference kernel image: the hardened-browser entitlement block,
+the platform-binary task flag, IPC containment and WebKit signing-id
+detection, the IPC security policy hook, and the VFS resolve-flags
+entitlement parse.
+
+The reference carries an exec_security_state byte in load_result_t and
+tracks it through kern_exec_security.h.  Add the related task security
+config bits (vm_containment_vessel_cow_defeatured, reserved2, webkit),
+the proc and proc_ro VFS resolve flag fields with their accessors, and
+move the shared EXEC_LOG and platform-restriction entitlement macros into
+kern_exec_internal.h.
+
+The hardened-browser GPU and network entitlement strings in the reference
+image read ...gpu and ...network, differing from the matching KDK's
+CodeSignature/Entitlements.h; the recovered source carries its own
+definitions.
+
+Authored-By: joethedev5 <joeshmo@nunya.com>
+---
+ bsd/kern/kern_exec.c          |  27 +----
+ bsd/kern/kern_exec_internal.h |  32 ++++++
+ bsd/kern/kern_exec_security.c | 185 ++++++++++++++++++++++++++++------
+ bsd/kern/kern_exec_security.h |  36 ++++++-
+ bsd/kern/kern_proc.c          |  15 +++
+ bsd/kern/mach_loader.h        |   4 +
+ bsd/sys/proc_internal.h       |   3 +
+ bsd/sys/proc_ro.h             |   1 +
+ osfmk/kern/task.c             |   2 +
+ osfmk/kern/task.h             |   7 +-
+ 10 files changed, 253 insertions(+), 59 deletions(-)
+
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 8305ea667..1c3ffd837 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -187,6 +187,7 @@
+ #include <IOKit/IOKitKeys.h> /* kIODriverKitEntitlementKey */
+ 
+ #include "kern_exec_internal.h"
++#include <kern/kern_exec_security.h>
+ 
+ #include <CodeSignature/Entitlements.h>
+ 
+@@ -209,14 +210,6 @@ static TUNABLE(bool, unentitled_ios_sim_launch, "unentitled_ios_sim_launch", fal
+ 
+ #if DEVELOPMENT || DEBUG
+ os_log_t exec_log_handle = NULL;
+-#define EXEC_LOG(fmt, ...)      \
+-do {    \
+-	if (exec_log_handle) {      \
+-	        os_log_with_type(exec_log_handle, OS_LOG_TYPE_INFO, "exec - %s:%d " fmt, __FUNCTION__, __LINE__, ##__VA_ARGS__);    \
+-	}   \
+-} while (0)
+-#else /* DEVELOPMENT || DEBUG */
+-#define EXEC_LOG(fmt, ...)  do { } while (0)
+ #endif /* DEVELOPMENT || DEBUG */
+ 
+ #if CONFIG_DTRACE
+@@ -1140,24 +1133,6 @@ static struct {
+ 	}
+ };
+ 
+-/*
+- * Platform Restrictions
+- *
+- * This mitigation opts you into the grab bag of various kernel mitigations
+- * including IPC security restrictions
+- * The presence of the entitlement opts the binary into the feature.
+- * The entitlement is a <string> entitlement containing a version number
+- * for the platform restrictions you are opting into.
+- */
+-#define SPAWN_ENABLE_PLATFORM_RESTRICTIONS_ENT_STR "com.apple.security.hardened-process.platform-restrictions-string"
+-
+-/*
+- * rdar://168452024: The platform restrictions entitlement was originally mapped
+- * to an integer, but unfortunately some machinery doesn't support integer value ranges.
+- * The original entitlement is preserved and parsed for compatibility.
+- */
+-#define SPAWN_ENABLE_PLATFORM_RESTRICTIONS_ENT_INT "com.apple.security.hardened-process.platform-restrictions"
+-
+ /* See kern_exec_internal.h for the extensive documentation. */
+ exec_security_err_t
+ exec_check_security_entitlement(struct image_params *imgp,
+diff --git a/bsd/kern/kern_exec_internal.h b/bsd/kern/kern_exec_internal.h
+index c793f7945..76296de39 100644
+--- a/bsd/kern/kern_exec_internal.h
++++ b/bsd/kern/kern_exec_internal.h
+@@ -29,10 +29,42 @@
+ #ifndef _KERN_EXEC_INTERNAL_H_
+ #define _KERN_EXEC_INTERNAL_H_
+ 
++#include <os/log.h>
++
+ #include <sys/imgact.h>
+ #include <sys/kernel_types.h>
+ #include <kern/mach_loader.h>
+ 
++#if DEVELOPMENT || DEBUG
++extern os_log_t exec_log_handle;
++#define EXEC_LOG(fmt, ...)      \
++do {    \
++	if (exec_log_handle) {      \
++	        os_log_with_type(exec_log_handle, OS_LOG_TYPE_INFO, "exec - %s:%d " fmt, __FUNCTION__, __LINE__, ##__VA_ARGS__);    \
++	}   \
++} while (0)
++#else /* DEVELOPMENT || DEBUG */
++#define EXEC_LOG(fmt, ...)  do { } while (0)
++#endif /* DEVELOPMENT || DEBUG */
++
++/*
++ * Platform Restrictions
++ *
++ * This mitigation opts you into the grab bag of various kernel mitigations
++ * including IPC security restrictions
++ * The presence of the entitlement opts the binary into the feature.
++ * The entitlement is a <string> entitlement containing a version number
++ * for the platform restrictions you are opting into.
++ */
++#define SPAWN_ENABLE_PLATFORM_RESTRICTIONS_ENT_STR "com.apple.security.hardened-process.platform-restrictions-string"
++
++/*
++ * rdar://168452024: The platform restrictions entitlement was originally mapped
++ * to an integer, but unfortunately some machinery doesn't support integer value ranges.
++ * The original entitlement is preserved and parsed for compatibility.
++ */
++#define SPAWN_ENABLE_PLATFORM_RESTRICTIONS_ENT_INT "com.apple.security.hardened-process.platform-restrictions"
++
+ /*
+  * Set p->p_comm and p->p_name to the name passed to exec
+  */
+diff --git a/bsd/kern/kern_exec_security.c b/bsd/kern/kern_exec_security.c
+index e1716872d..acdafa5fd 100644
+--- a/bsd/kern/kern_exec_security.c
++++ b/bsd/kern/kern_exec_security.c
+@@ -2,25 +2,69 @@
+  * Reconstruction of bsd/kern/kern_exec_security.c from the xnu-13432 reference kernel.
+  *
+  * Function signatures and ordering are derived from the KDK 27.0.1
+- * DWARF.  Functions marked RECON were moved from the public xnu source
+- * when the reference kernel placed them in this file; bodies marked
+- * "body not recovered" are still stubs.
++ * DWARF.  Bodies are recovered from the reference kernel image and the
++ * public xnu sources.
+  */
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/kernel.h>
++#include <sys/codesign.h>
++#include <sys/imgact.h>
++#include <sys/proc_internal.h>
++#include <sys/ubc_internal.h>
++
++#include <libkern/libkern.h>
++
++#include <mach/mach_types.h>
++#include <mach/vm_map.h>
++
++#include <kern/kalloc.h>
++#include <kern/task.h>
++#include <kern/mach_loader.h>
++
++#include <IOKit/IOBSD.h>
++
++#include "kern_exec_internal.h"
+ #include <kern/kern_exec_security.h>
+ 
+ #define RECON_BSD_KERN_KERN_EXEC_SECURITY_C 1
+ 
++/*
++ * The hardened-browser entitlement strings below are recovered from the
++ * reference kernel image.  They differ from the values in the matching KDK's
++ * <CodeSignature/Entitlements.h> (which read "rendering" and "networking"),
++ * so the xnu-13432 tree carried its own definitions.
++ */
++#define kCSWebBrowserHostEntitlement \
++	"com.apple.developer.web-browser-engine.host"
++#define kCSWebBrowserGPUEntitlement \
++	"com.apple.developer.web-browser-engine.gpu"
++#define kCSWebBrowserNetworkEntitlement \
++	"com.apple.developer.web-browser-engine.network"
++#define kCSWebBrowserWebContentEntitlement \
++	"com.apple.developer.web-browser-engine.webcontent"
++
++#define VFS_RESOLVE_FLAGS_ENTITLEMENT \
++	"com.apple.security.hardened-process.vfs.resolve-flags"
++
+ /* bsd/kern/kern_exec_security.c:42 */
+-static inline errno_t
+-imgact_setup_platform_restrictions(struct image_params *imgp, load_result_t *load_result, task_t task)
++errno_t
++imgact_setup_platform_restrictions(struct image_params *imgp,
++    load_result_t *load_result, task_t task)
+ {
+-	char* endptr = NULL;
+-	char* maybe_platform_restrictions_level_str = NULL;
++	char *endptr = NULL;
++	char *maybe_platform_restrictions_level_str = NULL;
+ 	uint64_t maybe_platform_restrictions_level_int = 0;
+ 
++	exec_security_advance_state(load_result,
++	    EXEC_SECURITY_STATE_PLATFORM_RESTRICTIONS_SETUP);
++
++	/* Hardened browser binaries get the lowest restriction level. */
++	if (exec_security_get_hardened_browser(load_result) != 0) {
++		task_set_platform_restrictions_version(task, 1);
++		return KERN_SUCCESS;
++	}
++
+ 	/* Platform binaries always get the highest available restriction level */
+ 	if (load_result->platform_binary) {
+ 		task_set_platform_restrictions_version(task, 3);
+@@ -29,7 +73,8 @@ imgact_setup_platform_restrictions(struct image_params *imgp, load_result_t *loa
+ 
+ 	/*
+ 	 * Parse the platform restriction version via entitlement if present.
+-	 * rdar://168452024: Prefer the new-style string version over the old-style int version.
++	 * rdar://168452024: Prefer the new-style string version over the
++	 * old-style int version.
+ 	 */
+ 	if (IOVnodeIsEntitlementPresentWithAnyValue(imgp->ip_vp, (int64_t)imgp->ip_arch_offset,
+ 	    SPAWN_ENABLE_PLATFORM_RESTRICTIONS_ENT_STR)) {
+@@ -67,6 +112,7 @@ imgact_setup_platform_restrictions(struct image_params *imgp, load_result_t *loa
+ 			return KERN_SUCCESS;
+ 		}
+ 	}
++
+ 	/*
+ 	 * Last resort: try the integer value entitlement.
+ 	 * To paper over compatibility concerns from when this entitlement was primary
+@@ -83,58 +129,135 @@ imgact_setup_platform_restrictions(struct image_params *imgp, load_result_t *loa
+ 	return KERN_SUCCESS;
+ }
+ 
+-/* bsd/kern/kern_exec_security.c:121 */
+-void
+-encode_hardened_browser_entitlement(const char * entitlement, hardened_browser_flags_t mask, const struct image_params * imgp, load_result_t * load_result)
++/*
++ * bsd/kern/kern_exec_security.c:121
++ *
++ * Records the hardened-browser entitlement in the load result.
++ */
++static inline void
++encode_hardened_browser_entitlement(const char *entitlement, hardened_browser_flags_t mask,
++    const struct image_params *imgp, load_result_t *load_result)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: encode_hardened_browser_entitlement");
++	if (IOVnodeHasEntitlement(imgp->ip_vp, (int64_t)imgp->ip_arch_offset, entitlement)) {
++		load_result->hardened_browser |= mask;
++	}
+ }
+ 
+ /* bsd/kern/kern_exec_security.c:140 */
+ void
+-imgact_setup_hardened_browser(struct image_params * imgp, load_result_t * load_result)
++imgact_setup_hardened_browser(struct image_params *imgp, load_result_t *load_result)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: imgact_setup_hardened_browser");
++	exec_security_advance_state(load_result,
++	    EXEC_SECURITY_STATE_HARDENED_BROWSER_SETUP);
++
++	load_result->hardened_browser = 0;
++	encode_hardened_browser_entitlement(kCSWebBrowserHostEntitlement,
++	    BrowserHostEntitlementMask, imgp, load_result);
++	encode_hardened_browser_entitlement(kCSWebBrowserGPUEntitlement,
++	    BrowserGPUEntitlementMask, imgp, load_result);
++	encode_hardened_browser_entitlement(kCSWebBrowserNetworkEntitlement,
++	    BrowserNetworkEntitlementMask, imgp, load_result);
++	encode_hardened_browser_entitlement(kCSWebBrowserWebContentEntitlement,
++	    BrowserWebContentEntitlementMask, imgp, load_result);
+ }
+ 
+ /* bsd/kern/kern_exec_security.c:158 */
+ hardened_browser_flags_t
+-exec_security_get_hardened_browser(const load_result_t * load_result)
++exec_security_get_hardened_browser(const load_result_t *load_result)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: exec_security_get_hardened_browser");
++	/*
++	 * The reference DWARF records two dead locals at this point of the
++	 * source (_lr and _es) left over from a debug/assertion aid.
++	 */
++	return load_result->hardened_browser;
+ }
+ 
+ /* bsd/kern/kern_exec_security.c:242 */
+-void
+-imgact_set_platform_binary_flag(load_result_t * load_result, task_t task, proc_t p)
++static inline void
++imgact_set_platform_binary_flag(load_result_t *load_result, task_t task,
++    __unused proc_t p)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: imgact_set_platform_binary_flag");
++	exec_security_advance_state(load_result,
++	    EXEC_SECURITY_STATE_PLATFORM_BINARY_SETUP);
++
++	task_set_platform_binary(task, load_result->platform_binary);
+ }
+ 
+ /* bsd/kern/kern_exec_security.c:259 */
+ void
+-imgact_setup_ipc_containment(struct image_params * imgp, load_result_t * load_result, task_t task, proc_t p)
++imgact_setup_ipc_containment(struct image_params *imgp,
++    load_result_t *load_result, task_t task, __unused proc_t p)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: imgact_setup_ipc_containment");
++	exec_security_advance_state(load_result,
++	    EXEC_SECURITY_STATE_IPC_CONTAINMENT_SETUP);
++
++	/* Pipe through the IPC containment vessel entitlement state from the load result */
++	if (load_result->is_ipc_containment_vessel) {
++		task_set_ipc_containment_vessel(task);
++
++		if (load_result->platform_binary) {
++			const char *webkit_prefix = "com.apple.WebKit.";
++			struct cs_blob *blob = csvnode_get_blob(imgp->ip_vp,
++			    imgp->ip_arch_offset);
++			const char *signing_id = blob ?
++			    csblob_get_identity(blob) : NULL;
++
++			if (signing_id && !strncmp(signing_id, webkit_prefix,
++			    strlen(webkit_prefix))) {
++				task_set_webkit(task);
++			} else {
++				task_clear_webkit(task);
++			}
++		}
++	} else {
++		task_clear_ipc_containment_vessel(task);
++	}
+ }
+ 
+ /* bsd/kern/kern_exec_security.c:290 */
+ void
+-imgact_setup_ipc_security_policy(struct image_params * imgp, load_result_t * load_result, task_t old_task, task_t new_task, vm_map_t map, proc_t p)
++imgact_setup_ipc_security_policy(struct image_params *imgp,
++    load_result_t *load_result, __unused task_t old_task, task_t new_task,
++    __unused vm_map_t map, proc_t p)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: imgact_setup_ipc_security_policy");
++	bool override = false;
++
++	imgact_set_platform_binary_flag(load_result, new_task, p);
++
++	/* Disable mach hardening for tasks which may load third-party plugins */
++#if XNU_TARGET_OS_OSX
++	if (override || (imgp->ip_flags & IMGPF_3P_PLUGINS)) {
++		task_disable_mach_hardening(new_task);
++	}
++#else
++	(void)override;
++#endif /* XNU_TARGET_OS_OSX */
+ }
+ 
+ /* bsd/kern/kern_exec_security.c:320 */
+ void
+ exec_setup_vfs_resolve_flags(task_t task)
+ {
+-	/* RECON(13432): body not recovered from the reference kernel yet. */
+-	panic("reconstructed stub: exec_setup_vfs_resolve_flags");
++	struct proc *p = get_bsdtask_info(task);
++	char *entitlement_string = IOTaskGetEntitlement(task,
++	    VFS_RESOLVE_FLAGS_ENTITLEMENT);
++
++	if (entitlement_string != NULL) {
++		char *endptr = NULL;
++		unsigned long value = strtoul(entitlement_string, &endptr, 10);
++
++		/*
++		 * Only accept fully parsed values; the entitlement controls the
++		 * fixed VFS path resolution flags for this process.
++		 */
++		if (entitlement_string != endptr &&
++		    *endptr == '\0') {
++			uint32_t resolve_flags = (uint32_t)value & 0x7ff;
++
++			proc_set_fixed_vfs_resolve_flags(p, resolve_flags);
++			p->p_vfs_resolve_flags |= resolve_flags;
++		}
++
++		kfree_data_addr(entitlement_string);
++	}
+ }
+diff --git a/bsd/kern/kern_exec_security.h b/bsd/kern/kern_exec_security.h
+index f66218aac..27e9eed6d 100644
+--- a/bsd/kern/kern_exec_security.h
++++ b/bsd/kern/kern_exec_security.h
+@@ -7,6 +7,19 @@
+ #ifndef XNU13432_BSD_KERN_KERN_EXEC_SECURITY_H
+ #define XNU13432_BSD_KERN_KERN_EXEC_SECURITY_H
+ 
++#include <sys/cdefs.h>
++#include <sys/types.h>
++#include <kern/mach_loader.h>
++#include <kern/task.h>
++#include <sys/proc_internal.h>
++
++__BEGIN_DECLS
++
++/*
++ * The exec security configuration is applied in a fixed order.  Each stage
++ * advances load_result->exec_security_state so that the state machine can be
++ * validated by the accessors below.
++ */
+ typedef enum {
+ 	EXEC_SECURITY_STATE_INIT = 0,
+ 	EXEC_SECURITY_STATE_HARDENED_BROWSER_SETUP = 1,
+@@ -17,6 +30,27 @@ typedef enum {
+ 	EXEC_SECURITY_STATE_PLATFORM_BINARY_SETUP = 6
+ } exec_security_state_t;
+ 
+-void exec_security_advance_state(load_result_t * load_result, exec_security_state_t new_state);
++errno_t imgact_setup_platform_restrictions(struct image_params *imgp,
++    load_result_t *load_result, task_t task);
++void imgact_setup_hardened_browser(struct image_params *imgp,
++    load_result_t *load_result);
++hardened_browser_flags_t exec_security_get_hardened_browser(
++    const load_result_t *load_result);
++void imgact_setup_ipc_containment(struct image_params *imgp,
++    load_result_t *load_result, task_t task, proc_t p);
++void imgact_setup_ipc_security_policy(struct image_params *imgp,
++    load_result_t *load_result, task_t old_task, task_t new_task,
++    vm_map_t map, proc_t p);
++void exec_setup_vfs_resolve_flags(task_t task);
++
++/* bsd/kern/kern_exec_security.h:164 */
++static inline void
++exec_security_advance_state(load_result_t *load_result,
++    exec_security_state_t new_state)
++{
++	load_result->exec_security_state = new_state;
++}
++
++__END_DECLS
+ 
+ #endif /* XNU13432_BSD_KERN_KERN_EXEC_SECURITY_H */
+diff --git a/bsd/kern/kern_proc.c b/bsd/kern/kern_proc.c
+index 01b305987..013145c53 100644
+--- a/bsd/kern/kern_proc.c
++++ b/bsd/kern/kern_proc.c
+@@ -2118,6 +2118,21 @@ proc_setpidversion(proc_t p, int idversion)
+ 	    &idversion);
+ }
+ 
++/* bsd/kern/kern_proc.c:2572 */
++uint32_t
++proc_fixed_vfs_resolve_flags(proc_t p)
++{
++	return proc_get_ro(p)->p_fixed_vfs_resolve_flags;
++}
++
++/* bsd/kern/kern_proc.c:2578 */
++void
++proc_set_fixed_vfs_resolve_flags(proc_t p, uint32_t resolve_flags)
++{
++	zalloc_ro_update_field(ZONE_ID_PROC_RO, proc_get_ro(p),
++	    p_fixed_vfs_resolve_flags, &resolve_flags);
++}
++
+ uint32_t
+ proc_persona_id(proc_t p)
+ {
+diff --git a/bsd/kern/mach_loader.h b/bsd/kern/mach_loader.h
+index 315a87467..6c593662f 100644
+--- a/bsd/kern/mach_loader.h
++++ b/bsd/kern/mach_loader.h
+@@ -90,6 +90,7 @@ typedef struct _load_result {
+ 	    custom_stack            : 1,
+ 	    is_rosetta              : 1,
+ 	    hardened_heap           : 1,
++	    is_vm_containment_vessel_cow_defeatured : 1,
+ 	    is_ipc_containment_vessel   : 1;
+ 	// 0 if not entitled, non-zero otherwise
+ 	uint8_t hardened_process_version;
+@@ -104,6 +105,9 @@ typedef struct _load_result {
+ 	/* Flags denoting which type of platform restrictions binary this is */
+ 	hardened_browser_flags_t hardened_browser;
+ 
++	/* Tracks how far through the exec security configuration we are */
++	uint8_t                 exec_security_state;
++
+ 	off_t                   cs_end_offset;
+ 	void                    *threadstate;
+ 	size_t                  threadstate_sz;
+diff --git a/bsd/sys/proc_internal.h b/bsd/sys/proc_internal.h
+index 930199062..502f66d08 100644
+--- a/bsd/sys/proc_internal.h
++++ b/bsd/sys/proc_internal.h
+@@ -284,6 +284,7 @@ struct proc {
+ 	uid_t           p_svuid;
+ 	gid_t           p_svgid;
+ 	pid_t           p_sessionid;
++	volatile uint32_t p_vfs_resolve_flags;
+ 	uint64_t        p_puniqueid;            /* parent's unique ID - set on fork/spawn, doesn't change if reparented. */
+ 
+ 	lck_mtx_t       p_mlock;                /* mutex lock for proc */
+@@ -1026,6 +1027,8 @@ extern void proc_release_proc_task_struct(proc_t proc);
+ extern void task_ref_hold_proc_task_struct(task_t task);
+ extern void task_release_proc_task_struct(task_t task, proc_ro_t proc_ro);
+ extern void proc_setpidversion(proc_t, int);
++extern uint32_t proc_fixed_vfs_resolve_flags(proc_t);
++extern void proc_set_fixed_vfs_resolve_flags(proc_t, uint32_t);
+ extern uint64_t proc_getcsflags(proc_t);
+ extern void proc_csflags_update(proc_t, uint64_t);
+ extern void proc_csflags_set(proc_t, uint64_t);
+diff --git a/bsd/sys/proc_ro.h b/bsd/sys/proc_ro.h
+index a94b25871..0bc44d1ed 100644
+--- a/bsd/sys/proc_ro.h
++++ b/bsd/sys/proc_ro.h
+@@ -76,6 +76,7 @@ struct proc_ro {
+ 		pid_t p_orig_ppid;                                 /* process's original parent pid, doesn't change if reparented */
+ 		int p_orig_ppidversion;                            /* process's original parent pid version, doesn't change if reparented */
+ 		uint32_t p_csflags;
++		uint32_t p_fixed_vfs_resolve_flags;
+ 		SMR_POINTER(struct ucred *) p_ucred;               /* Process owner's identity. (PUCL) */
+ 		uint8_t *__unsafe_indexable syscall_filter_mask;   /* syscall filter bitmask (length: nsysent bits) */
+ 		struct proc_platform_ro_data p_platform_data;
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+index bac41b937..4f1a1252c 100644
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -9975,6 +9975,8 @@ TASK_SECURITY_CONFIG_HELPER_DEFINE(tpro)
+ TASK_SECURITY_CONFIG_HELPER_DEFINE(script_restrictions)
+ TASK_SECURITY_CONFIG_HELPER_DEFINE(ipc_containment_vessel)
+ TASK_SECURITY_CONFIG_HELPER_DEFINE(guard_objects)
++TASK_SECURITY_CONFIG_HELPER_DEFINE(vm_containment_vessel_cow_defeatured)
++TASK_SECURITY_CONFIG_HELPER_DEFINE(webkit)
+ 
+ uint8_t
+ task_get_platform_restrictions_version(task_t task)
+diff --git a/osfmk/kern/task.h b/osfmk/kern/task.h
+index a9a1c9a36..658a9b83e 100644
+--- a/osfmk/kern/task.h
++++ b/osfmk/kern/task.h
+@@ -196,7 +196,10 @@ struct task_security_config {
+ 			platform_restrictions_version: 3,
+ 			    script_restrictions: 1,
+ 			    ipc_containment_vessel: 1,
+-			    guard_objects: 1;
++			    guard_objects: 1,
++			    vm_containment_vessel_cow_defeatured: 1,
++			    reserved2: 1,
++			    webkit: 1;
+ 			uint8_t hardened_process_version;
+ 		};
+ 		uint32_t value;
+@@ -1254,6 +1257,8 @@ TASK_SECURITY_CONFIG_HELPER_DECLARE(tpro);
+ TASK_SECURITY_CONFIG_HELPER_DECLARE(script_restrictions);
+ TASK_SECURITY_CONFIG_HELPER_DECLARE(ipc_containment_vessel);
+ TASK_SECURITY_CONFIG_HELPER_DECLARE(guard_objects);
++TASK_SECURITY_CONFIG_HELPER_DECLARE(vm_containment_vessel_cow_defeatured);
++TASK_SECURITY_CONFIG_HELPER_DECLARE(webkit);
+ 
+ extern bool task_has_fatal_vm_guards(task_t task);
+ uint8_t task_get_platform_restrictions_version(task_t task);

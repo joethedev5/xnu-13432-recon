@@ -1,7 +1,7 @@
 From 9443434b7161ec69b3451d099af42084d9aca020 Mon Sep 17 00:00:00 2001
 From: joethedev5 <deepsbx1@proton.me>
 Date: Wed, 25 Nov 2026 04:08:34 +0000
-Subject: [PATCH 37/39] Recover the RACK segment-allocation failure path
+Subject: [PATCH 37/40] Recover the RACK segment-allocation failure path
 
 tcp_seg_free_and_disable_rack is a static inline in the reference,
 inlined into the segment insertion paths when tcp_seg_alloc_init fails.

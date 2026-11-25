@@ -1,7 +1,7 @@
 From e8bff54858cbd22126a044a915d7ef5c95b210a5 Mon Sep 17 00:00:00 2001
 From: joethedev5 <deepsbx1@proton.me>
 Date: Wed, 25 Nov 2026 03:43:05 +0000
-Subject: [PATCH 32/39] Reconstruct the process virtual-environment integration
+Subject: [PATCH 32/40] Reconstruct the process virtual-environment integration
 
 The reference proc carries a virtual_env pointer at offset 1976 in
 place of the public subsystem-root path string.  Fork retains it into
